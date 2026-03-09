@@ -1,0 +1,29 @@
+defaults:
+  - data: shha
+  - model: dsgcnet
+  - optimizer: adam
+  - scheduler: step_lr
+  - _self_
+
+# Runtime
+seed: 42
+gpu_id: 0
+num_workers: 8
+eval_freq: 1
+
+# Training
+epochs: 2500
+clip_max_norm: 0.1
+frozen_weights: null
+resume: ""
+start_epoch: 0
+
+# Output dirs (hydra manages outputs/)
+checkpoints_dir: checkpoints
+tensorboard_dir: runs/dsgc
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false

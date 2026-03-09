@@ -1,0 +1,8 @@
+backbone: vgg16_bn # vgg16_bn | vgg16 | dinov2_s | dinov2_b | dinov2_l
+backbone_type: vgg # vgg | dinov2
+row: 2
+line: 2
+set_cost_class: 1.0
+set_cost_point: 0.05
+point_loss_coef: 0.0002
+eos_coef: 0.5

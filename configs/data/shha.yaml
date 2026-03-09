@@ -1,0 +1,5 @@
+dataset: SHHA
+data_root: "data/shanghaitech/part_A_final" # override: data.data_root=/path/to/sha
+batch_size: 8
+patch: true
+flip: true

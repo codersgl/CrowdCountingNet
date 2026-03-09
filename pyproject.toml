@@ -8,6 +8,7 @@ dependencies = [
     "torch>=2.0",
     "torchvision>=0.15",
     "tensorboard>=2.13",
+    "setuptools>=69.0.0,<70.0.0",
     "numpy>=1.24",
     "scipy>=1.10",
     "pillow>=9.5",

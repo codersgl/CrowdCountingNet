@@ -163,14 +163,10 @@ def _load_data(img_gt_path, train: bool):
     img_path, gt_path = img_gt_path
     img = cv2.imread(img_path)
     img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    points = []
-    with open(gt_path) as f_label:
-        for line in f_label:
-            parts = line.strip().split(" ")
-            x = float(parts[0])
-            y = float(parts[1])
-            points.append([x, y])
-    return img, np.array(points)
+    from crowdcount.data.prepare import _load_points
+
+    points = _load_points(Path(gt_path))
+    return img, points
 
 
 def _random_crop(img, den, num_patch: int = 4):

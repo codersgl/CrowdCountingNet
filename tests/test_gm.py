@@ -1,46 +1,74 @@
-"""Tests for anchor point generation utilities."""
+"""Unit tests for GateMechanism plugin."""
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
-from crowdcount.models.anchor import AnchorPoints, generate_anchor_points, shift
-
-
-def test_generate_anchor_points_shape():
-    pts = generate_anchor_points(stride=8, row=2, line=2)
-    assert pts.shape == (4, 2), "row×line anchor points expected"
+from crowdcount.plugins.gm import GateMechanism
 
 
-@pytest.mark.parametrize("row,line", [(2, 2), (3, 3)])
-def test_generate_anchor_points_count(row, line):
-    pts = generate_anchor_points(stride=16, row=row, line=line)
-    assert pts.shape[0] == row * line
+@pytest.fixture
+def default_gm() -> GateMechanism:
+    return GateMechanism()
 
 
-def test_shift_output_shape():
-    anchor_points = generate_anchor_points(stride=8, row=2, line=2)
-    shifted = shift((4, 4), stride=8, anchor_points=anchor_points)
-    # 4×4 grid positions × 4 anchors
-    assert shifted.shape == (4 * 4 * 4, 2)
+@pytest.fixture
+def custom_gm() -> GateMechanism:
+    return GateMechanism(input_dim=512, hidden_dim=256)
 
 
-def test_anchor_points_module_forward():
-    module = AnchorPoints(pyramid_levels=[3], row=2, line=2)
-    img = torch.zeros(1, 3, 128, 128)
-    out = module(img)
-    assert out.ndim == 3
-    assert out.shape[0] == 1
-    assert out.shape[2] == 2
+def test_gm_import() -> None:
+    assert GateMechanism is not None
+    assert issubclass(GateMechanism, nn.Module)
 
 
-def test_anchor_points_count_consistency():
-    """Number of anchors scales with image size and row×line."""
-    module_a = AnchorPoints(pyramid_levels=[3], row=2, line=2)
-    module_b = AnchorPoints(pyramid_levels=[3], row=3, line=3)
-    img = torch.zeros(1, 3, 128, 128)
-    cnt_a = module_a(img).shape[1]
-    cnt_b = module_b(img).shape[1]
-    assert cnt_b > cnt_a, "More anchor points with larger row×line"
+def test_gm_initialization_default(default_gm: GateMechanism) -> None:
+    assert default_gm.fc1.in_features == 256
+    assert default_gm.fc1.out_features == 128
+    assert default_gm.fc2.in_features == 128
+    assert default_gm.fc2.out_features == 3
+
+
+def test_gm_initialization_custom(custom_gm: GateMechanism) -> None:
+    assert custom_gm.fc1.in_features == 512
+    assert custom_gm.fc1.out_features == 256
+    assert custom_gm.fc2.in_features == 256
+    assert custom_gm.fc2.out_features == 3
+
+
+@pytest.mark.parametrize(
+    "batch,channels,height,width",
+    [(1, 256, 16, 16), (2, 256, 32, 32), (4, 256, 64, 64)],
+)
+def test_forward_shape_default(
+    batch: int,
+    channels: int,
+    height: int,
+    width: int,
+    default_gm: GateMechanism,
+) -> None:
+    x = torch.randn(batch, channels, height, width)
+    with torch.no_grad():
+        output = default_gm(x)
+    assert output.shape == (batch, 3)
+    assert isinstance(output, torch.Tensor)
+
+
+def test_forward_shape_custom(custom_gm: GateMechanism) -> None:
+    x = torch.randn(2, 512, 32, 32)
+    with torch.no_grad():
+        output = custom_gm(x)
+    assert output.shape == (2, 3)
+
+
+def test_output_is_softmax_probability(default_gm: GateMechanism) -> None:
+    x = torch.randn(3, 256, 20, 20)
+    with torch.no_grad():
+        output = default_gm(x)
+
+    row_sums = output.sum(dim=1)
+    assert torch.allclose(row_sums, torch.ones_like(row_sums), rtol=1e-5, atol=1e-6)
+    assert torch.all(output >= 0.0)
+    assert torch.all(output <= 1.0)

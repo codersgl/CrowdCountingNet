@@ -18,7 +18,14 @@ def build_model(cfg: DictConfig, training: bool = False):
     """
     num_classes = 1
     backbone = build_backbone(cfg)
-    model = DSGCnet(backbone, row=cfg.model.row, line=cfg.model.line)
+    model = DSGCnet(
+        backbone,
+        row=cfg.model.row,
+        line=cfg.model.line,
+        use_gm=getattr(cfg.model, "use_gm", False),
+        gm_input_dim=getattr(cfg.model, "gm_input_dim", 256),
+        gm_hidden_dim=getattr(cfg.model, "gm_hidden_dim", 128),
+    )
 
     if not training:
         return model

@@ -6,3 +6,6 @@ set_cost_class: 1.0
 set_cost_point: 0.05
 point_loss_coef: 0.0002
 eos_coef: 0.5
+use_gm: false
+gm_input_dim: 256
+gm_hidden_dim: 128

@@ -3,15 +3,23 @@
 import torch
 from torch import nn
 
-from crowdcount.utils.misc import nested_tensor_from_tensor_list
 from crowdcount.models.anchor import AnchorPoints
 from crowdcount.models.gcn import DensityGCNProcessor, FeatureGCNProcessor
 from crowdcount.models.head import ClassificationModel, Density_pred, RegressionModel
 from crowdcount.models.neck import Decoder_SPD_PAFPN
+from crowdcount.plugins.gm import GateMechanism
 
 
 class DSGCnet(nn.Module):
-    def __init__(self, backbone: nn.Module, row: int = 2, line: int = 2):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        row: int = 2,
+        line: int = 2,
+        use_gm: bool = False,
+        gm_input_dim: int = 256,
+        gm_hidden_dim: int = 128,
+    ):
         super().__init__()
         self.backbone = backbone
         self.num_classes = 2
@@ -39,6 +47,11 @@ class DSGCnet(nn.Module):
         self.alpha = nn.Parameter(
             torch.tensor([1.0, 1.0], dtype=torch.float32, requires_grad=True)
         )
+        self.gm: GateMechanism | None = (
+            GateMechanism(input_dim=gm_input_dim, hidden_dim=gm_hidden_dim)
+            if use_gm
+            else None
+        )
 
     def forward(self, samples: torch.Tensor) -> dict:
         features = self.backbone(samples)
@@ -48,11 +61,22 @@ class DSGCnet(nn.Module):
         density = self.density_pred(features_pa)
         density_gcn_feature = self.density_gcn(density, features_pa)
         feature_gcn_feature = self.feature_gcn(features_pa)
-        feature_fl = (
-            features_pa
-            + self.alpha[0] * density_gcn_feature
-            + self.alpha[1] * feature_gcn_feature
-        )
+        if self.gm is not None:
+            gate_weight = self.gm(features_pa)
+            w_1 = gate_weight[:, 0].view(-1, 1, 1, 1)
+            w_2 = gate_weight[:, 1].view(-1, 1, 1, 1)
+            w_3 = gate_weight[:, 2].view(-1, 1, 1, 1)
+            feature_fl = (
+                features_pa * w_1
+                + density_gcn_feature * w_2
+                + feature_gcn_feature * w_3
+            )
+        else:
+            feature_fl = (
+                features_pa
+                + self.alpha[0] * density_gcn_feature
+                + self.alpha[1] * feature_gcn_feature
+            )
 
         regression = self.regression(feature_fl) * 100
         classification = self.classification(feature_fl)

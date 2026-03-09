@@ -27,85 +27,134 @@ We evaluate the proposed method on three of the most widely used crowd counting 
 ## Experimental Results🏆
 ### Comparison with State-of-the-Art Methods
 
-| Method      | Venue       | Backbone     | SHTech Part A (MAE/MSE) | SHTech PartB (MAE/MSE) | UCF-QNRF (MAE/MSE) |
-|-------------|-------------|--------------|------------------------|------------------------|--------------------|
-| CSRNet      | CVPR-2018   | VGG-16       | 68.2 / 115.0           | 10.6 / 16.0            | - / -              |
-| BL          | ICCV-2019   | VGG-19       | 62.8 / 101.8           | 7.7 / 12.7             | 88.7 / 154.8       |
-| DM-Count    | NeurIPS-2020| VGG-19       | 59.7 / 95.7            | 7.4 / 11.8             | 85.6 / 148.3       |
-| HYGNN       | AAAI-20     | VGG-16       | 60.2 / 94.5            | 7.5 / 12.7             | 100.8 / 185.3      |
-| P2PNet      | ICCV-2021   | VGG-16       | 52.7 / 85.1            | 6.2 / 9.9              | 85.3 / 154.5       |
-| TopoCount   | AAAI-2021   | VGG-16       | 61.2 / 104.6           | 7.8 / 13.7             | 89.0 / 159.0       |
-| LSC-CNN     | TPAMI-2021  | VGG-16       | 66.4 / 117.0           | 8.1 / 12.7             | 120.5 / 218.2      |
-| CLTR        | ECCV-2022   | DETR         | 56.9 / 95.2            | 6.5 / 10.6             | 85.8 / 141.3       |
-| Ctrans-MISN | PRAI-2022   | ViT          | 55.8 / 95.9            | 7.3 / 11.4             | 95.2 / 180.1       |
-| NDConv      | SPL-2022    | ResNet-50    | 61.4 / 104.2           | 7.8 / 13.8             | 91.2 / 165.6       |
-| AutoScale   | IJCV-2022   | VGG-16       | 65.8 / 112.1           | 8.6 / 13.9             | 104.4 / 174.2      |
-| PTCNet      | EAAI-2023   | PVT          | <u>51.7</u> / 79.6      | 6.3 / 10.6             | <u>79.7</u> / **133.2** |
-| GMS         | TIP-2023    | HRNet        | 68.8 / 138.6           | 16.0 / 33.5            | 104.0 / 197.4      |
-| DMCNet      | WACV-2023   | VGG-16       | 58.5 / 84.6            | 8.6 / 13.7             | 96.5 / 164.0       |
-| VMambaCC    | arXiv-2024  | Mamba        | 51.9 / 81.3            | 7.5 / 12.5             | 88.4 / 144.7       |
-| DDRANet     | SPL-2024    | VGG-16       | 52.1 / <u>78.4</u>      | 6.9 / 10.3             | 89.2 / 146.9       |
-| CAAPN       | TPAMI-2024  | VGG-16       | 54.4 / 97.3            | **5.8** / <u>9.8</u>    | 83.9 / 144.3       |
-|CrowdFPN     | Ap.Int.-2025 | Twins     | 52.5 / 88.5            | 6.5 / 9.9               | 81.2 / 157.3       |
-| **Ours**    | -           | VGG-16       | **48.9** / **77.8**    | <u>5.9</u> / **9.3**    | **79.3** / <u>133.9</u> |
+| Method      | Venue        | Backbone  | SHTech Part A (MAE/MSE) | SHTech PartB (MAE/MSE) | UCF-QNRF (MAE/MSE)      |
+| ----------- | ------------ | --------- | ----------------------- | ---------------------- | ----------------------- |
+| CSRNet      | CVPR-2018    | VGG-16    | 68.2 / 115.0            | 10.6 / 16.0            | - / -                   |
+| BL          | ICCV-2019    | VGG-19    | 62.8 / 101.8            | 7.7 / 12.7             | 88.7 / 154.8            |
+| DM-Count    | NeurIPS-2020 | VGG-19    | 59.7 / 95.7             | 7.4 / 11.8             | 85.6 / 148.3            |
+| HYGNN       | AAAI-20      | VGG-16    | 60.2 / 94.5             | 7.5 / 12.7             | 100.8 / 185.3           |
+| P2PNet      | ICCV-2021    | VGG-16    | 52.7 / 85.1             | 6.2 / 9.9              | 85.3 / 154.5            |
+| TopoCount   | AAAI-2021    | VGG-16    | 61.2 / 104.6            | 7.8 / 13.7             | 89.0 / 159.0            |
+| LSC-CNN     | TPAMI-2021   | VGG-16    | 66.4 / 117.0            | 8.1 / 12.7             | 120.5 / 218.2           |
+| CLTR        | ECCV-2022    | DETR      | 56.9 / 95.2             | 6.5 / 10.6             | 85.8 / 141.3            |
+| Ctrans-MISN | PRAI-2022    | ViT       | 55.8 / 95.9             | 7.3 / 11.4             | 95.2 / 180.1            |
+| NDConv      | SPL-2022     | ResNet-50 | 61.4 / 104.2            | 7.8 / 13.8             | 91.2 / 165.6            |
+| AutoScale   | IJCV-2022    | VGG-16    | 65.8 / 112.1            | 8.6 / 13.9             | 104.4 / 174.2           |
+| PTCNet      | EAAI-2023    | PVT       | <u>51.7</u> / 79.6      | 6.3 / 10.6             | <u>79.7</u> / **133.2** |
+| GMS         | TIP-2023     | HRNet     | 68.8 / 138.6            | 16.0 / 33.5            | 104.0 / 197.4           |
+| DMCNet      | WACV-2023    | VGG-16    | 58.5 / 84.6             | 8.6 / 13.7             | 96.5 / 164.0            |
+| VMambaCC    | arXiv-2024   | Mamba     | 51.9 / 81.3             | 7.5 / 12.5             | 88.4 / 144.7            |
+| DDRANet     | SPL-2024     | VGG-16    | 52.1 / <u>78.4</u>      | 6.9 / 10.3             | 89.2 / 146.9            |
+| CAAPN       | TPAMI-2024   | VGG-16    | 54.4 / 97.3             | **5.8** / <u>9.8</u>   | 83.9 / 144.3            |
+| CrowdFPN    | Ap.Int.-2025 | Twins     | 52.5 / 88.5             | 6.5 / 9.9              | 81.2 / 157.3            |
+| **Ours**    | -            | VGG-16    | **48.9** / **77.8**     | <u>5.9</u> / **9.3**   | **79.3** / <u>133.9</u> |
 
 **Bold** indicates the best performance.
 
 
 ## Getting Started🚀
-### 1. Data Preparation
-First, prepare the dataset. Then, run the following command to generate the corresponding ground truth density distribution maps:
+
+### Installation
+
 ```bash
-python density_data_preparation/k_nearest_gaussian_kernel.py
+# Install uv (if not already available)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install all dependencies
+uv sync
+
+# With dev tools (pytest, coverage)
+uv sync --extra dev
 ```
-Immediately afterward, We use a list file to collect all the input images and their ground truth annotations in a counting dataset. When your dataset is organized as recommended in the following, the format of this list file is defined as:
-```
-train/scene01/img01.jpg train/scene01/img01.txt
-train/scene01/img02.jpg train/scene01/img02.txt
-...
-train/scene02/img01.jpg train/scene02/img01.txt
-```
-#### Dataset structures:
+
+### 1. Data Preparation
+
+Organise your dataset as follows and create `train.txt` / `test.txt` list files:
+
 ```
 DATA_ROOT/
-        |->train/
-        |    |->scene01/
-        |    |->scene02/
-        |    |->...
-        |->test/
-        |    |->scene01/
-        |    |->scene02/
-        |    |->...
-        |->train.list
-        |->test.list
-        |->gt_density_maps/
-        |    |->train/
-        |    |->test/  
+  train.txt            ← "images/IMG_xxx.jpg gt/GT_xxx.txt" per line
+  test.txt
+  images/
+  gt/
+  gt_density_maps/     ← generated automatically on first training run
+    train/
 ```
+
+> **Density maps are generated automatically** the first time training starts.  
+> They are cached to `DATA_ROOT/gt_density_maps/train/` and reused on subsequent runs.
+
 ### 2. Training
-The network can be trained using the train.py script. For training on ShanghaiTech PartA, use
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train.py --data_root $DATA_ROOT \
-    --dataset_file SHHA \
-    --epochs 3500 \
-    --lr_drop 3500 \
-    --output_dir ./logs \
-    --checkpoints_dir ./weights \
-    --tensorboard_dir ./runs \
-    --lr 0.0001 \
-    --lr_backbone 0.00001 \
-    --batch_size 8 \
-    --eval_freq 1 \
-    --gpu_id 0
+# Train with default config
+python scripts/train.py data.data_root=DATA_ROOT
+
+# Override hyperparameters via Hydra CLI
+python scripts/train.py \
+    data.data_root=DATA_ROOT \
+    epochs=3500 \
+    scheduler.lr_drop=3500 \
+    optimizer.lr=0.0001 \
+    optimizer.lr_backbone=0.00001 \
+    data.batch_size=8 \
+    eval_freq=1 \
+    gpu_id=0
+
+# Resume from checkpoint
+python scripts/train.py data.data_root=DATA_ROOT resume=checkpoints/latest.pth
+
+# Use DINOv2 backbone
+python scripts/train.py data.data_root=DATA_ROOT model.backbone=dinov2_s model.backbone_type=dinov2
 ```
-### 3. Test
-You can prepare the data according to the previously mentioned dataset structures and directly use our trained weights to predict individuals' locations and the total crowd count (which will be displayed on the predicted images). Please run
+
+Outputs (logs, configs, checkpoints) are written to `outputs/<date>/<time>/` automatically.
+
 ```bash
-python run_test.py
+tensorboard --logdir runs/
 ```
+
+### 3. Prediction (Test)
+
+```bash
+python scripts/predict.py \
+    +predict.weight_path=checkpoints/SHTechA.pth \
+    +predict.root_dir=./sha_a/test \
+    +predict.output_dir=./pred_result \
+    +predict.threshold=0.5
+```
+
+### 4. Testing
+
+```bash
+# Run full test suite (no GPU / real data required)
+uv run pytest tests/ -v
+
+# With coverage report
+uv run pytest tests/ --cov=src/crowdcount --cov-report=term-missing
+```
+
+## Configuration Reference 🔧
+
+All defaults live in `configs/`. Override any field with Hydra dot-notation on the CLI.
+
+| Group     | Key               | Default    | Description                  |
+| --------- | ----------------- | ---------- | ---------------------------- |
+| data      | `data_root`       | `""`       | Path to dataset root         |
+| data      | `batch_size`      | 8          | Training batch size          |
+| model     | `backbone`        | `vgg16_bn` | Backbone variant             |
+| model     | `backbone_type`   | `vgg`      | `vgg` or `dinov2`            |
+| model     | `row` / `line`    | 2 / 2      | Anchor grid size             |
+| model     | `point_loss_coef` | 0.0002     | Point regression loss weight |
+| optimizer | `lr`              | 1e-4       | Base LR                      |
+| optimizer | `lr_backbone`     | 1e-5       | Backbone LR                  |
+| scheduler | `lr_drop`         | 800        | StepLR step size             |
+| —         | `epochs`          | 2500       | Total training epochs        |
+| —         | `seed`            | 42         | Random seed                  |
+
 ## Friendly reminder😊
 The repository is gradually being improved. If you need further assistance, please contact us. Feedback and suggestions are also welcome.😀
 ## Cite our work📝
 ```Coming soon...```
 ## License📜
-The source code is free for research and education use only. Any comercial use should get formal permission first.
+The source code is free for research and education use only. Any commercial use should get formal permission first.

@@ -12,7 +12,7 @@ num_workers: 8
 eval_freq: 1
 
 # Training
-epochs: 2500
+epochs: 3500
 clip_max_norm: 0.1
 frozen_weights: null
 resume: ""

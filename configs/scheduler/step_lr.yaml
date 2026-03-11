@@ -1,2 +1,2 @@
 name: step_lr
-lr_drop: 800
+lr_drop: 3500

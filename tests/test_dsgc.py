@@ -11,6 +11,7 @@ import torch.nn as nn
 
 from crowdcount.models.dsgcnet import DSGCnet
 from crowdcount.plugins.gm import GateMechanism
+from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
 
 class TinyVGGBackbone(nn.Module):
@@ -136,3 +137,46 @@ def test_gate_weight_is_valid_probability_distribution() -> None:
     assert gate_weight.shape == (2, 3)
     row_sums = gate_weight.sum(dim=1)
     assert torch.allclose(row_sums, torch.ones_like(row_sums), rtol=1e-5, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# MassAdaptiveLayer (MSAA) tests
+# ---------------------------------------------------------------------------
+
+
+def test_msaa_initialized_when_enabled() -> None:
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2, use_msaa=True)
+    assert model.msaa is not None
+    assert isinstance(model.msaa, MsaaAdaptiveLayer)
+
+
+def test_msaa_disabled_when_false() -> None:
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2, use_msaa=False)
+    assert model.msaa is None
+
+
+def test_msaa_pa_channels_when_enabled() -> None:
+    """When use_msaa=True, PA-FPN should be initialised with 1280-channel inputs."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2, use_msaa=True)
+    # P5_1 is the first conv that ingests C5; its in_channels should be 1280
+    assert model.pa.P5_1[0].in_channels == 1280
+    assert model.pa.P4_1[0].in_channels == 1280
+    assert model.pa.P3_1[0].in_channels == 1280
+
+
+def test_msaa_forward_shapes_match() -> None:
+    """With use_msaa=True the output shapes must be identical to the default path."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2, use_msaa=True).eval()
+
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_logits"].shape[2] == 2
+    assert out["pred_points"].shape[0] == 2
+    assert out["pred_points"].shape[2] == 2
+    assert out["density_out"].shape[0] == 2

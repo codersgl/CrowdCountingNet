@@ -25,6 +25,9 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_gm=getattr(cfg.model, "use_gm", False),
         gm_input_dim=getattr(cfg.model, "gm_input_dim", 256),
         gm_hidden_dim=getattr(cfg.model, "gm_hidden_dim", 128),
+        use_msaa=getattr(cfg.model, "use_msaa", False),
+        msaa_in_channels=getattr(cfg.model, "msaa_in_channels", 1280),
+        msaa_reduction=getattr(cfg.model, "msaa_reduction", 4),
     )
 
     if not training:

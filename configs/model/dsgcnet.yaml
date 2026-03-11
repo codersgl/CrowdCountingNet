@@ -9,3 +9,6 @@ eos_coef: 0.5
 use_gm: false
 gm_input_dim: 256
 gm_hidden_dim: 128
+use_msaa: false
+msaa_in_channels: 1280
+msaa_reduction: 4

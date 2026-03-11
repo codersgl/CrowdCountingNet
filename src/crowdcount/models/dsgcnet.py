@@ -8,6 +8,7 @@ from crowdcount.models.gcn import DensityGCNProcessor, FeatureGCNProcessor
 from crowdcount.models.head import ClassificationModel, Density_pred, RegressionModel
 from crowdcount.models.neck import Decoder_SPD_PAFPN
 from crowdcount.plugins.gm import GateMechanism
+from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
 
 class DSGCnet(nn.Module):
@@ -19,6 +20,9 @@ class DSGCnet(nn.Module):
         use_gm: bool = False,
         gm_input_dim: int = 256,
         gm_hidden_dim: int = 128,
+        use_msaa: bool = False,
+        msaa_in_channels: int = 1280,
+        msaa_reduction: int = 4,
     ):
         super().__init__()
         self.backbone = backbone
@@ -40,7 +44,10 @@ class DSGCnet(nn.Module):
         )
 
         self.anchor_points = AnchorPoints(pyramid_levels=[3], row=row, line=line)
-        self.pa = Decoder_SPD_PAFPN(256, 512, 512)
+        if use_msaa:
+            self.pa = Decoder_SPD_PAFPN(1280, 1280, 1280)
+        else:
+            self.pa = Decoder_SPD_PAFPN(256, 512, 512)
         self.density_pred = Density_pred()
         self.density_gcn = DensityGCNProcessor(k=4)
         self.feature_gcn = FeatureGCNProcessor(k=4)
@@ -52,10 +59,22 @@ class DSGCnet(nn.Module):
             if use_gm
             else None
         )
+        self.msaa: MsaaAdaptiveLayer | None = (
+            MsaaAdaptiveLayer(in_channels=msaa_in_channels, reduction=msaa_reduction)
+            if use_msaa
+            else None
+        )
 
     def forward(self, samples: torch.Tensor) -> dict:
         features = self.backbone(samples)
-        features_pa = self.pa([features[1], features[2], features[3]])
+        # features[1]: torch.Size([1, 256, 32, 32])
+        # features[2]: torch.Size([1, 512, 16, 16])
+        # features[3]: torch.Size([1, 512, 8, 8])
+        if self.msaa is not None:
+            features = self.msaa(features)
+        features_pa = self.pa(
+            [features[1], features[2], features[3]]
+        )  # [batch_size, 256, 16, 16]
 
         batch_size = features[0].shape[0]
         density = self.density_pred(features_pa)

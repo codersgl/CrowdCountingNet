@@ -82,9 +82,7 @@ class Trainer:
         self.optimizer = torch.optim.Adam(
             param_dicts, lr=cfg.optimizer.lr, weight_decay=cfg.optimizer.weight_decay
         )
-        self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=cfg.scheduler.lr_drop
-        )
+        self.lr_scheduler = self._build_scheduler()
 
         # Data
         train_set, val_set = build_dataset(cfg)
@@ -123,6 +121,18 @@ class Trainer:
         self.writer = SummaryWriter(str(tb_dir))
 
         logger.info(f"Config:\n{cfg}")
+
+    def _build_scheduler(self) -> torch.optim.lr_scheduler.LRScheduler:
+        sched = self.cfg.scheduler
+        name = sched.get("name", "step_lr")
+        if name == "cosine_annealing":
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=sched.T_max,
+                eta_min=sched.eta_min,
+            )
+        # default: step_lr
+        return torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=sched.lr_drop)
 
     def train(self) -> None:
         cfg = self.cfg

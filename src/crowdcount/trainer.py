@@ -79,9 +79,21 @@ class Trainer:
                 "lr": cfg.optimizer.lr_backbone,
             },
         ]
-        self.optimizer = torch.optim.Adam(
-            param_dicts, lr=cfg.optimizer.lr, weight_decay=cfg.optimizer.weight_decay
-        )
+        _opt_name = cfg.optimizer.get("name", "adam").lower()
+        if _opt_name == "adamw":
+            self.optimizer = torch.optim.AdamW(
+                param_dicts,
+                lr=cfg.optimizer.lr,
+                weight_decay=cfg.optimizer.weight_decay,
+                amsgrad=cfg.optimizer.get("amsgrad", False),
+            )
+        else:
+            self.optimizer = torch.optim.Adam(
+                param_dicts,
+                lr=cfg.optimizer.lr,
+                weight_decay=cfg.optimizer.weight_decay,
+            )
+        logger.info(f"Optimizer: {type(self.optimizer).__name__}")
         self.lr_scheduler = self._build_scheduler()
 
         # Data

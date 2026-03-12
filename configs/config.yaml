@@ -1,7 +1,7 @@
 defaults:
   - data: shha
   - model: dsgcnet
-  - optimizer: adam
+  - optimizer: adamw
   - scheduler: step_lr
   - _self_
 

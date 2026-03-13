@@ -10,9 +10,10 @@ import math
 import sys
 from typing import Iterable, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 
 from crowdcount.utils.misc import MetricLogger, SmoothedValue, reduce_dict
 from loguru import logger
@@ -27,11 +28,31 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     max_norm: float = 0,
+    cfg=None,
 ) -> dict:
+    """Train for one epoch.
+
+    Args:
+        model: DSGCNet model
+        criterion: Main criterion for point matching
+        data_loader: Training data loader
+        optimizer: Optimizer
+        density_criterion: MSELoss for density maps
+        device: Device to train on
+        epoch: Current epoch number
+        max_norm: Max norm for gradient clipping
+        cfg: Optional config for multi-scale density prediction
+    """
     model.train()
     criterion.train()
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
+
+    # Check if multi-scale density prediction is enabled
+    density_cfg = getattr(cfg, "density_multi_scale", None) if cfg is not None else None
+    use_multi_scale_density = bool(
+        getattr(density_cfg, "enabled", False) if density_cfg is not None else False
+    )
 
     for samples, targets, gt_dmap in data_loader:
         samples = samples.to(device)
@@ -47,7 +68,74 @@ def train_one_epoch(
         )
 
         et_dmap = outputs["density_out"]
-        density_loss = density_criterion(et_dmap, gt_dmap) / gt_dmap.shape[0] * 0.01
+
+        # Compute density loss (single or multi-scale)
+        if use_multi_scale_density and all(
+            k in outputs for k in ["density_block3", "density_block4", "density_block5"]
+        ):
+            # Multi-scale density prediction
+            # Resize GT to each prediction shape for robust supervision.
+            gt_density_block3 = F.interpolate(
+                gt_dmap,
+                size=outputs["density_block3"].shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            gt_density_block4 = F.interpolate(
+                gt_dmap,
+                size=outputs["density_block4"].shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            gt_density_block5 = F.interpolate(
+                gt_dmap,
+                size=outputs["density_block5"].shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+            # Compute individual losses
+            loss_block3 = density_criterion(
+                outputs["density_block3"], gt_density_block3
+            )
+            loss_block4 = density_criterion(
+                outputs["density_block4"], gt_density_block4
+            )
+            loss_block5 = density_criterion(
+                outputs["density_block5"], gt_density_block5
+            )
+            loss_orig = density_criterion(et_dmap, gt_dmap)
+
+            # Get weights from config
+            weights_cfg = getattr(density_cfg, "weights", None)
+            w3 = float(getattr(weights_cfg, "block3", 1.0))
+            w4 = float(getattr(weights_cfg, "block4", 1.0))
+            w5 = float(getattr(weights_cfg, "block5", 1.0))
+            w_orig = float(getattr(weights_cfg, "original", 1.0))
+
+            # Weighted sum
+            density_loss = (
+                (
+                    w3 * loss_block3
+                    + w4 * loss_block4
+                    + w5 * loss_block5
+                    + w_orig * loss_orig
+                )
+                / gt_dmap.shape[0]
+                * 0.01
+            )
+
+            # Log individual losses for monitoring
+            metric_logger.update(
+                den_loss_block3=(loss_block3 / gt_dmap.shape[0] * 0.01).item(),
+                den_loss_block4=(loss_block4 / gt_dmap.shape[0] * 0.01).item(),
+                den_loss_block5=(loss_block5 / gt_dmap.shape[0] * 0.01).item(),
+                den_loss_orig=(loss_orig / gt_dmap.shape[0] * 0.01).item(),
+            )
+        else:
+            # Single-scale density prediction (original behavior)
+            density_loss = density_criterion(et_dmap, gt_dmap) / gt_dmap.shape[0] * 0.01
+
         loss_sum = losses + density_loss
 
         loss_dict_reduced = reduce_dict(loss_dict)

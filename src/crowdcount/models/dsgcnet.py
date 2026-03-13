@@ -2,10 +2,18 @@
 
 import torch
 from torch import nn
+from omegaconf import DictConfig
 
 from crowdcount.models.anchor import AnchorPoints
 from crowdcount.models.gcn import DensityGCNProcessor, FeatureGCNProcessor
-from crowdcount.models.head import ClassificationModel, Density_pred, RegressionModel
+from crowdcount.models.head import (
+    ClassificationModel,
+    Density_pred,
+    RegressionModel,
+    DensityPred_Block3,
+    DensityPred_Block4,
+    DensityPred_Block5,
+)
 from crowdcount.models.neck import Decoder_SPD_PAFPN
 from crowdcount.plugins.gm import GateMechanism
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
@@ -23,10 +31,18 @@ class DSGCnet(nn.Module):
         use_msaa: bool = False,
         msaa_in_channels: int = 1280,
         msaa_reduction: int = 4,
+        cfg: DictConfig | None = None,
     ):
         super().__init__()
         self.backbone = backbone
         self.num_classes = 2
+        self.cfg = cfg
+        density_cfg = (
+            getattr(cfg, "density_multi_scale", None) if cfg is not None else None
+        )
+        self.use_multi_scale_density = bool(
+            getattr(density_cfg, "enabled", False) if density_cfg is not None else False
+        )
         num_anchor_points = row * line
 
         self.fusion_total = nn.Sequential(
@@ -49,6 +65,13 @@ class DSGCnet(nn.Module):
         else:
             self.pa = Decoder_SPD_PAFPN(256, 512, 512)
         self.density_pred = Density_pred()
+
+        # Multi-scale density prediction (optional)
+        if self.use_multi_scale_density:
+            self.density_pred_block3 = DensityPred_Block3()
+            self.density_pred_block4 = DensityPred_Block4()
+            self.density_pred_block5 = DensityPred_Block5()
+
         self.density_gcn = DensityGCNProcessor(k=4)
         self.feature_gcn = FeatureGCNProcessor(k=4)
         self.alpha = nn.Parameter(
@@ -67,17 +90,42 @@ class DSGCnet(nn.Module):
 
     def forward(self, samples: torch.Tensor) -> dict:
         features = self.backbone(samples)
-        # features[1]: torch.Size([1, 256, 32, 32])
-        # features[2]: torch.Size([1, 512, 16, 16])
-        # features[3]: torch.Size([1, 512, 8, 8])
-        if self.msaa is not None:
-            features = self.msaa(features)
-        features_pa = self.pa(
-            [features[1], features[2], features[3]]
-        )  # [batch_size, 256, 16, 16]
 
-        batch_size = features[0].shape[0]
+        # Convert dict to list format for compatibility with MSAA and PA-FPN
+        features_list = [features[0], features[1], features[2], features[3]]
+
+        if self.msaa is not None:
+            features_list = self.msaa(features_list)
+
+        # Use stable list indices across VGG and DINO backbones:
+        # c3: 256ch, c4: 512ch, c5: 512ch
+        c3, c4, c5 = features_list[1], features_list[2], features_list[3]
+
+        features_pa = self.pa([c3, c4, c5])  # [batch_size, 256, 16, 16]
+
+        batch_size = features_list[0].shape[0]
         density = self.density_pred(features_pa)
+
+        # Multi-scale density prediction (if enabled)
+        output_dict = {
+            "pred_logits": None,
+            "pred_points": None,
+            "density_out": density,
+        }
+
+        if self.use_multi_scale_density:
+            density_block3 = self.density_pred_block3(c3)
+            density_block4 = self.density_pred_block4(c4)
+            density_block5 = self.density_pred_block5(c5)
+
+            output_dict.update(
+                {
+                    "density_block3": density_block3,
+                    "density_block4": density_block4,
+                    "density_block5": density_block5,
+                }
+            )
+
         density_gcn_feature = self.density_gcn(density, features_pa)
         feature_gcn_feature = self.feature_gcn(features_pa)
         if self.gm is not None:
@@ -103,8 +151,7 @@ class DSGCnet(nn.Module):
         output_coord = regression + anchor_points
         output_class = classification
 
-        return {
-            "pred_logits": output_class,
-            "pred_points": output_coord,
-            "density_out": density,
-        }
+        output_dict["pred_logits"] = output_class
+        output_dict["pred_points"] = output_coord
+
+        return output_dict

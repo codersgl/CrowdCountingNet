@@ -22,6 +22,15 @@ start_epoch: 0
 checkpoints_dir: checkpoints
 tensorboard_dir: runs/dsgc
 
+# Multi-scale density prediction (experimental)
+density_multi_scale:
+  enabled: false # Enable multi-scale density prediction with auxiliary supervision
+  weights:
+    block3: 0.5 # Weight for H/8 density loss
+    block4: 1.0 # Weight for H/16 density loss (original scale)
+    block5: 0.5 # Weight for H/32 density loss
+    original: 1.0 # Weight for original PA-FPN density loss
+
 hydra:
   run:
     dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}

@@ -28,6 +28,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_msaa=getattr(cfg.model, "use_msaa", False),
         msaa_in_channels=getattr(cfg.model, "msaa_in_channels", 1280),
         msaa_reduction=getattr(cfg.model, "msaa_reduction", 4),
+        cfg=cfg,  # Pass config for multi-scale density prediction
     )
 
     if not training:

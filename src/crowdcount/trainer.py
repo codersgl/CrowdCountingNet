@@ -166,6 +166,7 @@ class Trainer:
                 self.device,
                 epoch,
                 cfg.clip_max_norm,
+                cfg=cfg,  # Pass config for multi-scale density prediction
             )
             t2 = time.time()
 

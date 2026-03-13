@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
 
 from crowdcount.models.dsgcnet import DSGCnet
 from crowdcount.plugins.gm import GateMechanism
@@ -180,3 +181,37 @@ def test_msaa_forward_shapes_match() -> None:
     assert out["pred_points"].shape[0] == 2
     assert out["pred_points"].shape[2] == 2
     assert out["density_out"].shape[0] == 2
+
+
+def test_multiscale_density_outputs_present_and_shaped() -> None:
+    """When enabled, multi-scale density outputs should exist and align with c3/c4/c5."""
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create({"density_multi_scale": {"enabled": True}})
+    model = DSGCnet(backbone, row=2, line=2, cfg=cfg).eval()
+
+    x = torch.zeros(2, 3, 128, 128)
+    with torch.no_grad():
+        feats = backbone(x)
+        out = model(x)
+
+    assert "density_block3" in out
+    assert "density_block4" in out
+    assert "density_block5" in out
+
+    assert out["density_block3"].shape == (2, 1, feats[1].shape[2], feats[1].shape[3])
+    assert out["density_block4"].shape == (2, 1, feats[2].shape[2], feats[2].shape[3])
+    assert out["density_block5"].shape == (2, 1, feats[3].shape[2], feats[3].shape[3])
+
+
+def test_multiscale_density_outputs_absent_when_disabled() -> None:
+    """When disabled, model should keep legacy output keys only."""
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create({"density_multi_scale": {"enabled": False}})
+    model = DSGCnet(backbone, row=2, line=2, cfg=cfg).eval()
+
+    with torch.no_grad():
+        out = model(torch.zeros(1, 3, 128, 128))
+
+    assert "density_block3" not in out
+    assert "density_block4" not in out
+    assert "density_block5" not in out

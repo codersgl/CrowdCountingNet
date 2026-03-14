@@ -2,7 +2,7 @@ defaults:
   - data: shha
   - model: dsgcnet
   - optimizer: adamw
-  - scheduler: step_lr
+  - scheduler: cosine_annealing
   - _self_
 
 # Runtime

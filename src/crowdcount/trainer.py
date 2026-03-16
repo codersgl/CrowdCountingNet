@@ -247,7 +247,7 @@ class Trainer:
 
                 logger.info(
                     f"[Eval] mae={result[0]:.2f}  mse={result[1]:.2f}  "
-                    f"time={t2 - t1:.1f}s  best_mae={np.min(mae_history):.2f}"
+                    f"time={t2 - t1:.1f}s  best_mae={np.min(mae_history):.2f}  best_mse={np.min(mse_history):.2f}"
                 )
                 logger.info(
                     f"[Eval] density_mae={result[2]:.2f}  density_mse={result[3]:.2f}  "

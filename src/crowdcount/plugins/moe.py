@@ -1,9 +1,9 @@
 import math
+from typing import List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
 
 
 class ContentDrivenSpatialAttention(nn.Module):
@@ -212,7 +212,7 @@ class MultiHeadAttention(nn.Module):
         """
         batch_size, input_dim, h, w = x.size()
         N = h * w
-        x = x.reshape(batch_size, N, input_dim)
+        x = x.flatten(2).transpose(1, 2).contiguous()
         Q: torch.Tensor = self.W_q(x)  # [batch_size, N, input_dim]
         K: torch.Tensor = self.W_k(x)  # [batch_size, N, input_dim]
         V: torch.Tensor = self.W_v(x)  # [batch_size, N, input_dim]
@@ -525,35 +525,669 @@ class LocalExpert(nn.Module):
 
 
 class LaplaceKernel(nn.Module):
-    def __init__(
-        self,
-    ) -> None:
+    def __init__(self, input_dim: int) -> None:
         super().__init__()
+
+        laplace = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32
+        ).reshape((1, 1, 3, 3))
+        self.register_buffer(
+            "laplace", laplace.view(1, 1, 3, 3).repeat(input_dim, 1, 1, 1)
+        )
+        self.laplace: torch.Tensor
+        self.input_dim = input_dim
 
     def forward(self, x: torch.Tensor):
 
-        device = x.device
-
-        laplace = torch.tensor(
-            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], device=device
-        ).reshape((1, 1, 3, 3))
-
-        laplace_out = F.conv2d(x, laplace, padding=1)
+        laplace_out = F.conv2d(x, self.laplace, padding=1, groups=self.input_dim)
         return laplace_out
 
 
-if __name__ == "__main__":
-    x = torch.rand(1, 256, 16, 16)
-    esca = ESCA(256)
-    global_expert = GlobalExpert(256)
-    region_expert = RegionExpert(256)
-    local_expert = LocalExpert(256)
+class GaborFilter(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        kernel_size: int = 3,
+        n_orientations: int = 8,
+        lambd_: float = 1.0,
+        sigma_ratio: float = 0.5,
+        gamma: float = 0.5,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.kernel_size = kernel_size
+        self.n_orientations = n_orientations
+        self.gamma = gamma
+        self.sigma_ratio = sigma_ratio
 
-    y_esca = esca(x)
-    y_global = global_expert(x)
-    y_region = region_expert(x)
-    y_local = local_expert(x)
-    print(y_esca.shape)
-    print(y_global.shape)
-    print(y_region.shape)
-    print(y_local.shape)
+        thetas = torch.linspace(0, 360 - 360 / n_orientations, n_orientations)
+
+        gabor_kernels = []
+        for theta in thetas:
+            kernel = self._create_single_gabor_kernel(kernel_size, theta, lambd_)
+            kernel_4d = kernel.unsqueeze(0).unsqueeze(0)  # [1, 1, kH, kW]
+            kernel_dw = kernel_4d.repeat(in_channels, 1, 1, 1)  # [C, 1, kH, kW]
+            gabor_kernels.append(kernel_dw)
+
+        gabor_kernel = torch.cat(gabor_kernels, dim=0)  # [C*8, 1, kH, kW]
+        self.register_buffer("gabor_kernel", gabor_kernel)
+        self.gabor_kernel: torch.Tensor
+
+    def _create_single_gabor_kernel(
+        self, kernel_size: int, theta_deg: torch.Tensor, lambd: float
+    ):
+        """生成单个方向的2D Gabor核"""
+        theta_rad = torch.pi * theta_deg / 180.0
+        sigma = self.sigma_ratio * lambd
+
+        # 生成坐标网格
+        x = torch.linspace(-(kernel_size - 1) / 2, (kernel_size - 1) / 2, kernel_size)
+        y = torch.linspace(-(kernel_size - 1) / 2, (kernel_size - 1) / 2, kernel_size)
+        x, y = torch.meshgrid(x, y, indexing="ij")
+
+        # 坐标旋转
+        x_prime = x * torch.cos(theta_rad) + y * torch.sin(theta_rad)
+        y_prime = -x * torch.sin(theta_rad) + y * torch.cos(theta_rad)
+
+        # Gabor核公式
+        gabor = torch.exp(
+            -(x_prime**2 + self.gamma**2 * y_prime**2) / (2 * sigma**2)
+        ) * torch.cos(2 * torch.pi * x_prime / lambd)
+
+        # 归一化
+        gabor = gabor - torch.mean(gabor)
+        gabor = gabor / (torch.norm(gabor) + 1e-8)
+
+        return gabor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        输入: [B, C, H, W]
+        输出: [B, C * n_orientations, H, W]
+        """
+        _, C, _, _ = x.shape
+        outputs = []
+
+        # 对每个方向分别应用 depthwise 卷积
+        for i in range(self.n_orientations):
+            # 提取第 i 个方向的 kernel: [C, 1, kH, kW]
+            kernel_i = self.gabor_kernel[i * C : (i + 1) * C]  # [C, 1, kH, kW]
+
+            # Depthwise 卷积：groups=C，每个输入通道独立卷积
+            out_i = F.conv2d(
+                x,
+                kernel_i,
+                padding=(self.kernel_size - 1) // 2,
+                groups=C,
+            )  # [B, C, H, W]
+            outputs.append(out_i)
+
+        # 拼接所有方向的输出: [B, C*8, H, W]
+        return torch.cat(outputs, dim=1)
+
+
+class TextureExpert(nn.Module):
+    def __init__(self, input_dim: int) -> None:
+        super().__init__()
+        self.gabor_filter_3x3 = GaborFilter(input_dim, kernel_size=3, lambd_=7)
+        self.gabor_filter_5x5 = GaborFilter(input_dim, kernel_size=5, lambd_=15)
+        self.highfreq_enhance = nn.Sequential(
+            nn.Conv2d(input_dim, input_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+            nn.Conv2d(input_dim, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.sobel_kernel = SobelKernel(input_dim)
+        self.laplace_kernel = LaplaceKernel(input_dim)
+
+        gabor_channels = input_dim * 8  # 每个Gabor输出 C*8 通道
+
+        total_channels = (
+            gabor_channels * 2 + input_dim * 2
+        )  # 2个Gabor + Sobel + Laplace
+
+        self.feature_fusion = nn.Sequential(
+            nn.Conv2d(total_channels, total_channels // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(total_channels // 2),
+            nn.GELU(),
+            nn.Conv2d(total_channels // 2, input_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+        )
+
+        self.channel_attention = ChannelAttention(input_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+
+        Args:
+            x: [batch_size, input_dim, h, w]
+
+        Returns:
+            [TODO:return]
+        """
+        gabor_filter_3x3_output = self.gabor_filter_3x3(
+            x
+        )  # [batch_size, 8 * input_dim, h, w]
+        gabor_filter_5x5_output = self.gabor_filter_5x5(
+            x
+        )  # [batch_size, 8 * input_dim, h, w]
+        f_enhanced = x * self.highfreq_enhance(x)  # [batch_size, input_dim, h, w]
+        f_sobel_filted = self.sobel_kernel(f_enhanced)  # [batch_size, input_dim, h, w]
+        f_laplace_filted = self.laplace_kernel(
+            f_enhanced
+        )  # [batch_size, input_dim, h, w]
+        f_texture = torch.cat(
+            [
+                gabor_filter_3x3_output,
+                gabor_filter_5x5_output,
+                f_sobel_filted,
+                f_laplace_filted,
+            ],
+            dim=1,
+        )  # [batch_size, 18 * input_dim, h, w]
+        f_texture = self.feature_fusion(f_texture)  # [batch_size, input_dim, h, w]
+        f_texture = self.channel_attention(f_texture)  # [batch_size, input_dim, h, w]
+        return f_texture
+
+
+class RelationalFeature(nn.Module):
+    def __init__(self, input_dim: int) -> None:
+        super().__init__()
+        # Non-Local Block: Q/K 压缩到 C/2
+        self.W_q = nn.Linear(input_dim, input_dim // 2)
+        self.W_k = nn.Linear(input_dim, input_dim // 2)
+        self.W_v = nn.Linear(input_dim, input_dim)
+        self.W_o = nn.Linear(input_dim, input_dim)
+
+        # GAP → FC(2C) → LN → GELU → FC(C) → LN
+        self.relation_net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(start_dim=1),  # [B, C]
+            nn.Linear(input_dim, 2 * input_dim),
+            nn.LayerNorm(2 * input_dim),
+            nn.GELU(),
+            nn.Linear(2 * input_dim, input_dim),
+            nn.LayerNorm(input_dim),
+        )
+
+    def forward(self, x: torch.Tensor):
+        """
+        x: 原始输入特征 [B, C, H, W]
+        part_features: Part Extractor 输出的部件特征 [B, C, H, W]
+        """
+        b, c, h, w = x.size()
+
+        # Self-Attention (Non-Local Block)
+        f_flat = x.reshape(b, c, -1).transpose(-1, -2)  # [B, H*W, C]
+        Q = self.W_q(f_flat)  # [B, H*W, C/2]
+        K = self.W_k(f_flat)  # [B, H*W, C/2]
+        V = self.W_v(f_flat)  # [B, H*W, C]
+
+        attn_score = Q @ K.transpose(-1, -2) / math.sqrt(c // 2)
+        attn_weight = F.softmax(attn_score, dim=-1)
+        attn_output = attn_weight @ V  # [B, H*W, C]
+        attn_output = self.W_o(attn_output)  # [B, H*W, C]
+        attn_output = attn_output.transpose(-1, -2).reshape(b, c, h, w)
+
+        # 关系推理：从全局特征生成门控信号
+        gate = self.relation_net(attn_output)  # [B, C]
+        gate = gate.view(b, c, 1, 1)  # [B, C, 1, 1] 广播
+
+        f_relational = attn_output * gate
+
+        return f_relational
+
+
+class PartExpert(nn.Module):
+    def __init__(self, input_dim: int, N: int = 8) -> None:
+        super().__init__()
+        self.part_detector = nn.Sequential(
+            nn.Conv2d(input_dim, input_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+            nn.Conv2d(input_dim, input_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+            nn.Conv2d(input_dim, N, kernel_size=3, padding=1),
+            nn.Sigmoid(),
+        )
+        self.part_extractor = nn.Sequential(
+            nn.Conv2d(input_dim + N, (input_dim + N) // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d((input_dim + N) // 2),
+            nn.GELU(),
+            nn.Conv2d((input_dim + N) // 2, input_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+        )
+        self.relational_features = RelationalFeature(input_dim=input_dim)
+
+        self.spatial_features = nn.Sequential(
+            nn.Conv2d(
+                input_dim,
+                input_dim,
+                kernel_size=3,
+                padding=2,
+                dilation=2,
+                groups=input_dim,
+            ),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+            nn.Conv2d(
+                input_dim,
+                input_dim,
+                kernel_size=3,
+                padding=4,
+                dilation=4,
+                groups=input_dim,
+            ),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+        )
+        self.feature_fuse = nn.Sequential(
+            nn.Conv2d(input_dim * 3, input_dim * 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(input_dim * 2),
+            nn.GELU(),
+            nn.Conv2d(input_dim * 2, input_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        f_detected = self.part_detector(x)  # [batch_size, N, h, w]
+        f_detected = torch.cat(
+            [x, f_detected], dim=1
+        )  # [batch_size, input_dim + N, h, w]
+        f_part = self.part_extractor(f_detected)  # [batch_size, input_dim, h, w]
+        f_relational = self.relational_features(f_part)  # [batch_size, input_dim, h, w]
+        f_spatial = self.spatial_features(f_part)  # [batch_size, input_dim, h, w]
+        f_part = torch.cat(
+            [f_relational, f_part, f_spatial], dim=1
+        )  # [batch_size, 3 * input_dim, h, w]
+        f_part = self.feature_fuse(f_part)  # [batch_size, input_dim, h, w]
+        return f_part
+
+
+class SpatialContextEncoder(nn.Module):
+    """
+    空间上下文编码器：提取全局+局部空间特征
+    论文3.4节: "extracts both global and local information"
+    """
+
+    def __init__(self, input_dim: int, spatial_grid: int = 4):
+        super().__init__()
+        self.spatial_grid = spatial_grid
+
+        # 空间网格特征处理: [B, C, 4, 4] → [B, C//2, 4, 4] → [B, C//2 * 16]
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(input_dim, input_dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(input_dim // 2),
+            nn.GELU(),
+            nn.Conv2d(input_dim // 2, input_dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(input_dim // 2),
+            nn.GELU(),
+        )
+
+        # 融合层: global(C) + spatial(C//2 * 16) → expert_scores(5)
+        self.fusion = nn.Sequential(
+            nn.Linear(
+                input_dim + input_dim // 2 * spatial_grid * spatial_grid, input_dim
+            ),
+            nn.LayerNorm(input_dim),
+            nn.GELU(),
+            nn.Linear(input_dim, 5),  # 5个专家
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, H, W] 来自MSP模块的特征
+        Returns:
+            scores: [B, 5] 专家重要性分数
+        """
+        B, C, _, _ = x.shape
+
+        # 1. 全局特征: Global Average Pooling → [B, C]
+        f_global = F.adaptive_avg_pool2d(x, 1).view(B, C)
+
+        # 2. 空间网格特征: Adaptive Pool → [B, C, 4, 4]
+        f_spatial = F.adaptive_avg_pool2d(x, self.spatial_grid)  # [B, C, 4, 4]
+        f_spatial = self.spatial_conv(f_spatial)  # [B, C//2, 4, 4]
+        f_spatial = f_spatial.view(B, -1)  # [B, C//2 * 16]
+
+        # 3. 特征融合 → 专家分数
+        f_fused = torch.cat([f_global, f_spatial], dim=1)  # [B, C + C//2*16]
+        scores = self.fusion(f_fused)  # [B, 5]
+
+        return scores
+
+
+class DynamicRouter(nn.Module):
+    """
+    动态路由策略：训练/测试阶段使用不同策略
+    论文3.5节: Hard routing (training) / Soft routing (testing)
+    """
+
+    def __init__(self, num_experts: int = 5, top_k: int = 2, temperature: float = 1.0):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.temperature = temperature
+
+    def _gumbel_softmax(
+        self, logits: torch.Tensor, tau: float = 1.0, hard: bool = False
+    ):
+        """Gumbel-Softmax 实现（训练时硬路由）"""
+        gumbels = -torch.empty_like(logits).exponential_().log()
+        gumbels = (logits + gumbels) / tau
+        y_soft = gumbels.softmax(dim=-1)
+
+        if hard:
+            # Straight-through estimator
+            index = y_soft.max(dim=-1, keepdim=True)[1]
+            y_hard = torch.zeros_like(logits).scatter_(-1, index, 1.0)
+            return y_hard - y_soft.detach() + y_soft
+        return y_soft
+
+    def forward(self, scores: torch.Tensor, training: bool = True) -> torch.Tensor:
+        """
+        Args:
+            scores: [B, 5] 专家重要性分数
+            training: 是否训练阶段
+        Returns:
+            weights: [B, 5] 专家权重（hard: 0/1, soft: 连续值）
+        """
+        if training:
+            # Hard routing: Gumbel-Softmax + Top-K
+            # 1. Gumbel-Softmax 采样
+            probs = self._gumbel_softmax(scores / self.temperature, hard=True)
+
+            # 2. Top-K 选择
+            _, top_idx = torch.topk(probs, self.top_k, dim=-1)
+            weights = torch.zeros_like(probs).scatter_(-1, top_idx, 1.0)
+        else:
+            # Soft routing: Softmax 连续权重
+            weights = F.softmax(scores / self.temperature, dim=-1)
+
+        return weights
+
+
+class MoELoss(nn.Module):
+    """
+    MoE系统的辅助损失函数
+    论文3.5节: balance + diversity + orthogonality losses
+    """
+
+    def __init__(
+        self,
+        lambda_balance: float = 0.835,
+        lambda_diversity: float = 0.185,
+        lambda_ortho: float = 0.185,
+        usage_threshold: float = 0.1,
+    ):
+        super().__init__()
+        self.lambda_balance = lambda_balance
+        self.lambda_diversity = lambda_diversity
+        self.lambda_ortho = lambda_ortho
+        self.usage_threshold = usage_threshold
+
+    def _balance_loss(self, expert_usage: torch.Tensor) -> torch.Tensor:
+        """
+        平衡损失: 鼓励专家均匀使用
+        expert_usage: [5] 每个专家的使用频率（0~1）
+        """
+        num_experts = expert_usage.size(0)
+
+        # 1. 熵 deficit: 最大化使用分布的熵
+        p = expert_usage + 1e-8
+        current_entropy = -(p * torch.log(p)).sum()
+        max_entropy = torch.log(
+            torch.tensor(
+                float(num_experts),
+                device=expert_usage.device,
+                dtype=expert_usage.dtype,
+            )
+        )
+        l_entropy = max_entropy - current_entropy
+
+        # 2. 低使用率惩罚
+        l_low = torch.sum(torch.relu(self.usage_threshold - expert_usage) ** 2)
+
+        return l_entropy + l_low
+
+    def _diversity_loss(self, expert_outputs: list) -> torch.Tensor:
+        """
+        多样性损失: 最小化专家输出间的余弦相似度
+        expert_outputs: List[Tensor] 每个专家的输出 [B, C, H, W]
+        """
+        # 全局平均池化后计算余弦相似度
+        features = [
+            F.adaptive_avg_pool2d(f, 1).view(f.size(0), -1) for f in expert_outputs
+        ]
+        features = torch.stack(features, dim=0)  # [5, B, D]
+
+        # 计算所有专家对的余弦相似度
+        loss = torch.tensor(0.0, device=features.device, dtype=features.dtype)
+        count = 0
+        for i in range(len(features)):
+            for j in range(i + 1, len(features)):
+                cos_sim = F.cosine_similarity(features[i], features[j], dim=-1).mean()
+                loss += cos_sim
+                count += 1
+        return (
+            loss / count
+            if count > 0
+            else torch.tensor(0.0, device=features.device, dtype=features.dtype)
+        )
+
+    def _orthogonality_loss(self, expert_outputs: list) -> torch.Tensor:
+        """
+        正交性损失: 鼓励专家特征在空间中正交
+        """
+        features = [
+            F.adaptive_avg_pool2d(f, 1).view(f.size(0), -1) for f in expert_outputs
+        ]
+        features = torch.stack(features, dim=0)  # [5, B, D]
+
+        # 计算 Gram 矩阵的 Frobenius 范数
+        loss = torch.tensor(0.0, device=features.device, dtype=features.dtype)
+        count = 0
+        for i in range(len(features)):
+            for j in range(i + 1, len(features)):
+                # G_i^T @ G_j 的 Frobenius 范数
+                gram = features[i].unsqueeze(-1) @ features[j].unsqueeze(
+                    -2
+                )  # [B, D, D]
+                loss += torch.norm(gram, p="fro") ** 2
+                count += 1
+        return (
+            loss / count
+            if count > 0
+            else torch.tensor(0.0, device=features.device, dtype=features.dtype)
+        )
+
+    def forward(self, expert_weights: torch.Tensor, expert_outputs: list) -> dict:
+        """
+        Args:
+            expert_weights: [B, 5] 专家权重
+            expert_outputs: List[Tensor] 5个专家的输出
+        Returns:
+            losses: dict 包含各辅助损失
+        """
+        # 计算专家使用率
+        expert_usage = expert_weights.mean(dim=0)  # [5]
+
+        losses = {
+            "l_balance": self._balance_loss(expert_usage),
+            "l_diversity": self._diversity_loss(expert_outputs),
+            "l_ortho": self._orthogonality_loss(expert_outputs),
+        }
+
+        # 加权总损失
+        total_aux = (
+            self.lambda_balance * losses["l_balance"]
+            + self.lambda_diversity * losses["l_diversity"]
+            + self.lambda_ortho * losses["l_ortho"]
+        )
+        losses["total_aux"] = total_aux
+
+        return losses
+
+
+class GatingNetwork(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        top_k: int = 2,
+        temperature_init: float = 1.0,
+        temperature_min: float = 0.1,
+    ):
+        super().__init__()
+        self.top_k = top_k
+        self.temperature = temperature_init
+        self.temperature_min = temperature_min
+
+        # 核心组件
+        self.context_encoder = SpatialContextEncoder(input_dim)
+        self.router = DynamicRouter(num_experts=5, top_k=top_k)
+        self.loss_fn = MoELoss()
+
+        # 温度衰减调度
+        self.register_buffer("step", torch.tensor(0))
+
+    def update_temperature(self, decay_rate: float = 0.9999):
+        """逐步降低温度，使训练后期路由更确定"""
+        self.temperature = max(self.temperature * decay_rate, self.temperature_min)
+        self.step += 1
+
+    def forward(
+        self, x: torch.Tensor, expert_outputs: list, training: bool = True
+    ) -> tuple:
+        """
+        Args:
+            x: [B, C, H, W] 输入特征
+            expert_outputs: List[Tensor] 5个专家的输出
+            training: 是否训练阶段
+        Returns:
+            fused_output: [B, C, H, W] 融合后的特征
+            losses: dict 辅助损失
+        """
+        # 1. 获取专家分数
+        scores = self.context_encoder(x)  # [B, 5]
+
+        # 2. 动态路由获取权重
+        weights = self.router(scores, training=training)  # [B, 5]
+
+        # 3. 特征融合: F_MoE = Σ w_i * F_Ei
+        fused = torch.zeros_like(expert_outputs[0])
+        for _, (w, f) in enumerate(zip(weights.unbind(dim=1), expert_outputs)):
+            fused += w.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * f
+
+        # 4. 计算辅助损失（仅训练时）
+        losses = {}
+        if training:
+            losses = self.loss_fn(weights, expert_outputs)
+
+        return fused, losses, weights
+
+
+class MoE(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        top_k: int = 2,
+        temperature_init: float = 1.0,
+        temperature_min: float = 0.1,
+        lambda_balance: float = 0.835,
+        lambda_diversity: float = 0.185,
+        lambda_ortho: float = 0.185,
+    ):
+        super().__init__()
+
+        self.top_k = top_k
+        self.temperature = temperature_init
+        self.temperature_min = temperature_min
+
+        # ========== 1. 五个专家模块 ==========
+        self.global_expert = GlobalExpert(input_dim)
+        self.region_expert = RegionExpert(input_dim)
+        self.local_expert = LocalExpert(input_dim)
+        self.texture_expert = TextureExpert(input_dim)
+        self.part_expert = PartExpert(input_dim)
+        self.experts = nn.ModuleList(
+            [
+                self.global_expert,
+                self.region_expert,
+                self.local_expert,
+                self.texture_expert,
+                self.part_expert,
+            ]
+        )
+
+        # ========== 2. 门控网络 ==========
+        self.context_encoder = SpatialContextEncoder(input_dim)
+        self.router = DynamicRouter(num_experts=5, top_k=top_k)
+
+        # ========== 3. 辅助损失 ==========
+        self.aux_loss = MoELoss(
+            lambda_balance=lambda_balance,
+            lambda_diversity=lambda_diversity,
+            lambda_ortho=lambda_ortho,
+        )
+
+        # 训练阶段标记
+        self.register_buffer("step", torch.tensor(0))
+        self.training_stage = "specialization"  # 'specialization' or 'coordination'
+
+    def update_temperature(self, decay_rate: float = 0.9999):
+        """逐步降低温度，使训练后期路由更确定"""
+        self.temperature = max(self.temperature * decay_rate, self.temperature_min)
+        self.step += 1
+
+    def set_training_stage(self, stage: str):
+        """设置训练阶段: 'specialization' 或 'coordination'"""
+        self.training_stage = stage
+
+    def forward(self, x: torch.Tensor, training: bool = True) -> tuple:
+        """
+        Args:
+            x: [B, C, H, W] 输入特征（来自MSP模块）
+            training: 是否训练阶段
+        Returns:
+            fused_output: [B, C, H, W] 融合后的特征
+            aux_losses: dict 辅助损失（训练时）
+            expert_weights: [B, 5] 专家权重（可选，用于可视化）
+        """
+        # ========== 1. 前向传播通过5个专家 ==========
+        expert_outputs = [expert(x) for expert in self.experts]  # List of [B, C, H, W]
+
+        # ========== 2. 门控网络获取专家权重 ==========
+        scores = self.context_encoder(x)  # [B, 5]
+
+        if training and self.training_stage == "coordination":
+            # 协调学习阶段：使用动态路由
+            weights = self.router(scores, training=True)  # [B, 5], hard routing
+        elif training and self.training_stage == "specialization":
+            # 专家专精阶段：均匀路由（冻结门控）
+            B = x.size(0)
+            weights = torch.zeros(B, 5, device=x.device)
+            for i in range(B):
+                expert_idx = i % 5  # 轮询分配
+                weights[i, expert_idx] = 1.0
+        else:
+            # 测试阶段：软路由
+            weights = self.router(scores, training=False)  # [B, 5], soft routing
+
+        # ========== 3. 特征融合: F_MoE = Σ w_i * F_Ei ==========
+        fused = torch.zeros_like(expert_outputs[0])
+        for i, (w, f) in enumerate(zip(weights.unbind(dim=1), expert_outputs)):
+            # w: [B], f: [B, C, H, W]
+            fused += w.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * f
+
+        # ========== 4. 计算辅助损失（仅训练时） ==========
+        aux_losses = {}
+        if training:
+            aux_losses = self.aux_loss(weights, expert_outputs)
+
+        return fused, aux_losses, weights

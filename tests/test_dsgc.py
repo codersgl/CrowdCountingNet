@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 
 from crowdcount.models.dsgcnet import DSGCnet
 from crowdcount.plugins.gm import GateMechanism
+from crowdcount.plugins.moe import ESCA, MoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
 
@@ -99,7 +100,15 @@ def test_batch_consistency(model):
 
 def test_alpha_learnable(model):
     """alpha parameters should be learnable."""
+    assert model.alpha is not None
     assert model.alpha.requires_grad
+
+
+def test_alpha_absent_in_moe_mode() -> None:
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create({"top_k": 2})
+    model = DSGCnet(backbone, row=2, line=2, fusion_mode="esca_moe", moe_cfg=cfg)
+    assert model.alpha is None
 
 
 def test_gate_mechanism_initialized_when_enabled() -> None:
@@ -215,3 +224,51 @@ def test_multiscale_density_outputs_absent_when_disabled() -> None:
     assert "density_block3" not in out
     assert "density_block4" not in out
     assert "density_block5" not in out
+
+
+def test_moe_initialized_when_enabled() -> None:
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create({"top_k": 2})
+    model = DSGCnet(backbone, row=2, line=2, fusion_mode="esca_moe", moe_cfg=cfg)
+    assert model.esca is not None
+    assert model.moe is not None
+    assert isinstance(model.esca, ESCA)
+    assert isinstance(model.moe, MoE)
+
+
+def test_moe_forward_shapes_match() -> None:
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create({"top_k": 2})
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        fusion_mode="esca_moe",
+        moe_cfg=cfg,
+    ).eval()
+
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_logits"].shape[2] == 2
+    assert out["pred_points"].shape[0] == 2
+    assert out["pred_points"].shape[2] == 2
+    assert out["density_out"].shape[0] == 2
+    assert out["moe_weights"] is not None
+
+
+def test_moe_outputs_aux_losses_in_train_mode() -> None:
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create({"top_k": 2})
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        fusion_mode="esca_moe",
+        moe_cfg=cfg,
+    ).train()
+
+    out = model(torch.zeros(1, 3, 128, 128))
+    assert out["moe_aux_losses"] is not None
+    assert out["moe_aux_total"] is not None

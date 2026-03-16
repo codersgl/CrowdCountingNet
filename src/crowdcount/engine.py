@@ -53,6 +53,17 @@ def train_one_epoch(
     use_multi_scale_density = bool(
         getattr(density_cfg, "enabled", False) if density_cfg is not None else False
     )
+    model_moe_cfg = getattr(getattr(cfg, "model", None), "moe", None)
+    moe_aux_weight = (
+        float(getattr(model_moe_cfg, "aux_loss_weight", 1.0))
+        if model_moe_cfg is not None
+        else 1.0
+    )
+    moe_temperature_decay = (
+        float(getattr(model_moe_cfg, "temperature_decay", 0.9999))
+        if model_moe_cfg is not None
+        else 0.9999
+    )
 
     for samples, targets, gt_dmap in data_loader:
         samples = samples.to(device)
@@ -136,7 +147,12 @@ def train_one_epoch(
             # Single-scale density prediction (original behavior)
             density_loss = density_criterion(et_dmap, gt_dmap) / gt_dmap.shape[0] * 0.01
 
-        loss_sum = losses + density_loss
+        moe_aux_total = outputs.get("moe_aux_total")
+        moe_aux_component = torch.tensor(0.0, device=samples.device)
+        if moe_aux_total is not None:
+            moe_aux_component = moe_aux_weight * moe_aux_total
+
+        loss_sum = losses + density_loss + moe_aux_component
 
         loss_dict_reduced = reduce_dict(loss_dict)
         loss_dict_reduced_unscaled = {
@@ -161,6 +177,10 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
 
+        update_temperature = getattr(model, "update_moe_temperature", None)
+        if callable(update_temperature):
+            update_temperature(decay_rate=moe_temperature_decay)
+
         metric_logger.update(
             loss_sum=loss_sum.item(),
             losses=loss_value,
@@ -168,6 +188,21 @@ def train_one_epoch(
             **loss_dict_reduced_scaled,
             **loss_dict_reduced_unscaled,
         )
+
+        if moe_aux_total is not None:
+            metric_logger.update(
+                moe_aux_total=moe_aux_component.item(),
+                moe_aux_raw=float(moe_aux_total.item()),
+            )
+            moe_aux_losses = outputs.get("moe_aux_losses") or {}
+            for key in ("l_balance", "l_diversity", "l_ortho"):
+                if key in moe_aux_losses:
+                    metric_logger.update(**{key: float(moe_aux_losses[key].item())})
+
+            moe_module = getattr(model, "moe", None)
+            if moe_module is not None:
+                metric_logger.update(moe_temperature=float(moe_module.temperature))
+
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
     metric_logger.synchronize_between_processes()

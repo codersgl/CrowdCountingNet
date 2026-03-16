@@ -16,6 +16,7 @@ from crowdcount.models.head import (
 )
 from crowdcount.models.neck import Decoder_SPD_PAFPN
 from crowdcount.plugins.gm import GateMechanism
+from crowdcount.plugins.moe import ESCA, MoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
 
@@ -25,18 +26,28 @@ class DSGCnet(nn.Module):
         backbone: nn.Module,
         row: int = 2,
         line: int = 2,
+        fusion_mode: str = "gcn",
         use_gm: bool = False,
         gm_input_dim: int = 256,
         gm_hidden_dim: int = 128,
         use_msaa: bool = False,
         msaa_in_channels: int = 1280,
         msaa_reduction: int = 4,
+        moe_cfg: DictConfig | None = None,
         cfg: DictConfig | None = None,
     ):
         super().__init__()
         self.backbone = backbone
         self.num_classes = 2
         self.cfg = cfg
+        self.fusion_mode = fusion_mode
+        self.use_moe = fusion_mode == "esca_moe"
+
+        if self.fusion_mode not in {"gcn", "esca_moe"}:
+            raise ValueError(
+                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn' or 'esca_moe'"
+            )
+
         density_cfg = (
             getattr(cfg, "density_multi_scale", None) if cfg is not None else None
         )
@@ -72,21 +83,94 @@ class DSGCnet(nn.Module):
             self.density_pred_block4 = DensityPred_Block4()
             self.density_pred_block5 = DensityPred_Block5()
 
-        self.density_gcn = DensityGCNProcessor(k=4)
-        self.feature_gcn = FeatureGCNProcessor(k=4)
-        self.alpha = nn.Parameter(
-            torch.tensor([1.0, 1.0], dtype=torch.float32, requires_grad=True)
-        )
-        self.gm: GateMechanism | None = (
-            GateMechanism(input_dim=gm_input_dim, hidden_dim=gm_hidden_dim)
-            if use_gm
-            else None
-        )
+        if self.use_moe:
+            top_k = int(getattr(moe_cfg, "top_k", 2)) if moe_cfg is not None else 2
+            temperature_init = (
+                float(getattr(moe_cfg, "temperature_init", 1.0))
+                if moe_cfg is not None
+                else 1.0
+            )
+            temperature_min = (
+                float(getattr(moe_cfg, "temperature_min", 0.1))
+                if moe_cfg is not None
+                else 0.1
+            )
+            lambda_balance = (
+                float(getattr(moe_cfg, "lambda_balance", 0.835))
+                if moe_cfg is not None
+                else 0.835
+            )
+            lambda_diversity = (
+                float(getattr(moe_cfg, "lambda_diversity", 0.185))
+                if moe_cfg is not None
+                else 0.185
+            )
+            lambda_ortho = (
+                float(getattr(moe_cfg, "lambda_ortho", 0.185))
+                if moe_cfg is not None
+                else 0.185
+            )
+
+            self.esca: ESCA | None = ESCA(256)
+            self.moe: MoE | None = MoE(
+                input_dim=256,
+                top_k=top_k,
+                temperature_init=temperature_init,
+                temperature_min=temperature_min,
+                lambda_balance=lambda_balance,
+                lambda_diversity=lambda_diversity,
+                lambda_ortho=lambda_ortho,
+            )
+            self.density_gcn = None
+            self.feature_gcn = None
+            self.alpha = None
+            self.gm = None
+        else:
+            self.density_gcn: DensityGCNProcessor | None = DensityGCNProcessor(k=4)
+            self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(k=4)
+            self.alpha: nn.Parameter | None = nn.Parameter(
+                torch.tensor([1.0, 1.0], dtype=torch.float32, requires_grad=True)
+            )
+            self.gm: GateMechanism | None = (
+                GateMechanism(input_dim=gm_input_dim, hidden_dim=gm_hidden_dim)
+                if use_gm
+                else None
+            )
+            self.esca = None
+            self.moe = None
+
         self.msaa: MsaaAdaptiveLayer | None = (
             MsaaAdaptiveLayer(in_channels=msaa_in_channels, reduction=msaa_reduction)
             if use_msaa
             else None
         )
+
+    def supports_moe(self) -> bool:
+        return self.use_moe and self.moe is not None
+
+    def get_moe_gating_parameters(self) -> list[nn.Parameter]:
+        if self.moe is None:
+            return []
+        return list(self.moe.context_encoder.parameters()) + list(
+            self.moe.router.parameters()
+        )
+
+    def set_moe_gating_trainable(self, trainable: bool) -> None:
+        if self.moe is None:
+            return
+        for parameter in self.get_moe_gating_parameters():
+            parameter.requires_grad = trainable
+
+    def set_moe_training_stage(self, stage: str) -> None:
+        if self.moe is None:
+            return
+        self.moe.set_training_stage(stage)
+        self.set_moe_gating_trainable(stage == "coordination")
+
+    def update_moe_temperature(self, decay_rate: float = 0.9999) -> None:
+        if self.moe is None:
+            return
+        self.moe.update_temperature(decay_rate=decay_rate)
 
     def forward(self, samples: torch.Tensor) -> dict:
         features = self.backbone(samples)
@@ -111,6 +195,9 @@ class DSGCnet(nn.Module):
             "pred_logits": None,
             "pred_points": None,
             "density_out": density,
+            "moe_aux_losses": None,
+            "moe_aux_total": None,
+            "moe_weights": None,
         }
 
         if self.use_multi_scale_density:
@@ -126,24 +213,37 @@ class DSGCnet(nn.Module):
                 }
             )
 
-        density_gcn_feature = self.density_gcn(density, features_pa)
-        feature_gcn_feature = self.feature_gcn(features_pa)
-        if self.gm is not None:
-            gate_weight = self.gm(features_pa)
-            w_1 = gate_weight[:, 0].view(-1, 1, 1, 1)
-            w_2 = gate_weight[:, 1].view(-1, 1, 1, 1)
-            w_3 = gate_weight[:, 2].view(-1, 1, 1, 1)
-            feature_fl = (
-                features_pa * w_1
-                + density_gcn_feature * w_2
-                + feature_gcn_feature * w_3
+        if self.use_moe:
+            assert self.esca is not None and self.moe is not None
+            esca_feature = self.esca(features_pa)
+            feature_fl, moe_aux_losses, moe_weights = self.moe(
+                esca_feature, training=self.training
             )
+            output_dict["moe_aux_losses"] = moe_aux_losses
+            output_dict["moe_aux_total"] = moe_aux_losses.get("total_aux")
+            output_dict["moe_weights"] = moe_weights
         else:
-            feature_fl = (
-                features_pa
-                + self.alpha[0] * density_gcn_feature
-                + self.alpha[1] * feature_gcn_feature
-            )
+            assert self.density_gcn is not None
+            assert self.feature_gcn is not None
+            density_gcn_feature = self.density_gcn(density, features_pa)
+            feature_gcn_feature = self.feature_gcn(features_pa)
+            if self.gm is not None:
+                gate_weight = self.gm(features_pa)
+                w_1 = gate_weight[:, 0].view(-1, 1, 1, 1)
+                w_2 = gate_weight[:, 1].view(-1, 1, 1, 1)
+                w_3 = gate_weight[:, 2].view(-1, 1, 1, 1)
+                feature_fl = (
+                    features_pa * w_1
+                    + density_gcn_feature * w_2
+                    + feature_gcn_feature * w_3
+                )
+            else:
+                assert self.alpha is not None
+                feature_fl = (
+                    features_pa
+                    + self.alpha[0] * density_gcn_feature
+                    + self.alpha[1] * feature_gcn_feature
+                )
 
         regression = self.regression(feature_fl) * 100
         classification = self.classification(feature_fl)

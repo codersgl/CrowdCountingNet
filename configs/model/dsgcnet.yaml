@@ -12,3 +12,18 @@ gm_hidden_dim: 128
 use_msaa: false
 msaa_in_channels: 1280
 msaa_reduction: 4
+
+# Feature fusion branch selection: gcn | esca_moe
+fusion_mode: gcn
+
+moe:
+  top_k: 2
+  temperature_init: 1.0
+  temperature_min: 0.1
+  temperature_decay: 0.9999
+  stage1_ratio: 0.3
+  stage2_gating_lr_multiplier: 2.0
+  aux_loss_weight: 1.0
+  lambda_balance: 0.835
+  lambda_diversity: 0.185
+  lambda_ortho: 0.185

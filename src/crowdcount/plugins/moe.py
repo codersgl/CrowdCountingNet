@@ -279,9 +279,14 @@ class SENet(nn.Module):
 
 class GlobalExpert(nn.Module):
     def __init__(
-        self, input_dim: int, num_heads: int = 8, dropout: float = 0.1
+        self,
+        input_dim: int,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        max_attn_tokens: int = 1024,
     ) -> None:
         super().__init__()
+        self.max_attn_tokens = max_attn_tokens
         self.multi_attention = MultiHeadAttention(
             input_dim, num_heads=num_heads, dropout=dropout
         )
@@ -308,11 +313,33 @@ class GlobalExpert(nn.Module):
             [TODO:return]
         """
         b, c, h, w = x.size()
-        f_attention = self.multi_attention(x)  # [batch_size, h * w, input_dim]
+
+        attn_input = x
+        attn_h, attn_w = h, w
+        if h * w > self.max_attn_tokens:
+            ratio = math.sqrt(self.max_attn_tokens / float(h * w))
+            attn_h = max(1, int(h * ratio))
+            attn_w = max(1, int(w * ratio))
+            attn_input = F.adaptive_avg_pool2d(x, output_size=(attn_h, attn_w))
+
+        f_attention = self.multi_attention(
+            attn_input
+        )  # [batch_size, attn_h * attn_w, input_dim]
         f_enhanced = self.feature_enhancement(
             f_attention
-        )  # [batch_size, h * w, input_dim]
-        f_enhanced = f_enhanced.reshape(b, c, h, w)  # [batch_size, input_dim, h, w]
+        )  # [batch_size, attn_h * attn_w, input_dim]
+        f_enhanced = f_enhanced.reshape(
+            b, c, attn_h, attn_w
+        )  # [batch_size, input_dim, attn_h, attn_w]
+
+        if attn_h != h or attn_w != w:
+            f_enhanced = F.interpolate(
+                f_enhanced,
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            )
+
         f_global = self.channel_attention(f_enhanced)  # [batch_size, input_dim, h, w]
         output = torch.cat([x, f_global], dim=1)  # [batch_size, 2 * input_dim, h, w]
         output = self.feature_fusion(output)
@@ -899,13 +926,19 @@ class DynamicRouter(nn.Module):
             weights: [B, 5] 专家权重（hard: 0/1, soft: 连续值）
         """
         if training:
-            # Hard routing: Gumbel-Softmax + Top-K
-            # 1. Gumbel-Softmax 采样
-            probs = self._gumbel_softmax(scores / self.temperature, hard=True)
+            # Hard Top-K routing with straight-through gradient.
+            # Forward uses hard discrete routing, backward follows soft selected probs.
+            tau = max(self.temperature, 1e-6)
+            gumbels = -torch.empty_like(scores).exponential_().log()
+            noisy_scores = (scores + gumbels) / tau
+            probs = F.softmax(noisy_scores, dim=-1)
 
-            # 2. Top-K 选择
-            _, top_idx = torch.topk(probs, self.top_k, dim=-1)
-            weights = torch.zeros_like(probs).scatter_(-1, top_idx, 1.0)
+            k = min(self.top_k, scores.size(-1))
+            _, top_idx = torch.topk(noisy_scores, k, dim=-1)
+            hard_mask = torch.zeros_like(probs).scatter_(-1, top_idx, 1.0)
+
+            selected_soft = probs * hard_mask
+            weights = hard_mask - selected_soft.detach() + selected_soft
         else:
             # Soft routing: Softmax 连续权重
             weights = F.softmax(scores / self.temperature, dim=-1)
@@ -939,9 +972,12 @@ class MoELoss(nn.Module):
         """
         num_experts = expert_usage.size(0)
 
+        # Normalize usage to a valid probability distribution for entropy metrics.
+        p = torch.clamp(expert_usage, min=0.0)
+        p = p / (p.sum() + 1e-8)
+
         # 1. 熵 deficit: 最大化使用分布的熵
-        p = expert_usage + 1e-8
-        current_entropy = -(p * torch.log(p)).sum()
+        current_entropy = -(p * torch.log(p + 1e-8)).sum()
         max_entropy = torch.log(
             torch.tensor(
                 float(num_experts),
@@ -952,7 +988,7 @@ class MoELoss(nn.Module):
         l_entropy = max_entropy - current_entropy
 
         # 2. 低使用率惩罚
-        l_low = torch.sum(torch.relu(self.usage_threshold - expert_usage) ** 2)
+        l_low = torch.sum(torch.relu(self.usage_threshold - p) ** 2)
 
         return l_entropy + l_low
 
@@ -967,13 +1003,13 @@ class MoELoss(nn.Module):
         ]
         features = torch.stack(features, dim=0)  # [5, B, D]
 
-        # 计算所有专家对的余弦相似度
+        # 计算所有专家对的余弦相似度平方，鼓励去相关而非鼓励强负相关
         loss = torch.tensor(0.0, device=features.device, dtype=features.dtype)
         count = 0
         for i in range(len(features)):
             for j in range(i + 1, len(features)):
                 cos_sim = F.cosine_similarity(features[i], features[j], dim=-1).mean()
-                loss += cos_sim
+                loss += cos_sim.pow(2)
                 count += 1
         return (
             loss / count
@@ -1170,10 +1206,13 @@ class MoE(nn.Module):
             weights = self.router(scores, training=True)  # [B, 5], hard routing
         elif training and self.training_stage == "specialization":
             # 专家专精阶段：均匀路由（冻结门控）
+            # Use a global step offset so small batch sizes still cover all experts over time.
             B = x.size(0)
+            num_experts = len(self.experts)
+            offset = int(self.step.item()) % num_experts
             weights = torch.zeros(B, 5, device=x.device)
             for i in range(B):
-                expert_idx = i % 5  # 轮询分配
+                expert_idx = (offset + i) % num_experts
                 weights[i, expert_idx] = 1.0
         else:
             # 测试阶段：软路由

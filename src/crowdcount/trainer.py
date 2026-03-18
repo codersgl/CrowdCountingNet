@@ -152,7 +152,13 @@ class Trainer:
         if cfg.resume:
             ckpt = torch.load(cfg.resume, map_location="cpu")
             model.load_state_dict(ckpt["model"])
-            logger.info(f"Resumed from {cfg.resume}")
+            if "optimizer" in ckpt:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+            if "lr_scheduler" in ckpt:
+                self.lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+            if "epoch" in ckpt:
+                cfg.start_epoch = ckpt["epoch"] + 1
+            logger.info(f"Resumed from {cfg.resume} (epoch {cfg.start_epoch})")
 
         # TensorBoard
         tb_dir = hydra_output / cfg.tensorboard_dir
@@ -230,7 +236,15 @@ class Trainer:
 
             # Save latest checkpoint
             ckpt_path = self.checkpoints_dir / "latest.pth"
-            torch.save({"model": self.model.state_dict()}, ckpt_path)
+            torch.save(
+                {
+                    "model": self.model.state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                    "lr_scheduler": self.lr_scheduler.state_dict(),
+                    "epoch": epoch,
+                },
+                ckpt_path,
+            )
 
             # Evaluation
             if epoch % cfg.eval_freq == 0 and epoch != 0:
@@ -263,7 +277,12 @@ class Trainer:
                 # Save best MAE checkpoint
                 if abs(np.min(mae_history) - result[0]) < 0.01:
                     torch.save(
-                        {"model": self.model.state_dict()},
+                        {
+                            "model": self.model.state_dict(),
+                            "optimizer": self.optimizer.state_dict(),
+                            "lr_scheduler": self.lr_scheduler.state_dict(),
+                            "epoch": epoch,
+                        },
                         self.checkpoints_dir / "best_mae.pth",
                     )
 

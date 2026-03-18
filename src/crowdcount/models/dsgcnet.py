@@ -165,7 +165,10 @@ class DSGCnet(nn.Module):
         if self.moe is None:
             return
         self.moe.set_training_stage(stage)
-        self.set_moe_gating_trainable(stage == "coordination")
+        # Gate is always trainable: in specialization it learns with high Gumbel noise
+        # (exploration), in coordination it learns with normal noise (exploitation).
+        # Freezing the gate in specialization would nullify noisy-gate routing.
+        self.set_moe_gating_trainable(True)
 
     def update_moe_temperature(self, decay_rate: float = 0.9999) -> None:
         if self.moe is None:

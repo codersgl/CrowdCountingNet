@@ -158,6 +158,10 @@ class Trainer:
                 self.lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
             if "epoch" in ckpt:
                 cfg.start_epoch = ckpt["epoch"] + 1
+            if "mae_history" in ckpt:
+                self._resume_mae_history = ckpt["mae_history"]
+            if "density_mae_history" in ckpt:
+                self._resume_density_mae_history = ckpt["density_mae_history"]
             logger.info(f"Resumed from {cfg.resume} (epoch {cfg.start_epoch})")
 
         # TensorBoard
@@ -200,8 +204,9 @@ class Trainer:
         logger.info("Start training")
         start_time = time.time()
 
-        mae_history, mse_history = [], []
-        density_mae_history, density_mse_history = [], []
+        mae_history = list(getattr(self, "_resume_mae_history", []))
+        density_mae_history = list(getattr(self, "_resume_density_mae_history", []))
+        mse_history, density_mse_history = [], []
         step = 0
 
         for epoch in range(cfg.start_epoch, cfg.epochs):
@@ -242,6 +247,8 @@ class Trainer:
                     "optimizer": self.optimizer.state_dict(),
                     "lr_scheduler": self.lr_scheduler.state_dict(),
                     "epoch": epoch,
+                    "mae_history": mae_history,
+                    "density_mae_history": density_mae_history,
                 },
                 ckpt_path,
             )
@@ -282,6 +289,8 @@ class Trainer:
                             "optimizer": self.optimizer.state_dict(),
                             "lr_scheduler": self.lr_scheduler.state_dict(),
                             "epoch": epoch,
+                            "mae_history": mae_history,
+                            "density_mae_history": density_mae_history,
                         },
                         self.checkpoints_dir / "best_mae.pth",
                     )

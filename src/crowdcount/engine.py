@@ -166,8 +166,13 @@ def train_one_epoch(
         losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
         loss_value = losses_reduced_scaled.item()
 
-        if not math.isfinite(loss_value):
-            logger.error(f"Loss is {loss_sum.item()}, stopping training")
+        if not math.isfinite(loss_sum.item()):
+            logger.error(
+                f"loss_sum is {loss_sum.item()} ("
+                f"task={loss_value:.4f}, "
+                f"density={density_loss.item():.4f}, "
+                f"moe_aux={moe_aux_component.item():.4f}), stopping training"
+            )
             logger.error(str(loss_dict_reduced))
             sys.exit(1)
 

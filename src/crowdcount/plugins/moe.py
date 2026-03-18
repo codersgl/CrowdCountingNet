@@ -917,11 +917,14 @@ class DynamicRouter(nn.Module):
             return y_hard - y_soft.detach() + y_soft
         return y_soft
 
-    def forward(self, scores: torch.Tensor, training: bool = True) -> torch.Tensor:
+    def forward(
+        self, scores: torch.Tensor, training: bool = True, noise_scale: float = 1.0
+    ) -> torch.Tensor:
         """
         Args:
             scores: [B, 5] 专家重要性分数
             training: 是否训练阶段
+            noise_scale: Gumbel噪声缩放系数，越大探索越充分
         Returns:
             weights: [B, 5] 专家权重（hard: 0/1, soft: 连续值）
         """
@@ -930,7 +933,7 @@ class DynamicRouter(nn.Module):
             # Forward uses hard discrete routing, backward follows soft selected probs.
             tau = max(self.temperature, 1e-6)
             gumbels = -torch.empty_like(scores).exponential_().log()
-            noisy_scores = (scores + gumbels) / tau
+            noisy_scores = (scores + noise_scale * gumbels) / tau
             probs = F.softmax(noisy_scores, dim=-1)
 
             k = min(self.top_k, scores.size(-1))
@@ -1179,6 +1182,8 @@ class MoE(nn.Module):
     def update_temperature(self, decay_rate: float = 0.9999):
         """逐步降低温度，使训练后期路由更确定"""
         self.temperature = max(self.temperature * decay_rate, self.temperature_min)
+        # Sync temperature to router so DynamicRouter.forward() uses the decayed value.
+        self.router.temperature = self.temperature
         self.step += 1
 
     def set_training_stage(self, stage: str):
@@ -1205,15 +1210,9 @@ class MoE(nn.Module):
             # 协调学习阶段：使用动态路由
             weights = self.router(scores, training=True)  # [B, 5], hard routing
         elif training and self.training_stage == "specialization":
-            # 专家专精阶段：均匀路由（冻结门控）
-            # Use a global step offset so small batch sizes still cover all experts over time.
-            B = x.size(0)
-            num_experts = len(self.experts)
-            offset = int(self.step.item()) % num_experts
-            weights = torch.zeros(B, 5, device=x.device)
-            for i in range(B):
-                expert_idx = (offset + i) % num_experts
-                weights[i, expert_idx] = 1.0
+            # 专家专精阶段：高噪声门控路由，使门控网络从第0轮获得梯度
+            # noise_scale=2.0 使Gumbel噪声主导选择，确保多样性的同时训练门控网络。
+            weights = self.router(scores, training=True, noise_scale=2.0)
         else:
             # 测试阶段：软路由
             weights = self.router(scores, training=False)  # [B, 5], soft routing

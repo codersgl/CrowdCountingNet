@@ -25,7 +25,11 @@ def test_moe_specialization_routing_is_one_hot() -> None:
         _, _, weights = moe(x, training=True)
 
     assert weights.shape == (4, 5)
-    assert torch.allclose(weights.sum(dim=1), torch.ones(4, device=weights.device))
+    # Specialization now uses top_k=2 noisy gate routing: each sample selects 2 experts.
+    assert torch.allclose(
+        weights.sum(dim=1),
+        torch.full((4,), 2.0, device=weights.device),
+    )
 
 
 def test_moe_coordination_hard_routing_topk() -> None:

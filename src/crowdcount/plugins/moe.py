@@ -1022,23 +1022,24 @@ class MoELoss(nn.Module):
 
     def _orthogonality_loss(self, expert_outputs: list) -> torch.Tensor:
         """
-        正交性损失: 鼓励专家特征在空间中正交
+        正交性损失: 鼓励专家特征在空间中正交。
+        使用 L2 归一化后的内积平方 (cos²θ)，值域严格 [0, 1]，
+        彻底消除因特征幅度过大引起的梯度尖刺。
         """
         features = [
             F.adaptive_avg_pool2d(f, 1).view(f.size(0), -1) for f in expert_outputs
         ]
+        # L2 归一化：范数 = 1，结果只依赖方向，不受幅度影响
+        features = [F.normalize(f, p=2, dim=-1) for f in features]
         features = torch.stack(features, dim=0)  # [5, B, D]
 
-        # 计算 Gram 矩阵的 Frobenius 范数
         loss = torch.tensor(0.0, device=features.device, dtype=features.dtype)
         count = 0
         for i in range(len(features)):
             for j in range(i + 1, len(features)):
-                # G_i^T @ G_j 的 Frobenius 范数
-                gram = features[i].unsqueeze(-1) @ features[j].unsqueeze(
-                    -2
-                )  # [B, D, D]
-                loss += torch.norm(gram, p="fro") ** 2
+                # 内积平方 = cos²(θ_ij)，值域严格 [0, 1]
+                dot = (features[i] * features[j]).sum(dim=-1)  # [B]
+                loss += dot.pow(2).mean()
                 count += 1
         return (
             loss / count

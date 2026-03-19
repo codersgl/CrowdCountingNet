@@ -23,7 +23,7 @@ start_epoch: 0
 checkpoints_dir: checkpoints
 tensorboard_dir: runs/dsgc
 
-density_loss_weight: 0.05 # Global scale factor applied to all density map losses
+density_loss_weight: 0.01 # Global scale factor applied to all density map losses
 
 # Multi-scale density prediction (experimental)
 density_multi_scale:

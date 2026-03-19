@@ -30,11 +30,11 @@ def test_moe_specialization_routing_is_one_hot() -> None:
     with torch.no_grad():
         _, _, weights = moe(x, training=True)
 
-    assert weights.shape == (4, 5)
-    # Specialization now uses top_k=2 noisy gate routing: each sample selects 2 experts.
+    assert weights.shape == (4, 5, 8, 8)
+    # 每个像素位置选择 top_k=2 个专家，展展求和应为 2
     assert torch.allclose(
         weights.sum(dim=1),
-        torch.full((4,), 2.0, device=weights.device),
+        torch.full((4, 8, 8), 2.0, device=weights.device),
     )
 
 
@@ -47,10 +47,10 @@ def test_moe_coordination_hard_routing_topk() -> None:
     with torch.no_grad():
         _, aux_losses, weights = moe(x, training=True)
 
-    assert weights.shape == (3, 5)
+    assert weights.shape == (3, 5, 8, 8)
     assert torch.allclose(
         weights.sum(dim=1),
-        torch.full((3,), 2.0, device=weights.device),
+        torch.full((3, 8, 8), 2.0, device=weights.device),
     )
     assert "total_aux" in aux_losses
 
@@ -63,9 +63,9 @@ def test_moe_eval_soft_routing_probabilities() -> None:
     with torch.no_grad():
         _, aux_losses, weights = moe(x, training=False)
 
-    assert weights.shape == (2, 5)
+    assert weights.shape == (2, 5, 8, 8)
     assert torch.allclose(
-        weights.sum(dim=1), torch.ones(2, device=weights.device), atol=1e-6
+        weights.sum(dim=1), torch.ones(2, 8, 8, device=weights.device), atol=1e-6
     )
 
 
@@ -101,9 +101,9 @@ def test_moe_with_density_hint() -> None:
     with torch.no_grad():
         fused, aux_losses, weights = moe(x, density_hint=density, training=False)
     assert fused.shape == x.shape
-    assert weights.shape == (2, 5)
+    assert weights.shape == (2, 5, 8, 8)
     assert torch.allclose(
-        weights.sum(dim=1), torch.ones(2, device=weights.device), atol=1e-6
+        weights.sum(dim=1), torch.ones(2, 8, 8, device=weights.device), atol=1e-6
     )
 
 

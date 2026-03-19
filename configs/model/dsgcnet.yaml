@@ -24,6 +24,6 @@ moe:
   stage1_ratio: 0.15
   stage2_gating_lr_multiplier: 3.0
   aux_loss_weight: 0.2 # reduced from 2.0 to keep MoE aux << task loss
-  lambda_balance: 0.835
-  lambda_decorr: 1.0
+  lambda_balance: 0.05
+  lambda_decorr: 10.0
   use_density_hint: true

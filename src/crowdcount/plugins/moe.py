@@ -1034,42 +1034,21 @@ class DensityAwareExpert(nn.Module):
 
 class SpatialContextEncoder(nn.Module):
     """
-    空间上下文编码器：提取全局+局部空间特征
-    论文3.4节: "extracts both global and local information"
+    轻量像素级路由分数网络: [B,C,H,W] → [B,5,H,W]
+    每个空间位置独立预测专家分数，提供 H×W 个路由决策（vs 旧版 1 个图像级决策）。
     """
 
     def __init__(
         self, input_dim: int, spatial_grid: int = 4, use_density_hint: bool = False
     ):
         super().__init__()
-        self.spatial_grid = spatial_grid
         self.use_density_hint = use_density_hint
-
-        # 空间网格特征处理: [B, C, 4, 4] → [B, C//2, 4, 4] → [B, C//16, 4, 4] → [B, C//16 * G²]
-        # 末尾用 1×1 Conv 将通道从 C//2 压缩至 C//16，降低路由输入维度并减少参数量
-        _spatial_ch = max(1, input_dim // 16)
-        self.spatial_conv = nn.Sequential(
-            nn.Conv2d(input_dim, input_dim // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(input_dim // 2),
+        in_ch = input_dim + (1 if use_density_hint else 0)
+        self.score_net = nn.Sequential(
+            nn.Conv2d(in_ch, input_dim // 4, kernel_size=1),
+            nn.BatchNorm2d(input_dim // 4),
             nn.GELU(),
-            nn.Conv2d(input_dim // 2, input_dim // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(input_dim // 2),
-            nn.GELU(),
-            nn.Conv2d(input_dim // 2, _spatial_ch, kernel_size=1),
-            nn.BatchNorm2d(_spatial_ch),
-            nn.GELU(),
-        )
-
-        # density hint: mean + std + max + 4×4 grid = 3 + 16 = 19 dims
-        density_hint_dim = 19 if use_density_hint else 0
-        fusion_input_dim = (
-            input_dim + _spatial_ch * spatial_grid * spatial_grid + density_hint_dim
-        )
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_input_dim, input_dim),
-            nn.LayerNorm(input_dim),
-            nn.GELU(),
-            nn.Linear(input_dim, 5),
+            nn.Conv2d(input_dim // 4, 5, kernel_size=1),
         )
 
     def forward(
@@ -1080,34 +1059,20 @@ class SpatialContextEncoder(nn.Module):
             x: [B, C, H, W]
             density_hint: [B, 1, H, W] 密度图，可选，用于辅助路由
         Returns:
-            scores: [B, 5] 专家重要性分数
+            scores: [B, 5, H, W] 像素级专家分数
         """
-        B, C, H, W = x.shape
-
-        # 1. 全局特征: Global Average Pooling → [B, C]
-        f_global = F.adaptive_avg_pool2d(x, 1).view(B, C)
-
-        # 2. 空间网格特征: Adaptive Pool → [B, C, 4, 4]
-        f_spatial = F.adaptive_avg_pool2d(x, self.spatial_grid)  # [B, C, 4, 4]
-        f_spatial = self.spatial_conv(f_spatial)  # [B, C//2, 4, 4]
-        f_spatial = f_spatial.view(B, -1)  # [B, C//2 * 16]
-
-        # 3. 特征融合（可选注入密度提示）
-        f_fused = torch.cat([f_global, f_spatial], dim=1)  # [B, C + C//2*16]
         if self.use_density_hint and density_hint is not None:
-            if density_hint.shape[-2:] != (H, W):
+            if density_hint.shape[-2:] != x.shape[-2:]:
                 density_hint = F.interpolate(
-                    density_hint, size=(H, W), mode="bilinear", align_corners=False
+                    density_hint,
+                    size=x.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
                 )
-            d_mean = density_hint.mean(dim=(-1, -2))  # [B, 1]
-            d_std = density_hint.std(dim=(-1, -2))  # [B, 1]
-            d_max = density_hint.amax(dim=(-1, -2))  # [B, 1]
-            d_grid = F.adaptive_avg_pool2d(density_hint, 4).view(B, -1)  # [B, 16]
-            f_density = torch.cat([d_mean, d_std, d_max, d_grid], dim=1)  # [B, 19]
-            f_fused = torch.cat([f_fused, f_density], dim=1)
-
-        scores = self.fusion(f_fused)  # [B, 5]
-        return scores
+            inp = torch.cat([x, density_hint], dim=1)
+        else:
+            inp = x
+        return self.score_net(inp)  # [B, 5, H, W]
 
 
 class DynamicRouter(nn.Module):
@@ -1142,11 +1107,11 @@ class DynamicRouter(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            scores: [B, 5] 专家重要性分数
+            scores: [B, 5, H, W] 像素级专家分数
             training: 是否训练阶段
             noise_scale: Gumbel噪声缩放系数，越大探索越充分
         Returns:
-            weights: [B, 5] 专家权重（hard: 0/1, soft: 连续值）
+            weights: [B, 5, H, W] 像素级专家权重（hard: 0/1, soft: 连续值）
         """
         if training:
             # Hard Top-K routing with straight-through gradient.
@@ -1154,22 +1119,22 @@ class DynamicRouter(nn.Module):
             tau = max(self.temperature, 1e-6)
             gumbels = -torch.empty_like(scores).exponential_().log()
             noisy_scores = (scores + noise_scale * gumbels) / tau
-            probs = F.softmax(noisy_scores, dim=-1)
+            probs = F.softmax(noisy_scores, dim=1)
 
-            k = min(self.top_k, scores.size(-1))
-            _, top_idx = torch.topk(noisy_scores, k, dim=-1)
-            hard_mask = torch.zeros_like(probs).scatter_(-1, top_idx, 1.0)
+            k = min(self.top_k, scores.size(1))
+            _, top_idx = torch.topk(noisy_scores, k, dim=1)
+            hard_mask = torch.zeros_like(probs).scatter_(1, top_idx, 1.0)
 
             selected_soft = probs * hard_mask
             weights = hard_mask - selected_soft.detach() + selected_soft
         else:
             # Sparse routing: top-k masked softmax（与训练稀疏性对齐，权重连续可微）
-            probs = F.softmax(scores / self.temperature, dim=-1)
-            k = min(self.top_k, scores.size(-1))
-            _, top_idx = torch.topk(probs, k, dim=-1)
-            mask = torch.zeros_like(probs).scatter_(-1, top_idx, 1.0)
+            probs = F.softmax(scores / self.temperature, dim=1)
+            k = min(self.top_k, scores.size(1))
+            _, top_idx = torch.topk(probs, k, dim=1)
+            mask = torch.zeros_like(probs).scatter_(1, top_idx, 1.0)
             masked = probs * mask
-            weights = masked / (masked.sum(dim=-1, keepdim=True) + 1e-8)
+            weights = masked / (masked.sum(dim=1, keepdim=True) + 1e-8)
 
         return weights
 
@@ -1240,22 +1205,25 @@ class MoELoss(nn.Module):
     ) -> dict:
         """
         Args:
-            expert_weights: [B, 5] 专家权重
+            expert_weights: [B, 5, H, W] 像素级专家权重（兼容旧版 [B, 5]）
             expert_outputs: List[Tensor] 5个专家的输出
-            disable_balance: True 时 balance_loss 不参与 total_aux（stage1 专精阶段用）
+            disable_balance: 保留接口兼容性，已忽略
         Returns:
-            losses: dict 包含各辅助损失（l_balance 仍照常计算用于 TensorBoard 监控）
+            losses: dict 包含各辅助损失
         """
-        expert_usage = expert_weights.mean(dim=0)  # [5]
+        # 支持 [B,5] (旧版) 和 [B,5,H,W] (空间路由) 两种格式
+        if expert_weights.dim() == 4:
+            expert_usage = expert_weights.mean(dim=(0, 2, 3))  # [5]
+        else:
+            expert_usage = expert_weights.mean(dim=0)  # [5]
 
         losses = {
             "l_balance": self._balance_loss(expert_usage),
             "l_decorr": self._feature_decorrelation_loss(expert_outputs),
         }
 
-        balance_weight = 0.0 if disable_balance else self.lambda_balance
         total_aux = (
-            balance_weight * losses["l_balance"]
+            self.lambda_balance * losses["l_balance"]
             + self.lambda_decorr * losses["l_decorr"]
         )
         losses["total_aux"] = total_aux
@@ -1313,12 +1281,12 @@ class MoE(nn.Module):
             lambda_decorr=lambda_decorr,
         )
 
-        # 训练阶段标记
+        # 训练进度跟踪（保留 step buffer 和 ema_usage 用于监控）
         self.register_buffer("step", torch.tensor(0))
         self.register_buffer(
             "ema_usage", torch.ones(5) / 5
         )  # 跨 batch EMA 专家使用率（用于监控）
-        self.training_stage = "specialization"  # 'specialization' or 'coordination'
+        self._current_noise_scale: float = 0.5  # 由 update_noise_scale() 动态衰减
 
     def update_temperature(self, decay_rate: float = 0.9999):
         """逐步降低温度，使训练后期路由更确定"""
@@ -1327,9 +1295,19 @@ class MoE(nn.Module):
         self.router.temperature = self.temperature
         self.step += 1
 
-    def set_training_stage(self, stage: str):
-        """设置训练阶段: 'specialization' 或 'coordination'"""
-        self.training_stage = stage
+    def set_training_stage(self, stage: str) -> None:
+        """保留接口兼容性（trainer.py 调用），新版本无需两阶段切换。"""
+        pass  # no-op: single-stage training with noise decay
+
+    def update_noise_scale(self, progress: float) -> None:
+        """根据训练进度衰减 Gumbel 噪声强度。
+
+        Args:
+            progress: 当前训练进度 (epoch / total_epochs), 范围 [0, 1]
+        """
+        # 前 20% 快速从 0.5 衰减到 0，之后保持 0（路由完全由语义主导）
+        decay = min(1.0, progress / 0.2)
+        self._current_noise_scale = max(0.0, 0.5 * (1.0 - decay))
 
     def forward(
         self,
@@ -1345,50 +1323,42 @@ class MoE(nn.Module):
         Returns:
             fused_output: [B, C, H, W] 融合后的特征
             aux_losses: dict 辅助损失（训练时）
-            expert_weights: [B, 5] 专家权重（可选，用于可视化）
+            expert_weights: [B, 5, H, W] 像素级专家权重（可选，用于可视化）
         """
-        # ========== 1. 前向传播通过5个专家 ==========
+        # ========== 1. 前向传播通过5个专家（LocalExpert注入高频输入） ==========
         expert_outputs = []
-        for expert in self.experts:
+        for idx, expert in enumerate(self.experts):
             if isinstance(expert, DensityAwareExpert) and density_hint is not None:
                 expert_outputs.append(expert(x, density_hint))
+            elif idx == 2:  # LocalExpert: 注入高频残差增强边缘感知
+                smooth = F.avg_pool2d(
+                    F.pad(x, [1, 1, 1, 1], mode="reflect"), 3, stride=1, padding=0
+                )
+                expert_outputs.append(expert(x + (x - smooth)))
             else:
                 expert_outputs.append(expert(x))
 
-        # ========== 2. 门控网络获取专家权重（注入密度提示辅助路由） ==========
-        scores = self.context_encoder(x, density_hint=density_hint)  # [B, 5]
+        # ========== 2. 像素级门控网络获取专家权重 ==========
+        scores = self.context_encoder(x, density_hint=density_hint)  # [B, 5, H, W]
+        noise = self._current_noise_scale if training else 0.0
+        weights = self.router(scores, training=training, noise_scale=noise)
+        # weights: [B, 5, H, W]
 
-        if training and self.training_stage == "coordination":
-            # 协调学习阶段：使用动态路由
-            weights = self.router(scores, training=True)  # [B, 5], hard routing
-        elif training and self.training_stage == "specialization":
-            # 专家专精阶段：高噪声门控路由，使门控网络从第0轮获得梯度
-            # noise_scale=2.0 使Gumbel噪声主导选择，确保多样性的同时训练门控网络。
-            weights = self.router(scores, training=True, noise_scale=2.0)
-        else:
-            # 测试阶段：软路由
-            weights = self.router(scores, training=False)  # [B, 5], soft routing
-
-        # ========== 3. 特征融合: F_MoE = Σ w_i * F_Ei ==========
+        # ========== 3. 空间感知特征融合: F_MoE = Σ w_i * F_Ei ==========
         fused = torch.zeros_like(expert_outputs[0])
-        for i, (w, f) in enumerate(zip(weights.unbind(dim=1), expert_outputs)):
-            # w: [B], f: [B, C, H, W]
-            fused += w.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * f
+        for k in range(len(expert_outputs)):
+            fused += weights[:, k : k + 1] * expert_outputs[k]
 
         # ========== 4. 计算辅助损失（仅训练时） ==========
         aux_losses = {}
         if training:
-            # 以 EMA 跟踪跨 batch 专家使用率（用于 TensorBoard 监控，不参与 loss 梯度）
+            # EMA 跟踪跨 batch 专家使用率（用于 TensorBoard 监控，不参与 loss 梯度）
             with torch.no_grad():
-                batch_usage = weights.detach().float().mean(dim=0)
+                batch_usage = weights.detach().float().mean(dim=(0, 2, 3))  # [5]
                 self.ema_usage = (
                     self.ema_momentum * self.ema_usage
                     + (1.0 - self.ema_momentum) * batch_usage
                 )
-            aux_losses = self.aux_loss(
-                weights,
-                expert_outputs,
-                disable_balance=(self.training_stage == "specialization"),
-            )
+            aux_losses = self.aux_loss(weights, expert_outputs)
 
         return fused, aux_losses, weights

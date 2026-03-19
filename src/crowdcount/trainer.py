@@ -197,18 +197,7 @@ class Trainer:
         if not self.use_moe:
             return None
         stage = "specialization" if epoch < self._stage1_epochs() else "coordination"
-        self.model.set_moe_training_stage(stage)
-        # Boost gating LR the first time we enter stage 2 (coordination)
-        if (
-            stage == "coordination"
-            and self._moe_prev_stage != "coordination"
-            and self.gating_pg_idx is not None
-        ):
-            new_lr = self.cfg.optimizer.lr * self.moe_gating_lr_multiplier
-            self.optimizer.param_groups[self.gating_pg_idx]["lr"] = new_lr
-            # Also update initial_lr so CosineAnnealingLR.step() re-computes from new base.
-            self.optimizer.param_groups[self.gating_pg_idx]["initial_lr"] = new_lr
-            logger.info(f"[MoE] Stage 2 (coordination): gating LR → {new_lr:.2e}")
+        self.model.set_moe_training_stage(stage)  # no-op in new design
         self._moe_prev_stage = stage
         return stage
 
@@ -238,6 +227,12 @@ class Trainer:
             moe_stage = self._set_moe_stage_for_epoch(epoch)
             if moe_stage is not None:
                 logger.info(f"[MoE] epoch={epoch} training_stage={moe_stage}")
+            if (
+                self.use_moe
+                and hasattr(self.model, "moe")
+                and self.model.moe is not None
+            ):
+                self.model.moe.update_noise_scale(epoch / cfg.epochs)
 
             t1 = time.time()
             stat = train_one_epoch(

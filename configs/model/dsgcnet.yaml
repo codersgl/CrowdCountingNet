@@ -21,9 +21,8 @@ moe:
   temperature_init: 1.0
   temperature_min: 0.4
   temperature_decay: 0.99998
-  stage1_ratio: 0.08
+  stage1_ratio: 0.15
   stage2_gating_lr_multiplier: 3.0
   aux_loss_weight: 2.0
   lambda_balance: 0.835
-  lambda_diversity: 0.8
-  lambda_ortho: 0.3
+  lambda_decorr: 1.0

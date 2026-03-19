@@ -100,15 +100,10 @@ class DSGCnet(nn.Module):
                 if moe_cfg is not None
                 else 0.835
             )
-            lambda_diversity = (
-                float(getattr(moe_cfg, "lambda_diversity", 0.185))
+            lambda_decorr = (
+                float(getattr(moe_cfg, "lambda_decorr", 1.0))
                 if moe_cfg is not None
-                else 0.185
-            )
-            lambda_ortho = (
-                float(getattr(moe_cfg, "lambda_ortho", 0.185))
-                if moe_cfg is not None
-                else 0.185
+                else 1.0
             )
 
             self.esca: ESCA | None = ESCA(256)
@@ -118,8 +113,7 @@ class DSGCnet(nn.Module):
                 temperature_init=temperature_init,
                 temperature_min=temperature_min,
                 lambda_balance=lambda_balance,
-                lambda_diversity=lambda_diversity,
-                lambda_ortho=lambda_ortho,
+                lambda_decorr=lambda_decorr,
             )
             self.density_gcn = None
             self.feature_gcn = None

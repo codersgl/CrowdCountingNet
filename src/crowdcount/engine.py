@@ -215,13 +215,20 @@ def train_one_epoch(
                 moe_aux_raw=float(moe_aux_total.item()),
             )
             moe_aux_losses = outputs.get("moe_aux_losses") or {}
-            for key in ("l_balance", "l_diversity", "l_ortho"):
+            for key in ("l_balance", "l_decorr"):
                 if key in moe_aux_losses:
                     metric_logger.update(**{key: float(moe_aux_losses[key].item())})
 
             moe_module = getattr(model, "moe", None)
             if moe_module is not None:
                 metric_logger.update(moe_temperature=float(moe_module.temperature))
+                # Log EMA expert usage spread for monitoring load balance
+                if hasattr(moe_module, "ema_usage"):
+                    ema_u = moe_module.ema_usage
+                    metric_logger.update(
+                        ema_usage_min=float(ema_u.min().item()),
+                        ema_usage_max=float(ema_u.max().item()),
+                    )
 
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 

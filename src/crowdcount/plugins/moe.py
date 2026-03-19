@@ -393,9 +393,8 @@ class RegionContrast(nn.Module):
                 contrast = regions[i] - regions[j]  # [B, C, H, W]
                 contrast_features.append(contrast)
 
-        # Stack + Mean
-        stacked = torch.stack(contrast_features, dim=1)  # [B, 6, C, H, W]
-        aggregated = stacked.mean(dim=1)  # [B, C, H, W]
+        stacked = torch.cat(contrast_features, dim=1)  # [B, 6*C, H, W]
+        aggregated = self.contrast_fusion(stacked)  # [B, C, H, W]
 
         return aggregated
 
@@ -950,22 +949,17 @@ class DynamicRouter(nn.Module):
 
 
 class MoELoss(nn.Module):
-    """
-    MoE系统的辅助损失函数
-    论文3.5节: balance + diversity + orthogonality losses
-    """
+    """MoE辅助损失：balance（均匀使用）+ feature decorrelation（去相关）。"""
 
     def __init__(
         self,
         lambda_balance: float = 0.835,
-        lambda_diversity: float = 0.185,
-        lambda_ortho: float = 0.185,
+        lambda_decorr: float = 1.0,
         usage_threshold: float = 0.1,
     ):
         super().__init__()
         self.lambda_balance = lambda_balance
-        self.lambda_diversity = lambda_diversity
-        self.lambda_ortho = lambda_ortho
+        self.lambda_decorr = lambda_decorr
         self.usage_threshold = usage_threshold
 
     def _balance_loss(self, expert_usage: torch.Tensor) -> torch.Tensor:
@@ -995,57 +989,22 @@ class MoELoss(nn.Module):
 
         return l_entropy + l_low
 
-    def _diversity_loss(self, expert_outputs: list) -> torch.Tensor:
-        """
-        多样性损失: 最小化专家输出间的余弦相似度
-        expert_outputs: List[Tensor] 每个专家的输出 [B, C, H, W]
-        """
-        # 全局平均池化后计算余弦相似度
-        features = [
-            F.adaptive_avg_pool2d(f, 1).view(f.size(0), -1) for f in expert_outputs
-        ]
-        features = torch.stack(features, dim=0)  # [5, B, D]
-
-        # 计算所有专家对的余弦相似度平方，鼓励去相关而非鼓励强负相关
-        loss = torch.tensor(0.0, device=features.device, dtype=features.dtype)
-        count = 0
-        for i in range(len(features)):
-            for j in range(i + 1, len(features)):
-                cos_sim = F.cosine_similarity(features[i], features[j], dim=-1).mean()
-                loss += cos_sim.pow(2)
-                count += 1
-        return (
-            loss / count
-            if count > 0
-            else torch.tensor(0.0, device=features.device, dtype=features.dtype)
-        )
-
-    def _orthogonality_loss(self, expert_outputs: list) -> torch.Tensor:
-        """
-        正交性损失: 鼓励专家特征在空间中正交。
-        使用 L2 归一化后的内积平方 (cos²θ)，值域严格 [0, 1]，
-        彻底消除因特征幅度过大引起的梯度尖刺。
+    def _feature_decorrelation_loss(self, expert_outputs: list) -> torch.Tensor:
+        """特征去相关损失：惩罚专家对的 cos²(θ)，鼓励特征空间正交。
+        使用 L2 归一化消除幅度影响，合并了原 diversity_loss 和 orthogonality_loss（两者实质等价）。
         """
         features = [
             F.adaptive_avg_pool2d(f, 1).view(f.size(0), -1) for f in expert_outputs
         ]
-        # L2 归一化：范数 = 1，结果只依赖方向，不受幅度影响
-        features = [F.normalize(f, p=2, dim=-1) for f in features]
-        features = torch.stack(features, dim=0)  # [5, B, D]
-
-        loss = torch.tensor(0.0, device=features.device, dtype=features.dtype)
+        features = [F.normalize(f, p=2, dim=-1) for f in features]  # L2 归一化
+        loss = torch.tensor(0.0, device=features[0].device, dtype=features[0].dtype)
         count = 0
         for i in range(len(features)):
             for j in range(i + 1, len(features)):
-                # 内积平方 = cos²(θ_ij)，值域严格 [0, 1]
                 dot = (features[i] * features[j]).sum(dim=-1)  # [B]
                 loss += dot.pow(2).mean()
                 count += 1
-        return (
-            loss / count
-            if count > 0
-            else torch.tensor(0.0, device=features.device, dtype=features.dtype)
-        )
+        return loss / count if count > 0 else loss
 
     def forward(self, expert_weights: torch.Tensor, expert_outputs: list) -> dict:
         """
@@ -1055,81 +1014,20 @@ class MoELoss(nn.Module):
         Returns:
             losses: dict 包含各辅助损失
         """
-        # 计算专家使用率
         expert_usage = expert_weights.mean(dim=0)  # [5]
 
         losses = {
             "l_balance": self._balance_loss(expert_usage),
-            "l_diversity": self._diversity_loss(expert_outputs),
-            "l_ortho": self._orthogonality_loss(expert_outputs),
+            "l_decorr": self._feature_decorrelation_loss(expert_outputs),
         }
 
-        # 加权总损失
         total_aux = (
             self.lambda_balance * losses["l_balance"]
-            + self.lambda_diversity * losses["l_diversity"]
-            + self.lambda_ortho * losses["l_ortho"]
+            + self.lambda_decorr * losses["l_decorr"]
         )
         losses["total_aux"] = total_aux
 
         return losses
-
-
-class GatingNetwork(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        top_k: int = 2,
-        temperature_init: float = 1.0,
-        temperature_min: float = 0.1,
-    ):
-        super().__init__()
-        self.top_k = top_k
-        self.temperature = temperature_init
-        self.temperature_min = temperature_min
-
-        # 核心组件
-        self.context_encoder = SpatialContextEncoder(input_dim)
-        self.router = DynamicRouter(num_experts=5, top_k=top_k)
-        self.loss_fn = MoELoss()
-
-        # 温度衰减调度
-        self.register_buffer("step", torch.tensor(0))
-
-    def update_temperature(self, decay_rate: float = 0.9999):
-        """逐步降低温度，使训练后期路由更确定"""
-        self.temperature = max(self.temperature * decay_rate, self.temperature_min)
-        self.step += 1
-
-    def forward(
-        self, x: torch.Tensor, expert_outputs: list, training: bool = True
-    ) -> tuple:
-        """
-        Args:
-            x: [B, C, H, W] 输入特征
-            expert_outputs: List[Tensor] 5个专家的输出
-            training: 是否训练阶段
-        Returns:
-            fused_output: [B, C, H, W] 融合后的特征
-            losses: dict 辅助损失
-        """
-        # 1. 获取专家分数
-        scores = self.context_encoder(x)  # [B, 5]
-
-        # 2. 动态路由获取权重
-        weights = self.router(scores, training=training)  # [B, 5]
-
-        # 3. 特征融合: F_MoE = Σ w_i * F_Ei
-        fused = torch.zeros_like(expert_outputs[0])
-        for _, (w, f) in enumerate(zip(weights.unbind(dim=1), expert_outputs)):
-            fused += w.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * f
-
-        # 4. 计算辅助损失（仅训练时）
-        losses = {}
-        if training:
-            losses = self.loss_fn(weights, expert_outputs)
-
-        return fused, losses, weights
 
 
 class MoE(nn.Module):
@@ -1140,8 +1038,8 @@ class MoE(nn.Module):
         temperature_init: float = 1.0,
         temperature_min: float = 0.1,
         lambda_balance: float = 0.835,
-        lambda_diversity: float = 0.185,
-        lambda_ortho: float = 0.185,
+        lambda_decorr: float = 1.0,
+        ema_momentum: float = 0.99,
     ):
         super().__init__()
 
@@ -1170,14 +1068,17 @@ class MoE(nn.Module):
         self.router = DynamicRouter(num_experts=5, top_k=top_k)
 
         # ========== 3. 辅助损失 ==========
+        self.ema_momentum = ema_momentum
         self.aux_loss = MoELoss(
             lambda_balance=lambda_balance,
-            lambda_diversity=lambda_diversity,
-            lambda_ortho=lambda_ortho,
+            lambda_decorr=lambda_decorr,
         )
 
         # 训练阶段标记
         self.register_buffer("step", torch.tensor(0))
+        self.register_buffer(
+            "ema_usage", torch.ones(5) / 5
+        )  # 跨 batch EMA 专家使用率（用于监控）
         self.training_stage = "specialization"  # 'specialization' or 'coordination'
 
     def update_temperature(self, decay_rate: float = 0.9999):
@@ -1227,6 +1128,13 @@ class MoE(nn.Module):
         # ========== 4. 计算辅助损失（仅训练时） ==========
         aux_losses = {}
         if training:
+            # 以 EMA 跟踪跨 batch 专家使用率（用于 TensorBoard 监控，不参与 loss 梯度）
+            with torch.no_grad():
+                batch_usage = weights.detach().float().mean(dim=0)
+                self.ema_usage = (
+                    self.ema_momentum * self.ema_usage
+                    + (1.0 - self.ema_momentum) * batch_usage
+                )
             aux_losses = self.aux_loss(weights, expert_outputs)
 
         return fused, aux_losses, weights

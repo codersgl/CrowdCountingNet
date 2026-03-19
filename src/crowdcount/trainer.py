@@ -68,6 +68,8 @@ class Trainer:
             if moe_cfg is not None
             else 2.0
         )
+        self._moe_prev_stage: str | None = None  # used to detect stage transitions
+        self.gating_pg_idx: int | None = None  # param_groups index for gating params
 
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"Number of trainable parameters: {n_params:,}")
@@ -100,10 +102,11 @@ class Trainer:
                 p for p in model.get_moe_gating_parameters() if p.requires_grad
             ]
             if gating_params:
+                self.gating_pg_idx = len(param_dicts)  # record index before appending
                 param_dicts.append(
                     {
                         "params": gating_params,
-                        "lr": cfg.optimizer.lr * self.moe_gating_lr_multiplier,
+                        "lr": cfg.optimizer.lr,  # start at base LR; boosted at stage 2
                     }
                 )
         _opt_name = cfg.optimizer.get("name", "adam").lower()
@@ -195,6 +198,16 @@ class Trainer:
             return None
         stage = "specialization" if epoch < self._stage1_epochs() else "coordination"
         self.model.set_moe_training_stage(stage)
+        # Boost gating LR the first time we enter stage 2 (coordination)
+        if (
+            stage == "coordination"
+            and self._moe_prev_stage != "coordination"
+            and self.gating_pg_idx is not None
+        ):
+            new_lr = self.cfg.optimizer.lr * self.moe_gating_lr_multiplier
+            self.optimizer.param_groups[self.gating_pg_idx]["lr"] = new_lr
+            logger.info(f"[MoE] Stage 2 (coordination): gating LR → {new_lr:.2e}")
+        self._moe_prev_stage = stage
         return stage
 
     def _build_scheduler(self) -> torch.optim.lr_scheduler.LRScheduler:

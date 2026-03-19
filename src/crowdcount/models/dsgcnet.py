@@ -140,6 +140,30 @@ class DSGCnet(nn.Module):
             else None
         )
 
+        # DINOv2 semantic injection (optional, disabled by default)
+        # cfg may be full hydra config (has .model) or flat model-level config from tests
+        _model_cfg = getattr(cfg, "model", cfg) if cfg is not None else None
+        use_dino_inject = (
+            bool(getattr(_model_cfg, "use_dino_inject", False))
+            if _model_cfg is not None
+            else False
+        )
+        if use_dino_inject:
+            from crowdcount.models.backbone import DINOv2SemanticInjector
+
+            dino_variant = (
+                getattr(_model_cfg, "dino_inject_variant", "dinov2_b")
+                if _model_cfg is not None
+                else "dinov2_b"
+            )
+            self.dino_injector: DINOv2SemanticInjector | None = DINOv2SemanticInjector(
+                dino_variant
+            )
+            self.dino_gate: nn.Parameter | None = nn.Parameter(torch.zeros(1))
+        else:
+            self.dino_injector = None
+            self.dino_gate = None
+
     def supports_moe(self) -> bool:
         return self.use_moe and self.moe is not None
 
@@ -184,6 +208,11 @@ class DSGCnet(nn.Module):
         c3, c4, c5 = features_list[1], features_list[2], features_list[3]
 
         features_pa = self.pa([c3, c4, c5])  # [batch_size, 256, 16, 16]
+
+        # DINOv2 semantic injection: bounded gate (tanh) starts at 0
+        if self.dino_injector is not None and self.dino_gate is not None:
+            dino_feat = self.dino_injector(samples, target_size=features_pa.shape[-2:])
+            features_pa = features_pa + self.dino_gate.tanh() * dino_feat
 
         batch_size = features_list[0].shape[0]
         density = self.density_pred(features_pa)

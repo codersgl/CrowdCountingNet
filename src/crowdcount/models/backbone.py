@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import List
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 import crowdcount.models.vgg_ as vgg_models
@@ -140,6 +141,44 @@ class BackboneDINOv2(nn.Module):
             self.proj5(feats[3]),
         ]
         return out
+
+
+class DINOv2SemanticInjector(nn.Module):
+    """Takes only DINOv2's last-layer output, projects to 256ch for semantic injection.
+
+    The DINOv2 weights are frozen; only the projection Conv and the gate
+    (in DSGCnet) are trained.
+    """
+
+    def __init__(self, variant: str = "dinov2_b"):
+        super().__init__()
+        if variant not in _DINOV2_VARIANTS:
+            raise ValueError(
+                f"Unknown DINOv2 variant '{variant}'. Choose from {list(_DINOV2_VARIANTS)}"
+            )
+        repo, model_name, embed_dim = _DINOV2_VARIANTS[variant]
+        self.dino = torch.hub.load(repo, model_name, pretrained=True)
+        # Freeze DINOv2 — only proj will be trained
+        for p in self.dino.parameters():
+            p.requires_grad = False
+        self.proj = nn.Conv2d(embed_dim, 256, kernel_size=1)
+        self.embed_dim = embed_dim
+
+    def forward(self, x: torch.Tensor, target_size: tuple) -> torch.Tensor:
+        B, C, H, W = x.shape
+        H14 = (H // 14) * 14
+        W14 = (W // 14) * 14
+        if H14 != H or W14 != W:
+            x = F.interpolate(x, size=(H14, W14), mode="bilinear", align_corners=False)
+        tokens = self.dino.get_intermediate_layers(x, n=1, return_class_token=False)[0]
+        h, w = H14 // 14, W14 // 14
+        feat = tokens.reshape(B, h, w, self.embed_dim).permute(0, 3, 1, 2)
+        feat = self.proj(feat)
+        if feat.shape[-2:] != target_size:
+            feat = F.interpolate(
+                feat, size=target_size, mode="bilinear", align_corners=False
+            )
+        return feat
 
 
 # ---------------------------------------------------------------------------

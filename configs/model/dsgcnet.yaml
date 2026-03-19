@@ -27,3 +27,6 @@ moe:
   lambda_balance: 0.05
   lambda_decorr: 10.0
   use_density_hint: true
+
+use_dino_inject: false
+dino_inject_variant: dinov2_b

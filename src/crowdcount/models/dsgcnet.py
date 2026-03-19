@@ -56,11 +56,6 @@ class DSGCnet(nn.Module):
         )
         num_anchor_points = row * line
 
-        self.fusion_total = nn.Sequential(
-            nn.Conv2d(3 * 256, 256, kernel_size=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-        )
         self.regression = RegressionModel(
             num_features_in=256, num_anchor_points=num_anchor_points
         )
@@ -105,6 +100,11 @@ class DSGCnet(nn.Module):
                 if moe_cfg is not None
                 else 1.0
             )
+            use_density_hint = (
+                bool(getattr(moe_cfg, "use_density_hint", True))
+                if moe_cfg is not None
+                else True
+            )
 
             self.esca: ESCA | None = ESCA(256)
             self.moe: MoE | None = MoE(
@@ -114,6 +114,7 @@ class DSGCnet(nn.Module):
                 temperature_min=temperature_min,
                 lambda_balance=lambda_balance,
                 lambda_decorr=lambda_decorr,
+                use_density_hint=use_density_hint,
             )
             self.density_gcn = None
             self.feature_gcn = None
@@ -214,7 +215,7 @@ class DSGCnet(nn.Module):
             assert self.esca is not None and self.moe is not None
             esca_feature = self.esca(features_pa)
             feature_fl, moe_aux_losses, moe_weights = self.moe(
-                esca_feature, training=self.training
+                esca_feature, density_hint=density, training=self.training
             )
             output_dict["moe_aux_losses"] = moe_aux_losses
             output_dict["moe_aux_total"] = moe_aux_losses.get("total_aux")

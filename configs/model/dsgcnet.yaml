@@ -23,6 +23,7 @@ moe:
   temperature_decay: 0.99998
   stage1_ratio: 0.15
   stage2_gating_lr_multiplier: 3.0
-  aux_loss_weight: 2.0
+  aux_loss_weight: 0.2 # reduced from 2.0 to keep MoE aux << task loss
   lambda_balance: 0.835
   lambda_decorr: 1.0
+  use_density_hint: true

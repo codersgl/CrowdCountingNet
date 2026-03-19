@@ -278,24 +278,44 @@ class SENet(nn.Module):
 
 
 class GlobalExpert(nn.Module):
+    """全局专家：Pooled Cross-Attention (PCA).
+
+    用 O(N × G²) 的池化交叉注意力替换原有 O(N²) 全自注意力：
+      - Q：全分辨率 token [B, H*W, C]（无截断，任意输入尺寸均适用）
+      - K/V：固定池化至 G×G grid（默认 G=4，共 16 token）
+    推理任意大图时无需降采样-上采样，彻底消除空间信息损失。
+    原 max_attn_tokens 截断逻辑已移除。
+    """
+
     def __init__(
         self,
         input_dim: int,
         num_heads: int = 8,
         dropout: float = 0.1,
-        max_attn_tokens: int = 1024,
+        global_tokens: int = 4,
     ) -> None:
         super().__init__()
-        self.max_attn_tokens = max_attn_tokens
-        self.multi_attention = MultiHeadAttention(
-            input_dim, num_heads=num_heads, dropout=dropout
-        )
-        self.feature_enhancement = nn.Sequential(
-            nn.Linear(input_dim, 2 * input_dim),
-            nn.LayerNorm(2 * input_dim),
+        assert input_dim % num_heads == 0, "input_dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.d_k = input_dim // num_heads
+        self.global_tokens = global_tokens  # G（K/V 每边 token 数）
+
+        # Cross-attention projections（Q: full-res, K/V: G×G pooled）
+        self.q_proj = nn.Linear(input_dim, input_dim)
+        self.k_proj = nn.Linear(input_dim, input_dim)
+        self.v_proj = nn.Linear(input_dim, input_dim)
+        self.o_proj = nn.Linear(input_dim, input_dim)
+        self.dropout = nn.Dropout(dropout)
+
+        # Post-attention Conv FFN，在全分辨率空间图上运行（带残差）
+        self.ffn = nn.Sequential(
+            nn.Conv2d(input_dim, 2 * input_dim, kernel_size=1),
             nn.GELU(),
-            nn.Linear(2 * input_dim, input_dim),
+            nn.Conv2d(2 * input_dim, input_dim, kernel_size=1),
+            nn.BatchNorm2d(input_dim),
         )
+
+        # 保留原有 channel attention 和 skip-connection fusion
         self.channel_attention = SENet(input_dim)
         self.feature_fusion = nn.Sequential(
             nn.Conv2d(2 * input_dim, input_dim, kernel_size=3, padding=1),
@@ -305,43 +325,47 @@ class GlobalExpert(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-
         Args:
-            x: [batch_size, input_dim, h, w]
-
+            x: [B, C, H, W]
         Returns:
-            [TODO:return]
+            [B, C, H, W]
         """
-        b, c, h, w = x.size()
+        B, C, H, W = x.size()
+        N = H * W
+        G = self.global_tokens
+        G2 = G * G
 
-        attn_input = x
-        attn_h, attn_w = h, w
-        if h * w > self.max_attn_tokens:
-            ratio = math.sqrt(self.max_attn_tokens / float(h * w))
-            attn_h = max(1, int(h * ratio))
-            attn_w = max(1, int(w * ratio))
-            attn_input = F.adaptive_avg_pool2d(x, output_size=(attn_h, attn_w))
+        # Q：全分辨率 flatten → proj → [B, N, C]
+        q = self.q_proj(x.flatten(2).transpose(1, 2))  # [B, N, C]
 
-        f_attention = self.multi_attention(
-            attn_input
-        )  # [batch_size, attn_h * attn_w, input_dim]
-        f_enhanced = self.feature_enhancement(
-            f_attention
-        )  # [batch_size, attn_h * attn_w, input_dim]
-        f_enhanced = f_enhanced.reshape(
-            b, c, attn_h, attn_w
-        )  # [batch_size, input_dim, attn_h, attn_w]
+        # K/V：固定 G×G 池化 → flatten → proj → [B, G², C]
+        x_pooled = F.adaptive_avg_pool2d(x, G)  # [B, C, G, G]
+        kv_tokens = x_pooled.flatten(2).transpose(1, 2)  # [B, G², C]
+        k = self.k_proj(kv_tokens)  # [B, G², C]
+        v = self.v_proj(kv_tokens)  # [B, G², C]
 
-        if attn_h != h or attn_w != w:
-            f_enhanced = F.interpolate(
-                f_enhanced,
-                size=(h, w),
-                mode="bilinear",
-                align_corners=False,
-            )
+        # 多头分割
+        q = q.view(B, N, self.num_heads, self.d_k).transpose(1, 2)  # [B, h, N,  d_k]
+        k = k.view(B, G2, self.num_heads, self.d_k).transpose(1, 2)  # [B, h, G², d_k]
+        v = v.view(B, G2, self.num_heads, self.d_k).transpose(1, 2)  # [B, h, G², d_k]
 
-        f_global = self.channel_attention(f_enhanced)  # [batch_size, input_dim, h, w]
-        output = torch.cat([x, f_global], dim=1)  # [batch_size, 2 * input_dim, h, w]
+        # 池化交叉注意力：O(N × G²)
+        attn = (q @ k.transpose(-1, -2)) / math.sqrt(self.d_k)  # [B, h, N, G²]
+        attn = self.dropout(F.softmax(attn, dim=-1))
+        out = attn @ v  # [B, h, N, d_k]
+
+        # 合并头 → o_proj → reshape [B, C, H, W]
+        f_global = out.transpose(1, 2).contiguous().view(B, N, C)  # [B, N, C]
+        f_global = self.o_proj(f_global).transpose(1, 2).view(B, C, H, W)
+
+        # Post-attention FFN（残差）
+        f_global = f_global + self.ffn(f_global)
+
+        # Channel attention（保留）
+        f_global = self.channel_attention(f_global)  # [B, C, H, W]
+
+        # Skip connection + fusion（保留）
+        output = torch.cat([x, f_global], dim=1)  # [B, 2C, H, W]
         output = self.feature_fusion(output)
         return output
 
@@ -835,17 +859,195 @@ class PartExpert(nn.Module):
         return f_part
 
 
+class ScaleAdaptiveExpert(nn.Module):
+    """ASPP-based 多尺度专家：直接对齐 crowd counting 的多尺度人群挑战。
+
+    替换 TextureExpert（8方向 Gabor，计算量极大；人群关键是尺度而非纹理）。
+    6条并行分支：1×1 + dilation=1/3/6/9 + GAP全局上下文，约 1/10 的计算量。
+    """
+
+    def __init__(self, input_dim: int) -> None:
+        super().__init__()
+        branch_dim = max(1, input_dim // 6)
+        total_dim = branch_dim * 6
+
+        self.branch_1x1 = nn.Sequential(
+            nn.Conv2d(input_dim, branch_dim, kernel_size=1),
+            nn.BatchNorm2d(branch_dim),
+            nn.GELU(),
+        )
+        self.branch_r1 = nn.Sequential(
+            nn.Conv2d(input_dim, branch_dim, kernel_size=3, padding=1, dilation=1),
+            nn.BatchNorm2d(branch_dim),
+            nn.GELU(),
+        )
+        self.branch_r3 = nn.Sequential(
+            nn.Conv2d(input_dim, branch_dim, kernel_size=3, padding=3, dilation=3),
+            nn.BatchNorm2d(branch_dim),
+            nn.GELU(),
+        )
+        self.branch_r6 = nn.Sequential(
+            nn.Conv2d(input_dim, branch_dim, kernel_size=3, padding=6, dilation=6),
+            nn.BatchNorm2d(branch_dim),
+            nn.GELU(),
+        )
+        self.branch_r9 = nn.Sequential(
+            nn.Conv2d(input_dim, branch_dim, kernel_size=3, padding=9, dilation=9),
+            nn.BatchNorm2d(branch_dim),
+            nn.GELU(),
+        )
+        self.branch_global = nn.Sequential(
+            nn.Conv2d(input_dim, branch_dim, kernel_size=1),
+            nn.BatchNorm2d(branch_dim),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.fusion = nn.Sequential(
+            nn.Conv2d(total_dim, input_dim, kernel_size=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+            nn.Conv2d(input_dim, input_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, H, W]
+        Returns:
+            [B, C, H, W]
+        """
+        f1 = self.branch_1x1(x)
+        f2 = self.branch_r1(x)
+        f3 = self.branch_r3(x)
+        f4 = self.branch_r6(x)
+        f5 = self.branch_r9(x)
+        f6 = F.interpolate(
+            self.branch_global(x),
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        out = torch.cat([f1, f2, f3, f4, f5, f6], dim=1)
+        return self.fusion(out) + x  # 残差连接
+
+
+class DensityAwareExpert(nn.Module):
+    """密度感知专家：利用密度图引导特征增强，专为 crowd counting 任务设计。
+
+    替换 PartExpert（单人部件分析范式，不适配密集人群场景）。
+    高密度分支（小感受野）精准定位密集区；低密度分支（大感受野+全局上下文）感知稀疏区。
+    """
+
+    def __init__(self, input_dim: int) -> None:
+        super().__init__()
+        # 密度图空间注意力：[B, 1, H, W] → [B, 1, H, W]
+        self.density_attention = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.GELU(),
+            nn.Conv2d(16, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        # 高密度分支：dilation=1,2，精确定位密集人群
+        self.high_density_branch = nn.Sequential(
+            nn.Conv2d(input_dim, input_dim, kernel_size=3, padding=1, groups=input_dim),
+            nn.Conv2d(input_dim, input_dim, kernel_size=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+            nn.Conv2d(
+                input_dim,
+                input_dim,
+                kernel_size=3,
+                padding=2,
+                dilation=2,
+                groups=input_dim,
+            ),
+            nn.Conv2d(input_dim, input_dim, kernel_size=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+        )
+        # 低密度分支：dilation=4，稀疏区大感受野
+        self.low_density_branch = nn.Sequential(
+            nn.Conv2d(
+                input_dim,
+                input_dim,
+                kernel_size=3,
+                padding=4,
+                dilation=4,
+                groups=input_dim,
+            ),
+            nn.Conv2d(input_dim, input_dim, kernel_size=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+        )
+        # 全局上下文注入（场景级理解）
+        self.global_context = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(start_dim=1),
+            nn.Linear(input_dim, input_dim),
+            nn.GELU(),
+        )
+        # 自适应门控：混合高/低密度分支
+        self.adaptive_gate = nn.Sequential(
+            nn.Conv2d(input_dim * 2, 2, kernel_size=1),
+            nn.Softmax(dim=1),
+        )
+        self.fusion = nn.Sequential(
+            nn.Conv2d(input_dim, input_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+        )
+
+    def forward(
+        self, x: torch.Tensor, density: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, H, W]
+            density: [B, 1, H, W] 密度图，可选
+        Returns:
+            [B, C, H, W]
+        """
+        if density is not None:
+            if density.shape[-2:] != x.shape[-2:]:
+                density = F.interpolate(
+                    density, size=x.shape[-2:], mode="bilinear", align_corners=False
+                )
+            d_weight = self.density_attention(density)  # [B, 1, H, W]
+        else:
+            # 后备：用通道均值作为密度代理
+            d_weight = x.detach().mean(dim=1, keepdim=True).sigmoid()  # [B, 1, H, W]
+
+        # 高密度分支
+        f_high = self.high_density_branch(x * d_weight)  # [B, C, H, W]
+        # 低密度分支 + 全局上下文
+        f_low = self.low_density_branch(x * (1.0 - d_weight))  # [B, C, H, W]
+        g_ctx = self.global_context(x).view(x.size(0), -1, 1, 1)  # [B, C, 1, 1]
+        f_low = f_low + g_ctx
+        # 自适应门控融合
+        gate = self.adaptive_gate(torch.cat([f_high, f_low], dim=1))  # [B, 2, H, W]
+        fused = gate[:, 0:1] * f_high + gate[:, 1:2] * f_low  # [B, C, H, W]
+        return self.fusion(fused) + x  # 残差连接
+
+
 class SpatialContextEncoder(nn.Module):
     """
     空间上下文编码器：提取全局+局部空间特征
     论文3.4节: "extracts both global and local information"
     """
 
-    def __init__(self, input_dim: int, spatial_grid: int = 4):
+    def __init__(
+        self, input_dim: int, spatial_grid: int = 4, use_density_hint: bool = False
+    ):
         super().__init__()
         self.spatial_grid = spatial_grid
+        self.use_density_hint = use_density_hint
 
-        # 空间网格特征处理: [B, C, 4, 4] → [B, C//2, 4, 4] → [B, C//2 * 16]
+        # 空间网格特征处理: [B, C, 4, 4] → [B, C//2, 4, 4] → [B, C//16, 4, 4] → [B, C//16 * G²]
+        # 末尾用 1×1 Conv 将通道从 C//2 压缩至 C//16，降低路由输入维度并减少参数量
+        _spatial_ch = max(1, input_dim // 16)
         self.spatial_conv = nn.Sequential(
             nn.Conv2d(input_dim, input_dim // 2, kernel_size=3, padding=1),
             nn.BatchNorm2d(input_dim // 2),
@@ -853,26 +1055,34 @@ class SpatialContextEncoder(nn.Module):
             nn.Conv2d(input_dim // 2, input_dim // 2, kernel_size=3, padding=1),
             nn.BatchNorm2d(input_dim // 2),
             nn.GELU(),
+            nn.Conv2d(input_dim // 2, _spatial_ch, kernel_size=1),
+            nn.BatchNorm2d(_spatial_ch),
+            nn.GELU(),
         )
 
-        # 融合层: global(C) + spatial(C//2 * 16) → expert_scores(5)
+        # density hint: mean + std + max + 4×4 grid = 3 + 16 = 19 dims
+        density_hint_dim = 19 if use_density_hint else 0
+        fusion_input_dim = (
+            input_dim + _spatial_ch * spatial_grid * spatial_grid + density_hint_dim
+        )
         self.fusion = nn.Sequential(
-            nn.Linear(
-                input_dim + input_dim // 2 * spatial_grid * spatial_grid, input_dim
-            ),
+            nn.Linear(fusion_input_dim, input_dim),
             nn.LayerNorm(input_dim),
             nn.GELU(),
-            nn.Linear(input_dim, 5),  # 5个专家
+            nn.Linear(input_dim, 5),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, density_hint: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Args:
-            x: [B, C, H, W] 来自MSP模块的特征
+            x: [B, C, H, W]
+            density_hint: [B, 1, H, W] 密度图，可选，用于辅助路由
         Returns:
             scores: [B, 5] 专家重要性分数
         """
-        B, C, _, _ = x.shape
+        B, C, H, W = x.shape
 
         # 1. 全局特征: Global Average Pooling → [B, C]
         f_global = F.adaptive_avg_pool2d(x, 1).view(B, C)
@@ -882,10 +1092,21 @@ class SpatialContextEncoder(nn.Module):
         f_spatial = self.spatial_conv(f_spatial)  # [B, C//2, 4, 4]
         f_spatial = f_spatial.view(B, -1)  # [B, C//2 * 16]
 
-        # 3. 特征融合 → 专家分数
+        # 3. 特征融合（可选注入密度提示）
         f_fused = torch.cat([f_global, f_spatial], dim=1)  # [B, C + C//2*16]
-        scores = self.fusion(f_fused)  # [B, 5]
+        if self.use_density_hint and density_hint is not None:
+            if density_hint.shape[-2:] != (H, W):
+                density_hint = F.interpolate(
+                    density_hint, size=(H, W), mode="bilinear", align_corners=False
+                )
+            d_mean = density_hint.mean(dim=(-1, -2))  # [B, 1]
+            d_std = density_hint.std(dim=(-1, -2))  # [B, 1]
+            d_max = density_hint.amax(dim=(-1, -2))  # [B, 1]
+            d_grid = F.adaptive_avg_pool2d(density_hint, 4).view(B, -1)  # [B, 16]
+            f_density = torch.cat([d_mean, d_std, d_max, d_grid], dim=1)  # [B, 19]
+            f_fused = torch.cat([f_fused, f_density], dim=1)
 
+        scores = self.fusion(f_fused)  # [B, 5]
         return scores
 
 
@@ -942,8 +1163,13 @@ class DynamicRouter(nn.Module):
             selected_soft = probs * hard_mask
             weights = hard_mask - selected_soft.detach() + selected_soft
         else:
-            # Soft routing: Softmax 连续权重
-            weights = F.softmax(scores / self.temperature, dim=-1)
+            # Sparse routing: top-k masked softmax（与训练稀疏性对齐，权重连续可微）
+            probs = F.softmax(scores / self.temperature, dim=-1)
+            k = min(self.top_k, scores.size(-1))
+            _, top_idx = torch.topk(probs, k, dim=-1)
+            mask = torch.zeros_like(probs).scatter_(-1, top_idx, 1.0)
+            masked = probs * mask
+            weights = masked / (masked.sum(dim=-1, keepdim=True) + 1e-8)
 
         return weights
 
@@ -1006,13 +1232,19 @@ class MoELoss(nn.Module):
                 count += 1
         return loss / count if count > 0 else loss
 
-    def forward(self, expert_weights: torch.Tensor, expert_outputs: list) -> dict:
+    def forward(
+        self,
+        expert_weights: torch.Tensor,
+        expert_outputs: list,
+        disable_balance: bool = False,
+    ) -> dict:
         """
         Args:
             expert_weights: [B, 5] 专家权重
             expert_outputs: List[Tensor] 5个专家的输出
+            disable_balance: True 时 balance_loss 不参与 total_aux（stage1 专精阶段用）
         Returns:
-            losses: dict 包含各辅助损失
+            losses: dict 包含各辅助损失（l_balance 仍照常计算用于 TensorBoard 监控）
         """
         expert_usage = expert_weights.mean(dim=0)  # [5]
 
@@ -1021,8 +1253,9 @@ class MoELoss(nn.Module):
             "l_decorr": self._feature_decorrelation_loss(expert_outputs),
         }
 
+        balance_weight = 0.0 if disable_balance else self.lambda_balance
         total_aux = (
-            self.lambda_balance * losses["l_balance"]
+            balance_weight * losses["l_balance"]
             + self.lambda_decorr * losses["l_decorr"]
         )
         losses["total_aux"] = total_aux
@@ -1040,6 +1273,7 @@ class MoE(nn.Module):
         lambda_balance: float = 0.835,
         lambda_decorr: float = 1.0,
         ema_momentum: float = 0.99,
+        use_density_hint: bool = False,
     ):
         super().__init__()
 
@@ -1048,23 +1282,28 @@ class MoE(nn.Module):
         self.temperature_min = temperature_min
 
         # ========== 1. 五个专家模块 ==========
+        # Global/Region/Local: 保留原设计
+        # ScaleAdaptiveExpert (替换 TextureExpert): ASPP多尺度，直接对齐尺度变化挑战
+        # DensityAwareExpert (替换 PartExpert): 密度图引导的高/低密度分支
         self.global_expert = GlobalExpert(input_dim)
         self.region_expert = RegionExpert(input_dim)
         self.local_expert = LocalExpert(input_dim)
-        self.texture_expert = TextureExpert(input_dim)
-        self.part_expert = PartExpert(input_dim)
+        self.scale_expert = ScaleAdaptiveExpert(input_dim)
+        self.density_expert = DensityAwareExpert(input_dim)
         self.experts = nn.ModuleList(
             [
                 self.global_expert,
                 self.region_expert,
                 self.local_expert,
-                self.texture_expert,
-                self.part_expert,
+                self.scale_expert,
+                self.density_expert,
             ]
         )
 
-        # ========== 2. 门控网络 ==========
-        self.context_encoder = SpatialContextEncoder(input_dim)
+        # ========== 2. 门控网络（支持密度提示辅助路由） ==========
+        self.context_encoder = SpatialContextEncoder(
+            input_dim, use_density_hint=use_density_hint
+        )
         self.router = DynamicRouter(num_experts=5, top_k=top_k)
 
         # ========== 3. 辅助损失 ==========
@@ -1092,10 +1331,16 @@ class MoE(nn.Module):
         """设置训练阶段: 'specialization' 或 'coordination'"""
         self.training_stage = stage
 
-    def forward(self, x: torch.Tensor, training: bool = True) -> tuple:
+    def forward(
+        self,
+        x: torch.Tensor,
+        density_hint: torch.Tensor | None = None,
+        training: bool = True,
+    ) -> tuple:
         """
         Args:
-            x: [B, C, H, W] 输入特征（来自MSP模块）
+            x: [B, C, H, W] 输入特征（来自ESCA模块）
+            density_hint: [B, 1, H, W] 密度图，可选，用于路由和 DensityAwareExpert
             training: 是否训练阶段
         Returns:
             fused_output: [B, C, H, W] 融合后的特征
@@ -1103,10 +1348,15 @@ class MoE(nn.Module):
             expert_weights: [B, 5] 专家权重（可选，用于可视化）
         """
         # ========== 1. 前向传播通过5个专家 ==========
-        expert_outputs = [expert(x) for expert in self.experts]  # List of [B, C, H, W]
+        expert_outputs = []
+        for expert in self.experts:
+            if isinstance(expert, DensityAwareExpert) and density_hint is not None:
+                expert_outputs.append(expert(x, density_hint))
+            else:
+                expert_outputs.append(expert(x))
 
-        # ========== 2. 门控网络获取专家权重 ==========
-        scores = self.context_encoder(x)  # [B, 5]
+        # ========== 2. 门控网络获取专家权重（注入密度提示辅助路由） ==========
+        scores = self.context_encoder(x, density_hint=density_hint)  # [B, 5]
 
         if training and self.training_stage == "coordination":
             # 协调学习阶段：使用动态路由
@@ -1135,6 +1385,10 @@ class MoE(nn.Module):
                     self.ema_momentum * self.ema_usage
                     + (1.0 - self.ema_momentum) * batch_usage
                 )
-            aux_losses = self.aux_loss(weights, expert_outputs)
+            aux_losses = self.aux_loss(
+                weights,
+                expert_outputs,
+                disable_balance=(self.training_stage == "specialization"),
+            )
 
         return fused, aux_losses, weights

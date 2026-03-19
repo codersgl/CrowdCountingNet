@@ -206,6 +206,8 @@ class Trainer:
         ):
             new_lr = self.cfg.optimizer.lr * self.moe_gating_lr_multiplier
             self.optimizer.param_groups[self.gating_pg_idx]["lr"] = new_lr
+            # Also update initial_lr so CosineAnnealingLR.step() re-computes from new base.
+            self.optimizer.param_groups[self.gating_pg_idx]["initial_lr"] = new_lr
             logger.info(f"[MoE] Stage 2 (coordination): gating LR → {new_lr:.2e}")
         self._moe_prev_stage = stage
         return stage
@@ -307,8 +309,8 @@ class Trainer:
                 self.writer.add_scalar("metric/density_mse", result[3], step)
                 step += 1
 
-                # Save best MAE checkpoint
-                if abs(np.min(mae_history) - result[0]) < 0.01:
+                # Save best MAE checkpoint (strict: only when current epoch is the new minimum)
+                if result[0] <= np.min(mae_history):
                     torch.save(
                         {
                             "model": self.model.state_dict(),

@@ -53,6 +53,9 @@ def train_one_epoch(
     use_multi_scale_density = bool(
         getattr(density_cfg, "enabled", False) if density_cfg is not None else False
     )
+    density_loss_weight = (
+        float(getattr(cfg, "density_loss_weight", 0.05)) if cfg is not None else 0.05
+    )
     model_moe_cfg = getattr(getattr(cfg, "model", None), "moe", None)
     moe_aux_weight = (
         float(getattr(model_moe_cfg, "aux_loss_weight", 1.0))
@@ -133,19 +136,31 @@ def train_one_epoch(
                     + w_orig * loss_orig
                 )
                 / gt_dmap.shape[0]
-                * 0.01
+                * density_loss_weight
             )
 
             # Log individual losses for monitoring
             metric_logger.update(
-                den_loss_block3=(loss_block3 / gt_dmap.shape[0] * 0.01).item(),
-                den_loss_block4=(loss_block4 / gt_dmap.shape[0] * 0.01).item(),
-                den_loss_block5=(loss_block5 / gt_dmap.shape[0] * 0.01).item(),
-                den_loss_orig=(loss_orig / gt_dmap.shape[0] * 0.01).item(),
+                den_loss_block3=(
+                    loss_block3 / gt_dmap.shape[0] * density_loss_weight
+                ).item(),
+                den_loss_block4=(
+                    loss_block4 / gt_dmap.shape[0] * density_loss_weight
+                ).item(),
+                den_loss_block5=(
+                    loss_block5 / gt_dmap.shape[0] * density_loss_weight
+                ).item(),
+                den_loss_orig=(
+                    loss_orig / gt_dmap.shape[0] * density_loss_weight
+                ).item(),
             )
         else:
             # Single-scale density prediction (original behavior)
-            density_loss = density_criterion(et_dmap, gt_dmap) / gt_dmap.shape[0] * 0.01
+            density_loss = (
+                density_criterion(et_dmap, gt_dmap)
+                / gt_dmap.shape[0]
+                * density_loss_weight
+            )
 
         moe_aux_total = outputs.get("moe_aux_total")
         moe_aux_component = torch.tensor(0.0, device=samples.device)

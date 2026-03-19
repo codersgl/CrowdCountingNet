@@ -152,17 +152,27 @@ class Trainer:
         if cfg.resume:
             ckpt = torch.load(cfg.resume, map_location="cpu")
             model.load_state_dict(ckpt["model"])
-            if "optimizer" in ckpt:
+            reset_opt = bool(getattr(cfg, "reset_optimizer", False))
+            if not reset_opt and "optimizer" in ckpt:
                 self.optimizer.load_state_dict(ckpt["optimizer"])
-            if "lr_scheduler" in ckpt:
+            if not reset_opt and "lr_scheduler" in ckpt:
                 self.lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
-            if "epoch" in ckpt:
+            if "moe_temperature" in ckpt and ckpt["moe_temperature"] is not None:
+                if hasattr(model, "moe"):
+                    model.moe.temperature = ckpt["moe_temperature"]
+                    model.moe.router.temperature = ckpt["moe_temperature"]
+            if "epoch" in ckpt and not reset_opt:
                 cfg.start_epoch = ckpt["epoch"] + 1
             if "mae_history" in ckpt:
                 self._resume_mae_history = ckpt["mae_history"]
             if "density_mae_history" in ckpt:
                 self._resume_density_mae_history = ckpt["density_mae_history"]
-            logger.info(f"Resumed from {cfg.resume} (epoch {cfg.start_epoch})")
+            if reset_opt:
+                logger.info(
+                    f"Resumed model weights from {cfg.resume} (optimizer reset, training from epoch 0)"
+                )
+            else:
+                logger.info(f"Resumed from {cfg.resume} (epoch {cfg.start_epoch})")
 
         # TensorBoard
         tb_dir = hydra_output / cfg.tensorboard_dir
@@ -249,6 +259,9 @@ class Trainer:
                     "epoch": epoch,
                     "mae_history": mae_history,
                     "density_mae_history": density_mae_history,
+                    "moe_temperature": self.model.moe.temperature
+                    if hasattr(self.model, "moe")
+                    else None,
                 },
                 ckpt_path,
             )
@@ -291,6 +304,9 @@ class Trainer:
                             "epoch": epoch,
                             "mae_history": mae_history,
                             "density_mae_history": density_mae_history,
+                            "moe_temperature": self.model.moe.temperature
+                            if hasattr(self.model, "moe")
+                            else None,
                         },
                         self.checkpoints_dir / "best_mae.pth",
                     )

@@ -16,11 +16,14 @@ epochs: 3500
 clip_max_norm: 0.1
 frozen_weights: null
 resume: ""
+reset_optimizer: false
 start_epoch: 0
 
 # Output dirs (hydra manages outputs/)
 checkpoints_dir: checkpoints
 tensorboard_dir: runs/dsgc
+
+density_loss_weight: 0.05 # Global scale factor applied to all density map losses
 
 # Multi-scale density prediction (experimental)
 density_multi_scale:

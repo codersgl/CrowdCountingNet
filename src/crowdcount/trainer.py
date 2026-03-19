@@ -315,7 +315,7 @@ class Trainer:
                             "mae_history": mae_history,
                             "density_mae_history": density_mae_history,
                             "moe_temperature": self.model.moe.temperature
-                            if hasattr(self.model, "moe")
+                            if hasattr(self.model, "moe") and self.model.moe is not None
                             else None,
                         },
                         self.checkpoints_dir / "best_mae.pth",

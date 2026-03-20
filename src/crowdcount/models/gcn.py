@@ -96,10 +96,10 @@ class GCNModel(nn.Module):
     def forward(self, tensor: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         x = self.conv1(tensor, edge_index)
         x = F.relu(x)
-        x = F.dropout(x, p=0.5)
+        x = F.dropout(x, p=0.5, training=self.training)
         x = self.conv2(x, edge_index)
         x = F.relu(x)
-        x = F.dropout(x, p=0.5)
+        x = F.dropout(x, p=0.5, training=self.training)
         return x
 
 

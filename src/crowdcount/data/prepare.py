@@ -58,7 +58,7 @@ def gaussian_filter_density(img: np.ndarray, points: np.ndarray) -> np.ndarray:
 
     for i, pt in enumerate(points):
         pt2d = np.zeros(img_shape, dtype=np.float32)
-        if int(pt[1]) < img_shape[0] and int(pt[0]) < img_shape[1]:
+        if 0 <= int(pt[1]) < img_shape[0] and 0 <= int(pt[0]) < img_shape[1]:
             pt2d[int(pt[1]), int(pt[0])] = 1.0
         else:
             continue

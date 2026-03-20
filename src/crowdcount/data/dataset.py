@@ -121,13 +121,22 @@ class SHHA(Dataset):
                 point[i] = torch.Tensor(point[i])
 
         if random.random() > 0.5 and self.train and self.flip:
-            img_with_density = torch.Tensor(img_with_density[:, :, :, ::-1].copy())
+            if img_with_density.ndim == 4:
+                img_with_density = torch.Tensor(img_with_density[:, :, :, ::-1].copy())
+                flip_w = img_with_density.shape[3]
+            else:
+                img_with_density = torch.Tensor(img_with_density[:, :, ::-1].copy())
+                flip_w = img_with_density.shape[2]
             for i in range(len(point)):
-                point[i][:, 0] = 128 - point[i][:, 0]
+                point[i][:, 0] = flip_w - point[i][:, 0]
 
         if self.train:
-            img = img_with_density[:, :-1, :, :]
-            density = img_with_density[:, -1:, :, :]
+            if img_with_density.ndim == 4:
+                img = img_with_density[:, :-1, :, :]
+                density = img_with_density[:, -1:, :, :]
+            else:
+                img = img_with_density[:-1, :, :]
+                density = img_with_density[-1:, :, :]
             density = torch.Tensor(density)
 
         if not self.train:
@@ -182,9 +191,9 @@ def _random_crop(img, den, num_patch: int = 4):
         result_img[i] = img[:, start_h:end_h, start_w:end_w]
         idx = (
             (den[:, 0] >= start_w)
-            & (den[:, 0] <= end_w)
+            & (den[:, 0] < end_w)
             & (den[:, 1] >= start_h)
-            & (den[:, 1] <= end_h)
+            & (den[:, 1] < end_h)
         )
         record_den = den[idx]
         record_den[:, 0] -= start_w

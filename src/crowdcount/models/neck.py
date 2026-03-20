@@ -78,6 +78,17 @@ class Decoder_SPD_PAFPN(nn.Module):
             nn.BatchNorm2d(feature_size),
             nn.ReLU(inplace=True),
         )
+        # Independent conv layers for bottom-up pathway
+        self.P4_2_bu = nn.Sequential(
+            nn.Conv2d(feature_size, feature_size, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(feature_size),
+            nn.ReLU(inplace=True),
+        )
+        self.P5_2_bu = nn.Sequential(
+            nn.Conv2d(feature_size, feature_size, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(feature_size),
+            nn.ReLU(inplace=True),
+        )
         self.fusion = nn.Sequential(
             nn.Conv2d(3 * feature_size, feature_size, kernel_size=1),
             nn.BatchNorm2d(feature_size),
@@ -101,9 +112,9 @@ class Decoder_SPD_PAFPN(nn.Module):
         # Bottom-up
         P3_x = self.P3_downsampled(P3_x)
         P4_x = P4_x + P3_x
-        P4_x = self.P4_2(P4_x)
+        P4_x = self.P4_2_bu(P4_x)
         P5_x = P5_x + self.P4_downsampled(P4_x)
-        P5_x = self.P5_2(P5_x)
+        P5_x = self.P5_2_bu(P5_x)
         P5_x = self.P5_upsampled(P5_x)
 
         fuse = torch.cat([P3_x, P4_x, P5_x], 1)

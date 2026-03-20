@@ -54,7 +54,7 @@ def train_one_epoch(
         getattr(density_cfg, "enabled", False) if density_cfg is not None else False
     )
     density_loss_weight = (
-        float(getattr(cfg, "density_loss_weight", 0.05)) if cfg is not None else 0.05
+        float(getattr(cfg, "density_loss_weight", 0.01)) if cfg is not None else 0.01
     )
     model_moe_cfg = getattr(getattr(cfg, "model", None), "moe", None)
     moe_aux_weight = (

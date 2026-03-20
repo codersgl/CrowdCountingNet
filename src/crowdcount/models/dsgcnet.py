@@ -1,6 +1,7 @@
 """DSGCNet main model definition."""
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from omegaconf import DictConfig
 
@@ -124,7 +125,7 @@ class DSGCnet(nn.Module):
             self.density_gcn: DensityGCNProcessor | None = DensityGCNProcessor(k=4)
             self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(k=4)
             self.alpha: nn.Parameter | None = nn.Parameter(
-                torch.tensor([1.0, 1.0], dtype=torch.float32, requires_grad=True)
+                torch.ones(3, dtype=torch.float32)
             )
             self.gm: GateMechanism | None = (
                 GateMechanism(input_dim=gm_input_dim, hidden_dim=gm_hidden_dim)
@@ -266,10 +267,11 @@ class DSGCnet(nn.Module):
                 )
             else:
                 assert self.alpha is not None
+                w = F.softmax(self.alpha, dim=0)
                 feature_fl = (
-                    features_pa
-                    + self.alpha[0] * density_gcn_feature
-                    + self.alpha[1] * feature_gcn_feature
+                    w[0] * features_pa
+                    + w[1] * density_gcn_feature
+                    + w[2] * feature_gcn_feature
                 )
 
         regression = self.regression(feature_fl) * 100

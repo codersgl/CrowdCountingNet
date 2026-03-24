@@ -22,6 +22,12 @@ dependencies = [
     "torch-geometric>=2.3",
     "easydict>=1.10",
     "pytest-cov>=7.0.0",
+    "pywavelets>=1.8.0",
+    "timm>=1.0.25",
+    "einops>=0.8.2",
+    "ninja>=1.13.0",
+    "mamba-ssm",
+    "xformers>=0.0.35",
 ]
 
 [project.optional-dependencies]
@@ -46,3 +52,6 @@ filterwarnings = ["ignore::DeprecationWarning", "ignore::UserWarning"]
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
+
+[tool.uv.sources]
+mamba-ssm = { url = "https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl" }

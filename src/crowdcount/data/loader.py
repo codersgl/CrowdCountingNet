@@ -19,7 +19,7 @@ def build_dataset(cfg: DictConfig):
 
     Args:
         cfg: top-level hydra DictConfig; uses cfg.data.data_root,
-             cfg.data.patch, cfg.data.flip.
+             cfg.data.patch, cfg.data.flip, cfg.model.use_depth.
     """
     transform = standard_transforms.Compose(
         [
@@ -36,12 +36,26 @@ def build_dataset(cfg: DictConfig):
             f"data.data_root '{data_root}' does not exist or is not set. "
             "Pass it on the command line: data.data_root=/path/to/dataset"
         )
+
+    use_depth = bool(getattr(getattr(cfg, "model", None), "use_depth", False))
+    depth_cfg = (
+        getattr(getattr(cfg, "model", None), "depth", None) if use_depth else None
+    )
+
     train_set = SHHA(
         data_root,
         train=True,
         transform=transform,
         patch=cfg.data.patch,
         flip=cfg.data.flip,
+        use_depth=use_depth,
+        depth_cfg=depth_cfg,
     )
-    val_set = SHHA(data_root, train=False, transform=transform)
+    val_set = SHHA(
+        data_root,
+        train=False,
+        transform=transform,
+        use_depth=use_depth,
+        depth_cfg=depth_cfg,
+    )
     return train_set, val_set

@@ -40,3 +40,39 @@ def collate_fn_crowd_train(batch):
     batch = list(zip(*batch))
     batch[0] = nested_tensor_from_tensor_list(batch[0])
     return tuple(batch)
+
+
+def collate_fn_crowd_depth(batch):
+    """Collate for evaluation with depth (img, targets, depth_map)."""
+    batch_new = []
+    for b in batch:
+        imgs, points, depth = b
+        if imgs.ndim == 3:
+            imgs = imgs.unsqueeze(0)
+        if depth.ndim == 3:
+            depth = depth.unsqueeze(0)
+        for i in range(len(imgs)):
+            batch_new.append((imgs[i], points[i], depth[i]))
+    batch = batch_new
+    batch = list(zip(*batch))
+    batch[0] = nested_tensor_from_tensor_list(batch[0])
+    return tuple(batch)
+
+
+def collate_fn_crowd_train_depth(batch):
+    """Collate for training with depth (img, targets, density, depth_map)."""
+    batch_new = []
+    for b in batch:
+        imgs, points, density, depth = b
+        if imgs.ndim == 3:
+            imgs = imgs.unsqueeze(0)
+        if density.ndim == 3:
+            density = density.unsqueeze(0)
+        if depth.ndim == 3:
+            depth = depth.unsqueeze(0)
+        for i in range(len(imgs)):
+            batch_new.append((imgs[i], points[i], density[i], depth[i]))
+    batch = batch_new
+    batch = list(zip(*batch))
+    batch[0] = nested_tensor_from_tensor_list(batch[0])
+    return tuple(batch)

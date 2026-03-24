@@ -17,8 +17,46 @@ from crowdcount.models.head import (
 )
 from crowdcount.models.neck import Decoder_SPD_PAFPN
 from crowdcount.plugins.gm import GateMechanism
+from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
 from crowdcount.plugins.moe import ESCA, MoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
+
+
+class _DepthEncoder(nn.Module):
+    """Lightweight depth feature extractor: 1ch → (d3, d4, d5).
+
+    Produces three feature maps that match the spatial scales of the VGG
+    backbone's c3 / c4 / c5 outputs (features_list[1..3]):
+        d3: [B, 256, H/4,  W/4 ]
+        d4: [B, 512, H/8,  W/8 ]
+        d5: [B, 512, H/16, W/16]
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        def _block(in_ch: int, out_ch: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Conv2d(
+                    in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False
+                ),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            )
+
+        self.stage1 = _block(1, 64)  # H/2
+        self.stage2 = _block(64, 256)  # H/4  → d3
+        self.stage3 = _block(256, 512)  # H/8  → d4
+        self.stage4 = _block(512, 512)  # H/16 → d5
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = self.stage1(x)
+        d3 = self.stage2(x)  # [B, 256, H/4,  W/4 ]
+        d4 = self.stage3(d3)  # [B, 512, H/8,  W/8 ]
+        d5 = self.stage4(d4)  # [B, 512, H/16, W/16]
+        return d3, d4, d5
 
 
 class DSGCnet(nn.Module):
@@ -35,6 +73,8 @@ class DSGCnet(nn.Module):
         msaa_in_channels: int = 1280,
         msaa_reduction: int = 4,
         moe_cfg: DictConfig | None = None,
+        use_depth: bool = False,
+        depth_cfg: DictConfig | None = None,
         cfg: DictConfig | None = None,
     ):
         super().__init__()
@@ -43,6 +83,7 @@ class DSGCnet(nn.Module):
         self.cfg = cfg
         self.fusion_mode = fusion_mode
         self.use_moe = fusion_mode == "esca_moe"
+        self.use_depth = use_depth
 
         if self.fusion_mode not in {"gcn", "esca_moe"}:
             raise ValueError(
@@ -141,6 +182,34 @@ class DSGCnet(nn.Module):
             else None
         )
 
+        # Depth dual-stream fusion (optional, disabled by default)
+        if use_depth:
+            embed_dim = (
+                int(getattr(depth_cfg, "embed_dim", 128))
+                if depth_cfg is not None
+                else 128
+            )
+            num_isf_layers = (
+                int(getattr(depth_cfg, "num_isf_layers", 1))
+                if depth_cfg is not None
+                else 1
+            )
+            self.depth_backbone: _DepthEncoder | None = _DepthEncoder()
+            self.depth_fusion_c3: DepthFusionModule | None = DepthFusionModule(
+                in_channels=256, embed_dim=embed_dim, num_isf_layers=num_isf_layers
+            )
+            self.depth_fusion_c4: DepthFusionModule | None = DepthFusionModule(
+                in_channels=512, embed_dim=embed_dim, num_isf_layers=num_isf_layers
+            )
+            self.depth_fusion_c5: DepthFusionModule | None = DepthFusionModule(
+                in_channels=512, embed_dim=embed_dim, num_isf_layers=num_isf_layers
+            )
+        else:
+            self.depth_backbone = None
+            self.depth_fusion_c3 = None
+            self.depth_fusion_c4 = None
+            self.depth_fusion_c5 = None
+
         # DINOv2 semantic injection (optional, disabled by default)
         # cfg may be full hydra config (has .model) or flat model-level config from tests
         _model_cfg = getattr(cfg, "model", cfg) if cfg is not None else None
@@ -195,7 +264,9 @@ class DSGCnet(nn.Module):
             return
         self.moe.update_temperature(decay_rate=decay_rate)
 
-    def forward(self, samples: torch.Tensor) -> dict:
+    def forward(
+        self, samples: torch.Tensor, depth_map: torch.Tensor | None = None
+    ) -> dict:
         features = self.backbone(samples)
 
         # Convert dict to list format for compatibility with MSAA and PA-FPN
@@ -207,6 +278,22 @@ class DSGCnet(nn.Module):
         # Use stable list indices across VGG and DINO backbones:
         # c3: 256ch, c4: 512ch, c5: 512ch
         c3, c4, c5 = features_list[1], features_list[2], features_list[3]
+
+        # Depth dual-stream fusion: fuse each scale before PA-FPN
+        if self.use_depth and depth_map is not None:
+            assert self.depth_backbone is not None
+            # Resize depth_map to match input spatial dims (may differ due to padding)
+            if depth_map.shape[-2:] != samples.shape[-2:]:
+                depth_map = F.interpolate(
+                    depth_map,
+                    size=samples.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            d3, d4, d5 = self.depth_backbone(depth_map)
+            c3 = self.depth_fusion_c3(c3, d3)  # type: ignore[misc]
+            c4 = self.depth_fusion_c4(c4, d4)  # type: ignore[misc]
+            c5 = self.depth_fusion_c5(c5, d5)  # type: ignore[misc]
 
         features_pa = self.pa([c3, c4, c5])  # [batch_size, 256, 16, 16]
 

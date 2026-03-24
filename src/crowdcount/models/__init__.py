@@ -30,6 +30,8 @@ def build_model(cfg: DictConfig, training: bool = False):
         msaa_in_channels=getattr(cfg.model, "msaa_in_channels", 1280),
         msaa_reduction=getattr(cfg.model, "msaa_reduction", 4),
         moe_cfg=getattr(cfg.model, "moe", None),
+        use_depth=getattr(cfg.model, "use_depth", False),
+        depth_cfg=getattr(cfg.model, "depth", None),
         cfg=cfg,  # Pass config for multi-scale density prediction
     )
 

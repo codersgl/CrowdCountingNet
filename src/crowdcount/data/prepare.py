@@ -187,3 +187,79 @@ def generate_density_maps(data_root: str | Path, split: str = "train") -> None:
         np.save(str(out_path), density)
 
     logger.info(f"Density maps saved to {out_dir}")
+
+
+def generate_depth_maps(
+    data_root: str | Path,
+    split: str = "train",
+    encoder: str = "vitb",
+    weight_path: str | None = None,
+) -> None:
+    """Generate depth maps (.npy) for all images in a dataset split using DepthAnythingV2.
+
+    Maps are saved at original image resolution as float32 (H×W) to::
+
+        data_root/gt_depth_maps/<split>/<stem>.npy
+
+    Args:
+        data_root: Dataset root directory.
+        split: Dataset split ('train' or 'test').
+        encoder: DepthAnythingV2 encoder variant ('vits', 'vitb', 'vitl').
+        weight_path: Path to the .pth checkpoint. Defaults to
+            checkpoints/depth_anything_v2_{encoder}.pth relative to CWD.
+    """
+    import cv2
+    import torch
+    from tqdm import tqdm
+
+    from crowdcount.plugins.depth_anything_v2.dpt import DepthAnythingV2
+
+    data_root = Path(data_root)
+    out_dir = data_root / "gt_depth_maps" / split
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if weight_path is None:
+        weight_path = f"checkpoints/depth_anything_v2_{encoder}.pth"
+
+    _encoder_configs = {
+        "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
+        "vitb": {
+            "encoder": "vitb",
+            "features": 128,
+            "out_channels": [96, 192, 384, 768],
+        },
+        "vitl": {
+            "encoder": "vitl",
+            "features": 256,
+            "out_channels": [256, 512, 1024, 1024],
+        },
+    }
+    if encoder not in _encoder_configs:
+        raise ValueError(
+            f"Unknown encoder '{encoder}', choose from {list(_encoder_configs)}"
+        )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = DepthAnythingV2(**_encoder_configs[encoder])
+    ckpt = torch.load(weight_path, map_location="cpu")
+    model.load_state_dict(ckpt)
+    model = model.to(device).eval()
+    logger.info(f"Loaded DepthAnythingV2-{encoder} from {weight_path}")
+
+    pairs = _find_image_gt_pairs(data_root, split)
+    logger.info(f"Generating depth maps for split='{split}' ({len(pairs)} images)...")
+
+    for img_path, _ in tqdm(pairs, desc=f"depth maps [{split}]", unit="img"):
+        out_path = out_dir / f"{img_path.stem}.npy"
+        if out_path.exists():
+            continue
+
+        raw_img = cv2.imread(str(img_path))
+        if raw_img is None:
+            logger.warning(f"Cannot read image: {img_path}")
+            continue
+
+        depth = model.infer_image(raw_img)  # H×W float32 numpy array
+        np.save(str(out_path), depth.astype(np.float32))
+
+    logger.info(f"Depth maps saved to {out_dir}")

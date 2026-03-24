@@ -67,14 +67,28 @@ def train_one_epoch(
         if model_moe_cfg is not None
         else 0.9999
     )
+    use_depth = bool(
+        getattr(getattr(cfg, "model", None), "use_depth", False)
+        if cfg is not None
+        else False
+    )
 
-    for samples, targets, gt_dmap in data_loader:
+    for batch in data_loader:
+        if use_depth:
+            samples, targets, gt_dmap, depth_map = batch
+            depth_map = torch.stack(depth_map).to(device)
+        else:
+            samples, targets, gt_dmap = batch
+            depth_map = None
         samples = samples.to(device)
         gt_dmap = torch.stack(gt_dmap)
         gt_dmap = gt_dmap.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        outputs = model(samples)
+        if depth_map is not None:
+            outputs = model(samples, depth_map=depth_map)
+        else:
+            outputs = model(samples)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
         losses = sum(
@@ -243,6 +257,7 @@ def evaluate_crowd_no_overlap(
     data_loader: Iterable,
     device: torch.device,
     vis_dir: Optional[str] = None,
+    use_depth: bool = False,
 ) -> tuple[float, float, float, float]:
     """Evaluate on validation set (no overlap).
 
@@ -257,9 +272,18 @@ def evaluate_crowd_no_overlap(
     )
     maes, mses, density_maes, density_mses = [], [], [], []
 
-    for samples, targets in data_loader:
+    for batch in data_loader:
+        if use_depth:
+            samples, targets, depth_map = batch
+            depth_map = torch.stack(depth_map).to(device)
+        else:
+            samples, targets = batch
+            depth_map = None
         samples = samples.to(device)
-        outputs = model(samples)
+        if depth_map is not None:
+            outputs = model(samples, depth_map=depth_map)
+        else:
+            outputs = model(samples)
 
         outputs_scores = torch.nn.functional.softmax(outputs["pred_logits"], -1)[
             :, :, 1

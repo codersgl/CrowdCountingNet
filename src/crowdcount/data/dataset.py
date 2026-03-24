@@ -29,9 +29,12 @@ class SHHA(Dataset):
         train: bool = False,
         patch: bool = False,
         flip: bool = False,
+        use_depth: bool = False,
+        depth_cfg=None,
     ):
         self.root_path = data_root
         self.gt_density = "gt_density_maps"
+        self.use_depth = use_depth
         split = "train" if train else "test"
 
         if train:
@@ -41,6 +44,27 @@ class SHHA(Dataset):
                 self.gt_dmap_root
             ):
                 generate_density_maps(data_root, split="train")
+
+        if use_depth:
+            depth_split = "train" if train else "test"
+            self.gt_depth_root = os.path.join(data_root, "gt_depth_maps", depth_split)
+            if not os.path.isdir(self.gt_depth_root) or not os.listdir(
+                self.gt_depth_root
+            ):
+                from crowdcount.data.prepare import generate_depth_maps
+
+                encoder = "vitb"
+                weight_path = None
+                if depth_cfg is not None:
+                    encoder = str(getattr(depth_cfg, "encoder", "vitb"))
+                    wp = getattr(depth_cfg, "weight_path", None)
+                    weight_path = str(wp) if wp is not None else None
+                generate_depth_maps(
+                    data_root,
+                    split=depth_split,
+                    encoder=encoder,
+                    weight_path=weight_path,
+                )
 
         # Discover image/GT pairs without any list file
         from crowdcount.data.prepare import _find_image_gt_pairs
@@ -70,6 +94,16 @@ class SHHA(Dataset):
             )
             gt_dmap = torch.from_numpy(gt_dmap)
             gt_dmap1 = gt_dmap.unsqueeze(0)
+
+            if self.use_depth:
+                depth_npy = np.load(
+                    os.path.join(self.gt_depth_root, imgname.replace(".jpg", ".npy"))
+                ).astype(np.float32)
+                # Min-max normalise depth to [0, 1]
+                d_min, d_max = depth_npy.min(), depth_npy.max()
+                if d_max - d_min > 1e-6:
+                    depth_npy = (depth_npy - d_min) / (d_max - d_min)
+                gt_depth1 = torch.from_numpy(depth_npy).unsqueeze(0)  # [1, H, W]
 
         img, point = _load_data((img_path, gt_path), self.train)
 
@@ -110,10 +144,22 @@ class SHHA(Dataset):
                     align_corners=False,
                 ).squeeze(0)
                 gt_dmap1 = gt_dmap1 / torch.sum(gt_dmap1) * torch.sum(gt_dmap)
+                if self.use_depth:
+                    gt_depth1 = torch.nn.functional.interpolate(
+                        gt_depth1.unsqueeze(0),
+                        scale_factor=scale,
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
                 point *= scale
 
         if self.train:
-            img_with_density = torch.cat((img, gt_dmap1), dim=0)
+            # Build joint augmentation stack: [img(3) + density(1) + depth(1)]
+            # Depth channel appended last so it can be sliced off cleanly.
+            if self.use_depth:
+                img_with_density = torch.cat((img, gt_dmap1, gt_depth1), dim=0)
+            else:
+                img_with_density = torch.cat((img, gt_dmap1), dim=0)
 
         if self.train and self.patch:
             img_with_density, point = _random_crop(img_with_density, point)
@@ -132,15 +178,35 @@ class SHHA(Dataset):
 
         if self.train:
             if img_with_density.ndim == 4:
-                img = img_with_density[:, :-1, :, :]
-                density = img_with_density[:, -1:, :, :]
+                if self.use_depth:
+                    img = img_with_density[:, :-2, :, :]
+                    density = img_with_density[:, -2:-1, :, :]
+                    depth = img_with_density[:, -1:, :, :]
+                else:
+                    img = img_with_density[:, :-1, :, :]
+                    density = img_with_density[:, -1:, :, :]
             else:
-                img = img_with_density[:-1, :, :]
-                density = img_with_density[-1:, :, :]
+                if self.use_depth:
+                    img = img_with_density[:-2, :, :]
+                    density = img_with_density[-2:-1, :, :]
+                    depth = img_with_density[-1:, :, :]
+                else:
+                    img = img_with_density[:-1, :, :]
+                    density = img_with_density[-1:, :, :]
             density = torch.Tensor(density)
+            if self.use_depth:
+                depth = torch.Tensor(depth)
 
         if not self.train:
             point = [point]
+            if self.use_depth:
+                depth_npy = np.load(
+                    os.path.join(self.gt_depth_root, imgname.replace(".jpg", ".npy"))
+                ).astype(np.float32)
+                d_min, d_max = depth_npy.min(), depth_npy.max()
+                if d_max - d_min > 1e-6:
+                    depth_npy = (depth_npy - d_min) / (d_max - d_min)
+                depth = torch.from_numpy(depth_npy).unsqueeze(0)  # [1, H, W]
 
         img = torch.Tensor(img)
         target = [{} for _ in range(len(point))]
@@ -158,8 +224,12 @@ class SHHA(Dataset):
                 density_img = density[i, 0, :, :]
                 resized_img = density_img.reshape([16, 8, 16, 8]).sum(axis=(1, 3))
                 density_images[i, 0, :, :] = resized_img
+            if self.use_depth:
+                return img, target, density_images, depth
             return img, target, density_images
         else:
+            if self.use_depth:
+                return img, target, depth
             return img, target
 
 

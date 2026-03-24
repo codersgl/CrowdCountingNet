@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from crowdcount.data import build_dataset, collate_fn_crowd, collate_fn_crowd_train
+from crowdcount.data.collate import collate_fn_crowd_depth, collate_fn_crowd_train_depth
 from crowdcount.engine import evaluate_crowd_no_overlap, train_one_epoch
 from crowdcount.models import build_model
 from crowdcount.utils.logging import logger, setup_logger
@@ -59,6 +60,7 @@ class Trainer:
         self.density_criterion = nn.MSELoss(reduction="sum").to(self.device)
 
         self.use_moe = bool(getattr(self.model, "supports_moe", lambda: False)())
+        self.use_depth = bool(getattr(cfg.model, "use_depth", False))
         moe_cfg = getattr(cfg.model, "moe", None)
         self.moe_stage1_ratio = (
             float(getattr(moe_cfg, "stage1_ratio", 0.3)) if moe_cfg is not None else 0.3
@@ -136,7 +138,9 @@ class Trainer:
         self.data_loader_train = DataLoader(
             train_set,
             batch_sampler=batch_sampler_train,
-            collate_fn=collate_fn_crowd_train,
+            collate_fn=collate_fn_crowd_train_depth
+            if self.use_depth
+            else collate_fn_crowd_train,
             num_workers=cfg.num_workers,
         )
         self.data_loader_val = DataLoader(
@@ -144,7 +148,7 @@ class Trainer:
             batch_size=1,
             sampler=sampler_val,
             drop_last=False,
-            collate_fn=collate_fn_crowd,
+            collate_fn=collate_fn_crowd_depth if self.use_depth else collate_fn_crowd,
             num_workers=cfg.num_workers,
         )
 
@@ -280,7 +284,10 @@ class Trainer:
             if epoch % cfg.eval_freq == 0 and epoch != 0:
                 t1 = time.time()
                 result = evaluate_crowd_no_overlap(
-                    self.model, self.data_loader_val, self.device
+                    self.model,
+                    self.data_loader_val,
+                    self.device,
+                    use_depth=self.use_depth,
                 )
                 t2 = time.time()
 

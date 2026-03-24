@@ -35,6 +35,6 @@ dino_inject_variant: dinov2_b
 use_depth: false
 depth:
   encoder: vitl # vits | vitb | vitl
-  weight_path: checkpoints/depth_anything_v2_vitb.pth
+  weight_path: checkpoints/depth_anything_v2_vitl.pth
   embed_dim: 128 # internal dim for DepthFusionModule
   num_isf_layers: 1 # stacked ISFLayer+MFF pairs per scale

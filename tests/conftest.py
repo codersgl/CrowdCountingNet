@@ -56,6 +56,13 @@ def base_cfg():
                 "set_cost_point": 0.05,
                 "point_loss_coef": 0.0002,
                 "eos_coef": 0.5,
+                "use_depth": False,
+                "depth": {
+                    "encoder": "vitb",
+                    "weight_path": "checkpoints/depth_anything_v2_vitb.pth",
+                    "embed_dim": 128,
+                    "num_isf_layers": 1,
+                },
             },
             "optimizer": {
                 "name": "adam",
@@ -81,6 +88,12 @@ def base_cfg():
 def sample_batch():
     """A batch of 2 images, 3 channels, 128×128."""
     return torch.randn(2, 3, 128, 128)
+
+
+@pytest.fixture
+def depth_sample():
+    """A batch of 2 depth maps, 1 channel, 128×128."""
+    return torch.randn(2, 1, 128, 128)
 
 
 @pytest.fixture

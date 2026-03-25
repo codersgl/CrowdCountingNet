@@ -18,6 +18,7 @@ from crowdcount.models.head import (
 from crowdcount.models.neck import Decoder_SPD_PAFPN
 from crowdcount.plugins.gm import GateMechanism
 from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
+from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
 from crowdcount.plugins.moe import ESCA, MoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
@@ -75,6 +76,8 @@ class DSGCnet(nn.Module):
         moe_cfg: DictConfig | None = None,
         use_depth: bool = False,
         depth_cfg: DictConfig | None = None,
+        use_depth_geo: bool = False,
+        depth_geo_cfg: DictConfig | None = None,
         cfg: DictConfig | None = None,
     ):
         super().__init__()
@@ -84,6 +87,7 @@ class DSGCnet(nn.Module):
         self.fusion_mode = fusion_mode
         self.use_moe = fusion_mode == "esca_moe"
         self.use_depth = use_depth
+        self.use_depth_geo = use_depth_geo
 
         if self.fusion_mode not in {"gcn", "esca_moe"}:
             raise ValueError(
@@ -210,6 +214,46 @@ class DSGCnet(nn.Module):
             self.depth_fusion_c4 = None
             self.depth_fusion_c5 = None
 
+        # Depth geo-prior dual-stream fusion (optional, alternative to use_depth)
+        if use_depth_geo:
+            geo_num_heads = (
+                int(getattr(depth_geo_cfg, "num_heads", 8))
+                if depth_geo_cfg is not None
+                else 8
+            )
+            geo_init_val = (
+                float(getattr(depth_geo_cfg, "initial_value", 2.0))
+                if depth_geo_cfg is not None
+                else 2.0
+            )
+            geo_hr = (
+                float(getattr(depth_geo_cfg, "heads_range", 4.0))
+                if depth_geo_cfg is not None
+                else 4.0
+            )
+            self.geo_attn_c3 = DepthGeoPriorAttention(
+                256,
+                num_heads=geo_num_heads,
+                initial_value=geo_init_val,
+                heads_range=geo_hr,
+            )
+            self.geo_attn_c4 = DepthGeoPriorAttention(
+                512,
+                num_heads=geo_num_heads,
+                initial_value=geo_init_val,
+                heads_range=geo_hr,
+            )
+            self.geo_attn_c5 = DepthGeoPriorAttention(
+                512,
+                num_heads=geo_num_heads,
+                initial_value=geo_init_val,
+                heads_range=geo_hr,
+            )
+        else:
+            self.geo_attn_c3 = None
+            self.geo_attn_c4 = None
+            self.geo_attn_c5 = None
+
         # DINOv2 semantic injection (optional, disabled by default)
         # cfg may be full hydra config (has .model) or flat model-level config from tests
         _model_cfg = getattr(cfg, "model", cfg) if cfg is not None else None
@@ -294,6 +338,11 @@ class DSGCnet(nn.Module):
             c3 = self.depth_fusion_c3(c3, d3)  # type: ignore[misc]
             c4 = self.depth_fusion_c4(c4, d4)  # type: ignore[misc]
             c5 = self.depth_fusion_c5(c5, d5)  # type: ignore[misc]
+
+        if self.use_depth_geo and depth_map is not None:
+            c3 = self.geo_attn_c3(c3, depth_map)  # type: ignore[misc]
+            c4 = self.geo_attn_c4(c4, depth_map)  # type: ignore[misc]
+            c5 = self.geo_attn_c5(c5, depth_map)  # type: ignore[misc]
 
         features_pa = self.pa([c3, c4, c5])  # [batch_size, 256, 16, 16]
 

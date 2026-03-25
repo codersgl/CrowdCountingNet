@@ -38,3 +38,9 @@ depth:
   weight_path: checkpoints/depth_anything_v2_vitl.pth
   embed_dim: 128 # internal dim for DepthFusionModule
   num_isf_layers: 1 # stacked ISFLayer+MFF pairs per scale
+
+use_depth_geo: false
+depth_geo:
+  num_heads: 8
+  initial_value: 2.0
+  heads_range: 4.0

@@ -1,2 +1,4 @@
 name: step_lr
 lr_drop: 3500
+warmup_epochs: 100
+warmup_start_factor: 0.001

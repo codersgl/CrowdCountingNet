@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -186,7 +186,7 @@ class Trainer:
         tb_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(str(tb_dir))
 
-        logger.info(f"Config:\n{cfg}")
+        logger.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
 
     def _stage1_epochs(self) -> int:
         if not self.use_moe:
@@ -208,14 +208,43 @@ class Trainer:
     def _build_scheduler(self) -> torch.optim.lr_scheduler.LRScheduler:
         sched = self.cfg.scheduler
         name = sched.get("name", "step_lr")
+        warmup_epochs = int(sched.get("warmup_epochs", 0))
+        warmup_start_factor = float(sched.get("warmup_start_factor", 0.001))
+
         if name == "cosine_annealing":
-            return torch.optim.lr_scheduler.CosineAnnealingLR(
+            # Subtract warmup from the cosine period so the full T_max budget is
+            # correctly spent on the cosine phase after warmup completes.
+            t_max_effective = max(int(sched.T_max) - warmup_epochs, 1)
+            main_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
-                T_max=sched.T_max,
+                T_max=t_max_effective,
                 eta_min=sched.eta_min,
             )
-        # default: step_lr
-        return torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=sched.lr_drop)
+        else:
+            # default: step_lr
+            main_sched = torch.optim.lr_scheduler.StepLR(
+                self.optimizer, step_size=sched.lr_drop
+            )
+
+        if warmup_epochs > 0:
+            warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer,
+                start_factor=warmup_start_factor,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            logger.info(
+                f"Scheduler: {name} with linear warmup "
+                f"({warmup_epochs} epochs, start_factor={warmup_start_factor})"
+            )
+            return torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_sched, main_sched],
+                milestones=[warmup_epochs],
+            )
+
+        logger.info(f"Scheduler: {name} (no warmup)")
+        return main_sched
 
     def train(self) -> None:
         cfg = self.cfg
@@ -260,6 +289,11 @@ class Trainer:
             for key in ("loss_sum", "losses", "den_loss", "loss_ce"):
                 if key in stat:
                     self.writer.add_scalar(f"loss/{key}", stat[key], epoch)
+            for i, pg in enumerate(self.optimizer.param_groups):
+                tag = (
+                    "lr/backbone" if i == 1 else ("lr/gating" if i >= 2 else "lr/base")
+                )
+                self.writer.add_scalar(tag, pg["lr"], epoch)
 
             self.lr_scheduler.step()
 

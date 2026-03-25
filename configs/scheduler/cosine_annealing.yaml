@@ -1,3 +1,5 @@
 name: cosine_annealing
 T_max: ${epochs}
 eta_min: 1e-6
+warmup_epochs: 100
+warmup_start_factor: 0.001

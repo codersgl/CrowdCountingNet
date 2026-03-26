@@ -38,8 +38,10 @@ def build_dataset(cfg: DictConfig):
         )
 
     use_depth = bool(getattr(getattr(cfg, "model", None), "use_depth", False))
+    use_depth_geo = bool(getattr(getattr(cfg, "model", None), "use_depth_geo", False))
+    needs_depth = use_depth or use_depth_geo
     depth_cfg = (
-        getattr(getattr(cfg, "model", None), "depth", None) if use_depth else None
+        getattr(getattr(cfg, "model", None), "depth", None) if needs_depth else None
     )
 
     train_set = SHHA(
@@ -48,14 +50,14 @@ def build_dataset(cfg: DictConfig):
         transform=transform,
         patch=cfg.data.patch,
         flip=cfg.data.flip,
-        use_depth=use_depth,
+        use_depth=needs_depth,
         depth_cfg=depth_cfg,
     )
     val_set = SHHA(
         data_root,
         train=False,
         transform=transform,
-        use_depth=use_depth,
+        use_depth=needs_depth,
         depth_cfg=depth_cfg,
     )
     return train_set, val_set

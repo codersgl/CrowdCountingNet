@@ -61,6 +61,8 @@ class Trainer:
 
         self.use_moe = bool(getattr(self.model, "supports_moe", lambda: False)())
         self.use_depth = bool(getattr(cfg.model, "use_depth", False))
+        self.use_depth_geo = bool(getattr(cfg.model, "use_depth_geo", False))
+        self._needs_depth = self.use_depth or self.use_depth_geo
         moe_cfg = getattr(cfg.model, "moe", None)
         self.moe_stage1_ratio = (
             float(getattr(moe_cfg, "stage1_ratio", 0.3)) if moe_cfg is not None else 0.3
@@ -139,7 +141,7 @@ class Trainer:
             train_set,
             batch_sampler=batch_sampler_train,
             collate_fn=collate_fn_crowd_train_depth
-            if self.use_depth
+            if self._needs_depth
             else collate_fn_crowd_train,
             num_workers=cfg.num_workers,
         )
@@ -148,7 +150,9 @@ class Trainer:
             batch_size=1,
             sampler=sampler_val,
             drop_last=False,
-            collate_fn=collate_fn_crowd_depth if self.use_depth else collate_fn_crowd,
+            collate_fn=collate_fn_crowd_depth
+            if self._needs_depth
+            else collate_fn_crowd,
             num_workers=cfg.num_workers,
         )
 
@@ -321,7 +325,7 @@ class Trainer:
                     self.model,
                     self.data_loader_val,
                     self.device,
-                    use_depth=self.use_depth,
+                    use_depth=self._needs_depth,
                 )
                 t2 = time.time()
 

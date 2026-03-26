@@ -32,6 +32,8 @@ def build_model(cfg: DictConfig, training: bool = False):
         moe_cfg=getattr(cfg.model, "moe", None),
         use_depth=getattr(cfg.model, "use_depth", False),
         depth_cfg=getattr(cfg.model, "depth", None),
+        use_depth_geo=getattr(cfg.model, "use_depth_geo", False),
+        depth_geo_cfg=getattr(cfg.model, "depth_geo", None),
         cfg=cfg,  # Pass config for multi-scale density prediction
     )
 

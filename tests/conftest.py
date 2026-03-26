@@ -63,6 +63,12 @@ def base_cfg():
                     "embed_dim": 128,
                     "num_isf_layers": 1,
                 },
+                "use_depth_geo": False,
+                "depth_geo": {
+                    "num_heads": 8,
+                    "initial_value": 2.0,
+                    "heads_range": 4.0,
+                },
             },
             "optimizer": {
                 "name": "adam",

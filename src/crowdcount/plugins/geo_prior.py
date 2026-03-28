@@ -115,9 +115,9 @@ class GeoPriorGen(nn.Module):
                 depth_map, size=(H, W), mode="bilinear", align_corners=False
             )
 
-        # Normalize depth map for stable decay calculations (assuming [0, max] range)
-        max_val = depth_map.amax(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
-        depth_map = depth_map / max_val
+        # NOTE: depth_map is already normalised to [0, 1] in the dataset
+        # loader (per-image min-max).  A second per-batch max-normalisation
+        # here would erase cross-image relative depth scale, so we skip it.
 
         # Generates RoPE embeddings
         index = torch.arange(H * W, device=self.angle.device)

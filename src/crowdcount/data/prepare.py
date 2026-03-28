@@ -54,7 +54,12 @@ def gaussian_filter_density(img: np.ndarray, points: np.ndarray) -> np.ndarray:
 
     leafsize = 2048
     tree = scipy.spatial.KDTree(points.copy(), leafsize=leafsize)
-    distances, _ = tree.query(points, k=4)
+    # Query min(4, gt_count) neighbours to avoid inf distances when gt_count < 4
+    k_query = min(4, gt_count)
+    distances, _ = tree.query(points, k=k_query)
+    # Ensure distances is always 2-D even when k_query == 1
+    if distances.ndim == 1:
+        distances = distances[:, np.newaxis]
 
     for i, pt in enumerate(points):
         pt2d = np.zeros(img_shape, dtype=np.float32)
@@ -62,8 +67,12 @@ def gaussian_filter_density(img: np.ndarray, points: np.ndarray) -> np.ndarray:
             pt2d[int(pt[1]), int(pt[0])] = 1.0
         else:
             continue
-        if gt_count > 1:
+        if gt_count >= 4:
             sigma = (distances[i][1] + distances[i][2] + distances[i][3]) * 0.1
+        elif gt_count > 1:
+            # Only 1..2 valid neighbours available; use their mean × 0.3
+            valid_dists = distances[i][1:]
+            sigma = float(np.mean(valid_dists)) * 0.3
         else:
             sigma = np.average(np.array(img_shape)) / 2.0 / 2.0
         density += gaussian_filter(pt2d, sigma, mode="constant")

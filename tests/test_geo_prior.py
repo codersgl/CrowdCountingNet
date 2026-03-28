@@ -108,3 +108,56 @@ def test_dsgcnet_depth_geo_no_depth_input(sample_batch):
         out = model(sample_batch, depth_map=None)
 
     assert out["pred_logits"].shape[0] == sample_batch.shape[0]
+
+
+# ---------------------------------------------------------------------------
+# Depth normalisation semantics — geo_prior must NOT re-normalise
+# ---------------------------------------------------------------------------
+
+
+def test_geo_prior_preserves_depth_scale():
+    """GeoPriorGen must not alter the depth_map values it receives.
+
+    The dataset already normalises depth to [0, 1] per-image.  If the module
+    did a second per-batch max-normalisation the output masks would lose
+    cross-image relative depth information.
+
+    We craft two images with the same *relative* depth gradient but different
+    absolute scales.  Without re-normalisation the decay masks must differ
+    because the pairwise depth differences are larger for the high-scale image.
+    """
+    B, num_heads = 2, 8
+    H, W = 16, 16
+    embed_dim = 256
+    geo = GeoPriorGen(embed_dim=embed_dim, num_heads=num_heads)
+
+    # Image A: gentle gradient  [0.0, 0.1]
+    # Image B: steep gradient   [0.0, 0.5]
+    # Both live in [0, 1] but have different absolute pairwise differences.
+    ramp = torch.linspace(0.0, 1.0, H).view(1, 1, H, 1).expand(1, 1, H, W)
+    depth_a = ramp * 0.1  # max diff ≈ 0.1
+    depth_b = ramp * 0.5  # max diff ≈ 0.5
+
+    (_, _), (mask_h_a, _) = geo((H, W), depth_a)
+    (_, _), (mask_h_b, _) = geo((H, W), depth_b)
+
+    # The depth-dependent decay masks must differ for different depth scales
+    assert not torch.allclose(mask_h_a, mask_h_b, atol=1e-6), (
+        "Masks for different depth scales should differ — "
+        "a second normalisation would erase this difference"
+    )
+
+
+def test_geo_prior_no_nan_inf_with_normalized_depth():
+    """Passing pre-normalised [0, 1] depth should produce neither NaN nor Inf."""
+    B, num_heads = 2, 8
+    H, W = 8, 8
+    embed_dim = 256
+    geo = GeoPriorGen(embed_dim=embed_dim, num_heads=num_heads)
+    depth = torch.rand(B, 1, H, W)  # already in [0, 1]
+
+    (sin, cos), (mask_h, mask_w) = geo((H, W), depth)
+
+    for name, t in [("sin", sin), ("cos", cos), ("mask_h", mask_h), ("mask_w", mask_w)]:
+        assert not torch.isnan(t).any(), f"{name} contains NaN"
+        assert not torch.isinf(t).any(), f"{name} contains Inf"

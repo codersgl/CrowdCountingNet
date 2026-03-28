@@ -11,6 +11,7 @@ import torch.nn as nn
 from omegaconf import OmegaConf
 
 from crowdcount.models.dsgcnet import DSGCnet
+from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism
 from crowdcount.plugins.moe import ESCA, MoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
@@ -272,3 +273,90 @@ def test_moe_outputs_aux_losses_in_train_mode() -> None:
     out = model(torch.zeros(1, 3, 128, 128))
     assert out["moe_aux_losses"] is not None
     assert out["moe_aux_total"] is not None
+
+
+# ---------------------------------------------------------------------------
+# SEMCEnhancer tests
+# ---------------------------------------------------------------------------
+
+
+def test_semc_enhancer_initialized_when_enabled() -> None:
+    """SEMCEnhancer should be created when use_semc_enhancer=True."""
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create({"use_semc_enhancer": True})
+    model = DSGCnet(backbone, row=2, line=2, cfg=cfg)
+    assert model.semc_enhancer is not None
+    assert isinstance(model.semc_enhancer, SEMCEnhancer)
+
+
+def test_semc_enhancer_absent_when_disabled() -> None:
+    """SEMCEnhancer should be None when use_semc_enhancer is not set."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2)
+    assert model.semc_enhancer is None
+
+
+def test_semc_enhancer_forward_output_shapes() -> None:
+    """Enabling SEMCEnhancer must not change any output key or shape."""
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create({"use_semc_enhancer": True})
+    model = DSGCnet(backbone, row=2, line=2, cfg=cfg).eval()
+
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_logits"].shape[2] == 2
+    assert out["pred_points"].shape[0] == 2
+    assert out["pred_points"].shape[2] == 2
+    assert out["density_out"].shape[0] == 2
+    # query count must be consistent with baseline (row*line anchors * spatial cells)
+    assert out["pred_logits"].shape[1] == out["pred_points"].shape[1]
+
+
+def test_semc_enhancer_density_hint_forward() -> None:
+    """use_density_hint=True path must remain stable and produce non-negative density."""
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create(
+        {
+            "use_semc_enhancer": True,
+            "semc": {"use_density_hint": True, "expansion_factor": 2},
+        }
+    )
+    model = DSGCnet(backbone, row=2, line=2, cfg=cfg).eval()
+
+    with torch.no_grad():
+        out = model(torch.zeros(1, 3, 128, 128))
+
+    assert out["density_out"].shape[0] == 1
+    assert (out["density_out"] >= 0).all()
+
+
+def test_semc_enhancer_invalid_position_raises() -> None:
+    """Only post_gcn is supported in the current implementation."""
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create(
+        {
+            "use_semc_enhancer": True,
+            "semc": {"position": "pre_gcn"},
+        }
+    )
+
+    with pytest.raises(ValueError, match="semc.position"):
+        DSGCnet(backbone, row=2, line=2, cfg=cfg)
+
+
+def test_semc_enhancer_with_moe_mode_raises() -> None:
+    """SEMCEnhancer should not silently alter the MoE path."""
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create({"top_k": 2, "use_semc_enhancer": True})
+
+    with pytest.raises(ValueError, match="fusion_mode='gcn'"):
+        DSGCnet(
+            backbone,
+            row=2,
+            line=2,
+            fusion_mode="esca_moe",
+            moe_cfg=cfg,
+            cfg=cfg,
+        )

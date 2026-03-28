@@ -44,3 +44,12 @@ depth_geo:
   num_heads: 8
   initial_value: 2.0
   heads_range: 4.0
+
+# SEMC post-GCN enhancer (disabled by default; enable via CLI or override)
+use_semc_enhancer: false
+semc:
+  position: post_gcn # only post_gcn is implemented in v1
+  expansion_factor: 4 # MSCB internal channel expansion ratio
+  kernel_sizes: [1, 3, 5] # parallel DW conv kernel sizes
+  use_residual: true # strongly recommended; stabilises early training
+  use_density_hint: false # gate the enhanced branch with density_out

@@ -16,6 +16,7 @@ from crowdcount.models.head import (
     DensityPred_Block5,
 )
 from crowdcount.models.neck import Decoder_SPD_PAFPN
+from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism
 from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
 from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
@@ -278,6 +279,65 @@ class DSGCnet(nn.Module):
             self.dino_injector = None
             self.dino_gate = None
 
+        # SEMC post-GCN enhancer (optional, disabled by default)
+        # Reads use_semc_enhancer and semc.* from the same _model_cfg resolved above.
+        _use_semc = (
+            bool(getattr(_model_cfg, "use_semc_enhancer", False))
+            if _model_cfg is not None
+            else False
+        )
+        if _use_semc:
+            if self.use_moe:
+                raise ValueError(
+                    "SEMCEnhancer is currently supported only for fusion_mode='gcn'"
+                )
+            _semc_cfg = (
+                getattr(_model_cfg, "semc", None) if _model_cfg is not None else None
+            )
+            _position = (
+                str(getattr(_semc_cfg, "position", "post_gcn"))
+                if _semc_cfg is not None
+                else "post_gcn"
+            )
+            if _position != "post_gcn":
+                raise ValueError(
+                    f"Unsupported semc.position={_position}, expected 'post_gcn'"
+                )
+            _exp_f = (
+                int(getattr(_semc_cfg, "expansion_factor", 4))
+                if _semc_cfg is not None
+                else 4
+            )
+            _ks_raw = (
+                getattr(_semc_cfg, "kernel_sizes", [1, 3, 5])
+                if _semc_cfg is not None
+                else [1, 3, 5]
+            )
+            _ks = tuple(int(k) for k in _ks_raw)
+            _resid = (
+                bool(getattr(_semc_cfg, "use_residual", True))
+                if _semc_cfg is not None
+                else True
+            )
+            _dh = (
+                bool(getattr(_semc_cfg, "use_density_hint", False))
+                if _semc_cfg is not None
+                else False
+            )
+            self.semc_enhancer: SEMCEnhancer | None = SEMCEnhancer(
+                in_channels=256,
+                expansion_factor=_exp_f,
+                kernel_sizes=_ks,
+                use_residual=_resid,
+                use_density_hint=_dh,
+            )
+            self._semc_position = _position
+            self._semc_use_density_hint: bool = _dh
+        else:
+            self.semc_enhancer = None
+            self._semc_position = None
+            self._semc_use_density_hint = False
+
     def supports_moe(self) -> bool:
         return self.use_moe and self.moe is not None
 
@@ -409,6 +469,13 @@ class DSGCnet(nn.Module):
                     + w[1] * density_gcn_feature
                     + w[2] * feature_gcn_feature
                 )
+
+        # SEMC post-GCN enhancement (optional, disabled by default)
+        if self.semc_enhancer is not None and not self.use_moe:
+            feature_fl = self.semc_enhancer(
+                feature_fl,
+                density if self._semc_use_density_hint else None,
+            )
 
         regression = self.regression(feature_fl) * 100
         classification = self.classification(feature_fl)

@@ -133,19 +133,19 @@ class DSGCnet(nn.Module):
                 else 1.0
             )
             temperature_min = (
-                float(getattr(moe_cfg, "temperature_min", 0.1))
+                float(getattr(moe_cfg, "temperature_min", 0.4))
                 if moe_cfg is not None
-                else 0.1
+                else 0.4
             )
             lambda_balance = (
-                float(getattr(moe_cfg, "lambda_balance", 0.835))
+                float(getattr(moe_cfg, "lambda_balance", 0.05))
                 if moe_cfg is not None
-                else 0.835
+                else 0.05
             )
             lambda_decorr = (
-                float(getattr(moe_cfg, "lambda_decorr", 1.0))
+                float(getattr(moe_cfg, "lambda_decorr", 10.0))
                 if moe_cfg is not None
-                else 1.0
+                else 10.0
             )
             use_density_hint = (
                 bool(getattr(moe_cfg, "use_density_hint", True))
@@ -347,21 +347,6 @@ class DSGCnet(nn.Module):
         return list(self.moe.context_encoder.parameters()) + list(
             self.moe.router.parameters()
         )
-
-    def set_moe_gating_trainable(self, trainable: bool) -> None:
-        if self.moe is None:
-            return
-        for parameter in self.get_moe_gating_parameters():
-            parameter.requires_grad = trainable
-
-    def set_moe_training_stage(self, stage: str) -> None:
-        if self.moe is None:
-            return
-        self.moe.set_training_stage(stage)
-        # Gate is always trainable: in specialization it learns with high Gumbel noise
-        # (exploration), in coordination it learns with normal noise (exploitation).
-        # Freezing the gate in specialization would nullify noisy-gate routing.
-        self.set_moe_gating_trainable(True)
 
     def update_moe_temperature(self, decay_rate: float = 0.9999) -> None:
         if self.moe is None:

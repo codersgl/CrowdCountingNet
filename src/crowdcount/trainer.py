@@ -63,32 +63,15 @@ class Trainer:
         self.use_depth = bool(getattr(cfg.model, "use_depth", False))
         self.use_depth_geo = bool(getattr(cfg.model, "use_depth_geo", False))
         self._needs_depth = self.use_depth or self.use_depth_geo
-        moe_cfg = getattr(cfg.model, "moe", None)
-        self.moe_stage1_ratio = (
-            float(getattr(moe_cfg, "stage1_ratio", 0.3)) if moe_cfg is not None else 0.3
-        )
-        self.moe_gating_lr_multiplier = (
-            float(getattr(moe_cfg, "stage2_gating_lr_multiplier", 2.0))
-            if moe_cfg is not None
-            else 2.0
-        )
-        self._moe_prev_stage: str | None = None  # used to detect stage transitions
-        self.gating_pg_idx: int | None = None  # param_groups index for gating params
 
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"Number of trainable parameters: {n_params:,}")
 
         # Optimizer
-        gating_param_ids = (
-            {id(p) for p in model.get_moe_gating_parameters()}
-            if self.use_moe
-            else set()
-        )
-
         non_backbone_params = [
             p
             for n, p in model.named_parameters()
-            if "backbone" not in n and id(p) not in gating_param_ids and p.requires_grad
+            if "backbone" not in n and p.requires_grad
         ]
         backbone_params = [
             p
@@ -100,19 +83,6 @@ class Trainer:
             {"params": non_backbone_params},
             {"params": backbone_params, "lr": cfg.optimizer.lr_backbone},
         ]
-
-        if self.use_moe:
-            gating_params = [
-                p for p in model.get_moe_gating_parameters() if p.requires_grad
-            ]
-            if gating_params:
-                self.gating_pg_idx = len(param_dicts)  # record index before appending
-                param_dicts.append(
-                    {
-                        "params": gating_params,
-                        "lr": cfg.optimizer.lr,  # start at base LR; boosted at stage 2
-                    }
-                )
         _opt_name = cfg.optimizer.get("name", "adam").lower()
         if _opt_name == "adamw":
             self.optimizer = torch.optim.AdamW(
@@ -192,23 +162,6 @@ class Trainer:
 
         logger.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
 
-    def _stage1_epochs(self) -> int:
-        if not self.use_moe:
-            return 0
-        if self.cfg.epochs <= 1:
-            return 0
-        stage1 = int(self.cfg.epochs * self.moe_stage1_ratio)
-        stage1 = max(stage1, 1)
-        return min(stage1, self.cfg.epochs - 1)
-
-    def _set_moe_stage_for_epoch(self, epoch: int) -> str | None:
-        if not self.use_moe:
-            return None
-        stage = "specialization" if epoch < self._stage1_epochs() else "coordination"
-        self.model.set_moe_training_stage(stage)  # no-op in new design
-        self._moe_prev_stage = stage
-        return stage
-
     def _build_scheduler(self) -> torch.optim.lr_scheduler.LRScheduler:
         sched = self.cfg.scheduler
         name = sched.get("name", "step_lr")
@@ -261,9 +214,6 @@ class Trainer:
         step = 0
 
         for epoch in range(cfg.start_epoch, cfg.epochs):
-            moe_stage = self._set_moe_stage_for_epoch(epoch)
-            if moe_stage is not None:
-                logger.info(f"[MoE] epoch={epoch} training_stage={moe_stage}")
             if (
                 self.use_moe
                 and hasattr(self.model, "moe")
@@ -294,9 +244,7 @@ class Trainer:
                 if key in stat:
                     self.writer.add_scalar(f"loss/{key}", stat[key], epoch)
             for i, pg in enumerate(self.optimizer.param_groups):
-                tag = (
-                    "lr/backbone" if i == 1 else ("lr/gating" if i >= 2 else "lr/base")
-                )
+                tag = "lr/backbone" if i == 1 else "lr/base"
                 self.writer.add_scalar(tag, pg["lr"], epoch)
 
             self.lr_scheduler.step()

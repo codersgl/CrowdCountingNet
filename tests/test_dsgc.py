@@ -360,3 +360,78 @@ def test_semc_enhancer_with_moe_mode_raises() -> None:
             moe_cfg=cfg,
             cfg=cfg,
         )
+
+
+# ---------------------------------------------------------------------------
+# MoE wiring and checkpoint restore tests
+# ---------------------------------------------------------------------------
+
+
+def test_density_hint_wired_through_to_moe() -> None:
+    """density_hint 应传入 MoE，并进入路由网络的输入通道。"""
+    backbone = TinyVGGBackbone()
+    moe_cfg = OmegaConf.create({"top_k": 2, "use_density_hint": True})
+    model = DSGCnet(
+        backbone, row=2, line=2, fusion_mode="esca_moe", moe_cfg=moe_cfg
+    ).eval()
+
+    x = torch.randn(1, 3, 128, 128)
+    captured: dict = {}
+    _orig_forward = model.moe.forward  # type: ignore[union-attr]
+
+    def _spy_forward(feat, density_hint=None, training=True):
+        captured["density_hint"] = density_hint
+        return _orig_forward(feat, density_hint=density_hint, training=training)
+
+    model.moe.forward = _spy_forward  # type: ignore[union-attr]
+    with torch.no_grad():
+        model(x)
+
+    assert captured.get("density_hint") is not None, (
+        "DSGCnet 未将 density map 传递给 MoE.forward()"
+    )
+
+    first_conv_inputs: list[torch.Tensor] = []
+
+    def _capture_first_conv_input(module, args):
+        first_conv_inputs.append(args[0].detach().clone())
+
+    hook = model.moe.context_encoder.score_net[0].register_forward_pre_hook(  # type: ignore[union-attr]
+        _capture_first_conv_input
+    )
+    with torch.no_grad():
+        features = model.backbone(x)
+        features_list = [features[0], features[1], features[2], features[3]]
+        c3, c4, c5 = features_list[1], features_list[2], features_list[3]
+        features_pa = model.pa([c3, c4, c5])
+        density = model.density_pred(features_pa)
+        esca_feature = model.esca(features_pa)  # type: ignore[union-attr]
+        model.moe.context_encoder(esca_feature, density_hint=density)  # type: ignore[union-attr]
+
+    hook.remove()
+    assert len(first_conv_inputs) == 1, "未捕获到 context_encoder 的第一层输入"
+    routed_input = first_conv_inputs[0]
+    assert routed_input.shape[1] == esca_feature.shape[1] + 1
+    assert torch.allclose(routed_input[:, -1:], density, atol=1e-6), (
+        "density_hint 没有作为额外通道送入路由网络"
+    )
+    model.moe.forward = _orig_forward  # type: ignore[union-attr]
+
+
+def test_checkpoint_temperature_restore_syncs_router() -> None:
+    """模拟 checkpoint 恢复：必须同时将 temperature 写入 moe 和 moe.router。"""
+    backbone = TinyVGGBackbone()
+    moe_cfg = OmegaConf.create({"top_k": 2})
+    model = DSGCnet(backbone, row=2, line=2, fusion_mode="esca_moe", moe_cfg=moe_cfg)
+
+    saved_temp = 0.6
+    # Simulate the checkpoint restore pattern used in trainer.py
+    model.moe.temperature = saved_temp  # type: ignore[union-attr]
+    model.moe.router.temperature = saved_temp  # type: ignore[union-attr]
+
+    assert model.moe.temperature == saved_temp  # type: ignore[union-attr]
+    assert model.moe.router.temperature == saved_temp  # type: ignore[union-attr]
+    # Subsequent decay must start from the restored value
+    model.update_moe_temperature(decay_rate=0.9)
+    assert model.moe.temperature < saved_temp  # type: ignore[union-attr]
+    assert model.moe.router.temperature == model.moe.temperature  # type: ignore[union-attr]

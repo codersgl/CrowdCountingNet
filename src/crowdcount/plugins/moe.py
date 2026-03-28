@@ -1144,8 +1144,8 @@ class MoELoss(nn.Module):
 
     def __init__(
         self,
-        lambda_balance: float = 0.835,
-        lambda_decorr: float = 1.0,
+        lambda_balance: float = 0.05,
+        lambda_decorr: float = 10.0,
         usage_threshold: float = 0.1,
     ):
         super().__init__()
@@ -1237,9 +1237,9 @@ class MoE(nn.Module):
         input_dim: int,
         top_k: int = 2,
         temperature_init: float = 1.0,
-        temperature_min: float = 0.1,
-        lambda_balance: float = 0.835,
-        lambda_decorr: float = 1.0,
+        temperature_min: float = 0.4,
+        lambda_balance: float = 0.05,
+        lambda_decorr: float = 10.0,
         ema_momentum: float = 0.99,
         use_density_hint: bool = False,
     ):
@@ -1294,10 +1294,6 @@ class MoE(nn.Module):
         # Sync temperature to router so DynamicRouter.forward() uses the decayed value.
         self.router.temperature = self.temperature
         self.step += 1
-
-    def set_training_stage(self, stage: str) -> None:
-        """保留接口兼容性（trainer.py 调用），新版本无需两阶段切换。"""
-        pass  # no-op: single-stage training with noise decay
 
     def update_noise_scale(self, progress: float) -> None:
         """根据训练进度衰减 Gumbel 噪声强度。

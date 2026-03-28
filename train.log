@@ -2878,3 +2878,12 @@
 2026-03-27 00:08:29 | INFO     | crowdcount.trainer:248 - Scheduler: step_lr (no warmup)
 2026-03-27 00:08:30 | INFO     | crowdcount.engine:256 - Averaged stats: lr: 0.000100  loss_sum: 1.3123 (1.3123)  losses: 0.8988 (0.8988)  den_loss: 0.4135 (0.4135)  loss_ce: 0.7415 (0.7415)  loss_points: 0.1573 (0.1573)  loss_ce_unscaled: 0.7415 (0.7415)  loss_points_unscaled: 786.4727 (786.4727)
 2026-03-27 00:08:30 | INFO     | crowdcount.engine:256 - Averaged stats: lr: 0.000100  loss_sum: 1.2280 (1.2112)  losses: 0.7981 (0.7930)  den_loss: 0.4149 (0.4181)  loss_ce: 0.7015 (0.6959)  loss_points: 0.1244 (0.0972)  loss_ce_unscaled: 0.7015 (0.6959)  loss_points_unscaled: 622.2234 (485.8910)
+2026-03-28 21:20:33 | INFO     | crowdcount.trainer:68 - Number of trainable parameters: 26,153,684
+2026-03-28 21:20:33 | INFO     | crowdcount.trainer:100 - Optimizer: Adam
+2026-03-28 21:20:33 | INFO     | crowdcount.trainer:203 - Scheduler: step_lr (no warmup)
+2026-03-28 21:30:32 | INFO     | crowdcount.trainer:68 - Number of trainable parameters: 26,153,684
+2026-03-28 21:30:32 | INFO     | crowdcount.trainer:100 - Optimizer: Adam
+2026-03-28 21:30:32 | INFO     | crowdcount.trainer:203 - Scheduler: step_lr (no warmup)
+2026-03-28 21:39:12 | INFO     | crowdcount.trainer:68 - Number of trainable parameters: 26,153,684
+2026-03-28 21:39:12 | INFO     | crowdcount.trainer:100 - Optimizer: Adam
+2026-03-28 21:39:12 | INFO     | crowdcount.trainer:203 - Scheduler: step_lr (no warmup)

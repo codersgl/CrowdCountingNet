@@ -88,6 +88,7 @@ class DSGCnet(nn.Module):
         gcn_density_scale: float = 4.0,
         gcn_sim_threshold: float = 0.5,
         cfg: DictConfig | None = None,
+        use_dcn: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
@@ -123,9 +124,9 @@ class DSGCnet(nn.Module):
 
         self.anchor_points = AnchorPoints(pyramid_levels=[3], row=row, line=line)
         if use_msaa:
-            self.pa = Decoder_SPD_PAFPN(1280, 1280, 1280)
+            self.pa = Decoder_SPD_PAFPN(1280, 1280, 1280, use_dcn=use_dcn)
         else:
-            self.pa = Decoder_SPD_PAFPN(256, 512, 512)
+            self.pa = Decoder_SPD_PAFPN(256, 512, 512, use_dcn=use_dcn)
         self.density_pred = Density_pred()
 
         # Multi-scale density prediction (optional)

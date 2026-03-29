@@ -7,9 +7,57 @@ from torch import nn
 from crowdcount.utils.misc import get_world_size, is_dist_avail_and_initialized
 
 
+def sigmoid_focal_loss(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.25,
+    gamma: float = 2.0,
+    class_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sigmoid focal loss for dense classification (RetinaNet-style).
+
+    Args:
+        inputs: [N, C] raw logits (before sigmoid).
+        targets: [N] integer class labels in [0, C).
+        alpha: Weighting factor for the foreground class.
+        gamma: Focusing parameter (higher ⇒ more focus on hard examples).
+        class_weight: Optional per-class weight tensor of shape [C].
+
+    Returns:
+        Scalar mean focal loss.
+    """
+    num_classes = inputs.shape[-1]
+    # One-hot encode targets → [N, C]
+    target_onehot = F.one_hot(targets, num_classes=num_classes).float()
+
+    p = inputs.sigmoid()
+    ce = F.binary_cross_entropy_with_logits(inputs, target_onehot, reduction="none")
+    p_t = p * target_onehot + (1 - p) * (1 - target_onehot)
+    focal_weight = (1 - p_t) ** gamma
+
+    # Per-class alpha weighting: foreground gets alpha, background gets (1 - alpha)
+    alpha_t = alpha * target_onehot + (1 - alpha) * (1 - target_onehot)
+
+    loss = alpha_t * focal_weight * ce  # [N, C]
+
+    # Apply optional class weight (e.g. eos_coef for background)
+    if class_weight is not None:
+        loss = loss * class_weight.unsqueeze(0)
+
+    return loss.mean()
+
+
 class SetCriterion_Crowd(nn.Module):
     def __init__(
-        self, num_classes: int, matcher, weight_dict: dict, eos_coef: float, losses
+        self,
+        num_classes: int,
+        matcher,
+        weight_dict: dict,
+        eos_coef: float,
+        losses,
+        use_focal_loss: bool = False,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -17,6 +65,9 @@ class SetCriterion_Crowd(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
+        self.use_focal_loss = use_focal_loss
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[0] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
@@ -34,9 +85,18 @@ class SetCriterion_Crowd(nn.Module):
         )
         target_classes[idx] = target_classes_o
 
-        loss_ce = F.cross_entropy(
-            src_logits.transpose(1, 2), target_classes, self.empty_weight
-        )
+        if self.use_focal_loss:
+            loss_ce = sigmoid_focal_loss(
+                src_logits.flatten(0, 1),  # [B*Q, C]
+                target_classes.flatten(0, 1),  # [B*Q]
+                alpha=self.focal_alpha,
+                gamma=self.focal_gamma,
+                class_weight=self.empty_weight,
+            )
+        else:
+            loss_ce = F.cross_entropy(
+                src_logits.transpose(1, 2), target_classes, self.empty_weight
+            )
         return {"loss_ce": loss_ce}
 
     def loss_points(self, outputs, targets, indices, num_points):
@@ -46,7 +106,9 @@ class SetCriterion_Crowd(nn.Module):
         target_points = torch.cat(
             [t["point"][i] for t, (_, i) in zip(targets, indices)], dim=0
         )
-        loss_bbox = F.smooth_l1_loss(src_points, target_points, reduction="none", beta=1.0)
+        loss_bbox = F.smooth_l1_loss(
+            src_points, target_points, reduction="none", beta=1.0
+        )
         return {"loss_points": loss_bbox.sum() / num_points}
 
     def loss_count(self, outputs, targets, indices, num_points):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from crowdcount.models.neck import Decoder_SPD_PAFPN, SPD
+from crowdcount.models.neck import Decoder_SPD_PAFPN, SPD, DeformConv2dBNReLU
 
 
 # ---------------------------------------------------------------------------
@@ -54,3 +54,39 @@ def test_pafpn_spatial_resolution(fpn_inputs):
     out = neck(fpn_inputs)
     # P4-level output after fusion
     assert out.shape[2] == 16 and out.shape[3] == 16
+
+
+# ---------------------------------------------------------------------------
+# Decoder_SPD_PAFPN with DCN
+# ---------------------------------------------------------------------------
+
+
+def test_pafpn_dcn_output_shape(fpn_inputs):
+    """DCN mode should produce the same output shape as standard mode."""
+    neck = Decoder_SPD_PAFPN(
+        C3_size=256, C4_size=512, C5_size=512, feature_size=256, use_dcn=True
+    )
+    out = neck(fpn_inputs)
+    assert out.shape == (2, 256, 16, 16)
+
+
+def test_pafpn_dcn_has_offset_params():
+    """DCN mode should contain offset convolution parameters."""
+    neck = Decoder_SPD_PAFPN(
+        C3_size=256, C4_size=512, C5_size=512, feature_size=256, use_dcn=True
+    )
+    param_names = [n for n, _ in neck.named_parameters()]
+    assert any("offset_conv" in n for n in param_names), (
+        "DCN neck should have offset_conv parameters"
+    )
+    assert any("mask_conv" in n for n in param_names), (
+        "DCN neck should have mask_conv parameters"
+    )
+
+
+def test_deform_conv2d_bn_relu_shape():
+    """DeformConv2dBNReLU should preserve spatial dims."""
+    layer = DeformConv2dBNReLU(64, 128, kernel_size=3, stride=1, padding=1)
+    x = torch.randn(2, 64, 16, 16)
+    out = layer(x)
+    assert out.shape == (2, 128, 16, 16)

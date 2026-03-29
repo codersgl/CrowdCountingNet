@@ -42,6 +42,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         gcn_density_scale=getattr(cfg.model, "gcn_density_scale", 4.0),
         gcn_sim_threshold=getattr(cfg.model, "gcn_sim_threshold", 0.5),
         cfg=cfg,  # Pass config for multi-scale density prediction
+        use_dcn=getattr(cfg.model, "use_dcn", False),
     )
 
     if not training:
@@ -54,12 +55,22 @@ def build_model(cfg: DictConfig, training: bool = False):
     }
     losses = ["labels", "points", "count"]
     matcher = build_matcher_crowd(cfg)
+
+    # Focal loss config
+    use_focal = getattr(cfg.model, "use_focal_loss", False)
+    focal_cfg = getattr(cfg.model, "focal_loss", None)
+    focal_alpha = float(getattr(focal_cfg, "alpha", 0.25)) if focal_cfg else 0.25
+    focal_gamma = float(getattr(focal_cfg, "gamma", 2.0)) if focal_cfg else 2.0
+
     criterion = SetCriterion_Crowd(
         num_classes=num_classes,
         matcher=matcher,
         weight_dict=weight_dict,
         eos_coef=cfg.model.eos_coef,
         losses=losses,
+        use_focal_loss=use_focal,
+        focal_alpha=focal_alpha,
+        focal_gamma=focal_gamma,
     )
     return model, criterion
 

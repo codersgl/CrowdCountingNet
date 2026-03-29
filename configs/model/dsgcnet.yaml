@@ -61,3 +61,12 @@ semc:
   kernel_sizes: [1, 3, 5] # parallel DW conv kernel sizes
   use_residual: true # strongly recommended; stabilises early training
   use_density_hint: false # gate the enhanced branch with density_out
+
+# Focal Loss (disabled by default; falls back to weighted CE)
+use_focal_loss: false
+focal_loss:
+  alpha: 0.25 # Weighting factor for foreground class
+  gamma: 2.0 # Focusing parameter; higher = more focus on hard examples
+
+# Deformable Convolution in PA-FPN (disabled by default)
+use_dcn: false

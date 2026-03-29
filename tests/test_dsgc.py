@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 
 from crowdcount.models.dsgcnet import DSGCnet
 from crowdcount.models.semc_blocks import SEMCEnhancer
-from crowdcount.plugins.gm import GateMechanism
+from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.moe import ESCA, MoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
@@ -116,7 +116,32 @@ def test_gate_mechanism_initialized_when_enabled() -> None:
     backbone = TinyVGGBackbone()
     model = DSGCnet(backbone, row=2, line=2, use_gm=True)
     assert model.gm is not None
+    # Default gm_spatial=True → SpatialGateMechanism
+    assert isinstance(model.gm, SpatialGateMechanism)
+
+
+def test_legacy_gate_mechanism_when_gm_spatial_false() -> None:
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2, use_gm=True, gm_spatial=False)
+    assert model.gm is not None
     assert isinstance(model.gm, GateMechanism)
+
+
+def test_adaptive_gcn_forward() -> None:
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        gcn_adaptive=True,
+        gcn_k=4,
+        gcn_k_min=2,
+        gcn_k_max=6,
+    ).eval()
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_points"].shape[0] == 2
 
 
 def test_gate_mechanism_disabled_when_false() -> None:

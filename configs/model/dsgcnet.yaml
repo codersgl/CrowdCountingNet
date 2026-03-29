@@ -9,12 +9,21 @@ eos_coef: 0.5
 use_gm: false
 gm_input_dim: 256
 gm_hidden_dim: 128
+gm_spatial: true # true: per-pixel spatial gate | false: legacy global gate
 use_msaa: false
 msaa_in_channels: 1280
 msaa_reduction: 4
 
 # Feature fusion branch selection: gcn | esca_moe
 fusion_mode: gcn
+
+# Adaptive GCN graph construction (only used when fusion_mode: gcn)
+gcn_adaptive: false # true: density/sim-adaptive k | false: fixed k=gcn_k
+gcn_k: 4 # base k for fixed mode; also k_base for adaptive mode
+gcn_k_min: 2 # adaptive mode: minimum neighbours per node
+gcn_k_max: 8 # adaptive mode: maximum neighbours per node
+gcn_density_scale: 4.0 # adaptive DensityGCN: scale factor for density → k mapping
+gcn_sim_threshold: 0.5 # adaptive FeatureGCN: cosine similarity threshold
 
 moe:
   top_k: 2

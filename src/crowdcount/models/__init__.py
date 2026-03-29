@@ -26,6 +26,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_gm=getattr(cfg.model, "use_gm", False),
         gm_input_dim=getattr(cfg.model, "gm_input_dim", 256),
         gm_hidden_dim=getattr(cfg.model, "gm_hidden_dim", 128),
+        gm_spatial=getattr(cfg.model, "gm_spatial", True),
         use_msaa=getattr(cfg.model, "use_msaa", False),
         msaa_in_channels=getattr(cfg.model, "msaa_in_channels", 1280),
         msaa_reduction=getattr(cfg.model, "msaa_reduction", 4),
@@ -34,6 +35,12 @@ def build_model(cfg: DictConfig, training: bool = False):
         depth_cfg=getattr(cfg.model, "depth", None),
         use_depth_geo=getattr(cfg.model, "use_depth_geo", False),
         depth_geo_cfg=getattr(cfg.model, "depth_geo", None),
+        gcn_adaptive=getattr(cfg.model, "gcn_adaptive", False),
+        gcn_k=getattr(cfg.model, "gcn_k", 4),
+        gcn_k_min=getattr(cfg.model, "gcn_k_min", 2),
+        gcn_k_max=getattr(cfg.model, "gcn_k_max", 8),
+        gcn_density_scale=getattr(cfg.model, "gcn_density_scale", 4.0),
+        gcn_sim_threshold=getattr(cfg.model, "gcn_sim_threshold", 0.5),
         cfg=cfg,  # Pass config for multi-scale density prediction
     )
 

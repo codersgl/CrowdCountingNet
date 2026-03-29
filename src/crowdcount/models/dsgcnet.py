@@ -18,7 +18,7 @@ from crowdcount.models.head import (
 )
 from crowdcount.models.neck import Decoder_SPD_PAFPN
 from crowdcount.models.semc_blocks import SEMCEnhancer
-from crowdcount.plugins.gm import GateMechanism
+from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
 from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
 from crowdcount.plugins.moe import ESCA, MoE
@@ -72,6 +72,7 @@ class DSGCnet(nn.Module):
         use_gm: bool = False,
         gm_input_dim: int = 256,
         gm_hidden_dim: int = 128,
+        gm_spatial: bool = True,
         use_msaa: bool = False,
         msaa_in_channels: int = 1280,
         msaa_reduction: int = 4,
@@ -80,6 +81,12 @@ class DSGCnet(nn.Module):
         depth_cfg: DictConfig | None = None,
         use_depth_geo: bool = False,
         depth_geo_cfg: DictConfig | None = None,
+        gcn_adaptive: bool = False,
+        gcn_k: int = 4,
+        gcn_k_min: int = 2,
+        gcn_k_max: int = 8,
+        gcn_density_scale: float = 4.0,
+        gcn_sim_threshold: float = 0.5,
         cfg: DictConfig | None = None,
     ):
         super().__init__()
@@ -170,16 +177,34 @@ class DSGCnet(nn.Module):
             self.alpha = None
             self.gm = None
         else:
-            self.density_gcn: DensityGCNProcessor | None = DensityGCNProcessor(k=4)
-            self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(k=4)
+            self.density_gcn: DensityGCNProcessor | None = DensityGCNProcessor(
+                k=gcn_k,
+                adaptive=gcn_adaptive,
+                k_min=gcn_k_min,
+                k_max=gcn_k_max,
+                density_scale=gcn_density_scale,
+            )
+            self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(
+                k=gcn_k,
+                adaptive=gcn_adaptive,
+                k_min=gcn_k_min,
+                k_max=gcn_k_max,
+                sim_threshold=gcn_sim_threshold,
+            )
             self.alpha: nn.Parameter | None = nn.Parameter(
                 torch.ones(3, dtype=torch.float32)
             )
-            self.gm: GateMechanism | None = (
-                GateMechanism(input_dim=gm_input_dim, hidden_dim=gm_hidden_dim)
-                if use_gm
-                else None
-            )
+            if use_gm:
+                if gm_spatial:
+                    self.gm: SpatialGateMechanism | GateMechanism | None = (
+                        SpatialGateMechanism(input_dim=gm_input_dim)
+                    )
+                else:
+                    self.gm = GateMechanism(
+                        input_dim=gm_input_dim, hidden_dim=gm_hidden_dim
+                    )
+            else:
+                self.gm = None
             self.esca = None
             self.moe = None
 
@@ -440,14 +465,23 @@ class DSGCnet(nn.Module):
             feature_gcn_feature = self.feature_gcn(features_pa)
             if self.gm is not None:
                 gate_weight = self.gm(features_pa)
-                w_1 = gate_weight[:, 0].view(-1, 1, 1, 1)
-                w_2 = gate_weight[:, 1].view(-1, 1, 1, 1)
-                w_3 = gate_weight[:, 2].view(-1, 1, 1, 1)
-                feature_fl = (
-                    features_pa * w_1
-                    + density_gcn_feature * w_2
-                    + feature_gcn_feature * w_3
-                )
+                if gate_weight.dim() == 4:
+                    # SpatialGateMechanism: [B, 3, H, W]
+                    feature_fl = (
+                        features_pa * gate_weight[:, 0:1]
+                        + density_gcn_feature * gate_weight[:, 1:2]
+                        + feature_gcn_feature * gate_weight[:, 2:3]
+                    )
+                else:
+                    # Legacy GateMechanism: [B, 3]
+                    w_1 = gate_weight[:, 0].view(-1, 1, 1, 1)
+                    w_2 = gate_weight[:, 1].view(-1, 1, 1, 1)
+                    w_3 = gate_weight[:, 2].view(-1, 1, 1, 1)
+                    feature_fl = (
+                        features_pa * w_1
+                        + density_gcn_feature * w_2
+                        + feature_gcn_feature * w_3
+                    )
             else:
                 assert self.alpha is not None
                 w = F.softmax(self.alpha, dim=0)

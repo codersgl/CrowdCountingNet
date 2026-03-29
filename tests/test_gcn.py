@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from crowdcount.models.gcn import (
+    AdaptiveDensityGraphBuilder,
+    AdaptiveFeatureGraphBuilder,
     DensityGCNProcessor,
     DensityGraphBuilder,
     FeatureGCNProcessor,
@@ -42,6 +44,39 @@ def test_feature_graph_builder(small_feature_map):
     edge_index, num_nodes_total, H, W = builder.build_batch_graph(small_feature_map)
     assert edge_index.shape[0] == 2
     assert num_nodes_total == 2 * 8 * 8
+
+
+def test_adaptive_density_graph_builder(small_density_map):
+    builder = AdaptiveDensityGraphBuilder(k_base=4, k_min=2, k_max=6, density_scale=2.0)
+    edge_index, num_nodes_total, H, W = builder.build_batch_graph(small_density_map)
+    assert edge_index.shape[0] == 2
+    assert num_nodes_total == 2 * 8 * 8
+    # Adaptive: edge count should be between k_min and k_max per node (+ self loops)
+    num_edges_no_self = edge_index.shape[1] - num_nodes_total
+    num_nodes_per_batch = 8 * 8
+    total_nodes = 2 * num_nodes_per_batch
+    assert num_edges_no_self >= total_nodes * 2  # at least k_min per node
+    assert num_edges_no_self <= total_nodes * 6  # at most k_max per node
+
+
+def test_adaptive_feature_graph_builder(small_feature_map):
+    builder = AdaptiveFeatureGraphBuilder(k_min=2, k_max=6, sim_threshold=0.5)
+    edge_index, num_nodes_total, H, W = builder.build_batch_graph(small_feature_map)
+    assert edge_index.shape[0] == 2
+    assert num_nodes_total == 2 * 8 * 8
+    # At least k_min edges per node guaranteed
+    num_edges_no_self = edge_index.shape[1] - num_nodes_total
+    total_nodes = 2 * 8 * 8
+    assert num_edges_no_self >= total_nodes * 2
+
+
+def test_adaptive_density_graph_builder_uniform_density():
+    """Uniform density should yield ~k_base neighbours per node."""
+    density = torch.ones(1, 1, 4, 4) * 0.5
+    builder = AdaptiveDensityGraphBuilder(k_base=3, k_min=2, k_max=6, density_scale=2.0)
+    edge_index, num_nodes_total, H, W = builder.build_batch_graph(density)
+    assert edge_index.shape[0] == 2
+    assert num_nodes_total == 16
 
 
 # ---------------------------------------------------------------------------
@@ -81,3 +116,35 @@ def test_feature_gcn_processor_output_shape(small_feature_map):
     assert out.shape == small_feature_map.shape, (
         "FeatureGCN output should match feature map shape"
     )
+
+
+def test_adaptive_density_gcn_processor_output_shape(
+    small_feature_map, small_density_map
+):
+    proc = DensityGCNProcessor(
+        k=4,
+        in_channels=256,
+        hidden_channels=128,
+        out_channels=256,
+        adaptive=True,
+        k_min=2,
+        k_max=6,
+        density_scale=2.0,
+    )
+    out = proc(small_density_map, small_feature_map)
+    assert out.shape == small_feature_map.shape
+
+
+def test_adaptive_feature_gcn_processor_output_shape(small_feature_map):
+    proc = FeatureGCNProcessor(
+        k=4,
+        in_channels=256,
+        hidden_channels=128,
+        out_channels=256,
+        adaptive=True,
+        k_min=2,
+        k_max=6,
+        sim_threshold=0.3,
+    )
+    out = proc(small_feature_map)
+    assert out.shape == small_feature_map.shape

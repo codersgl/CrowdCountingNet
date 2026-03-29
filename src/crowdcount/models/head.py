@@ -1,13 +1,36 @@
 """Prediction head modules for DSGCNet.
 
 Contains:
-  - Density_pred:   density map regression head
-  - RegressionModel: point regression head
-  - ClassificationModel: point classification head
+  - Density_pred:         density map regression head
+  - SharedPredictionTrunk: shared 2-layer conv trunk for regression & classification
+  - RegressionModel:      point regression projection (used after SharedPredictionTrunk)
+  - ClassificationModel:  point classification projection (used after SharedPredictionTrunk)
 """
 
 import torch
 import torch.nn as nn
+
+
+class SharedPredictionTrunk(nn.Module):
+    """Shared 2-layer conv feature extractor for regression and classification heads.
+
+    Replaces the duplicate conv1/conv2 pairs that previously existed independently
+    in both RegressionModel and ClassificationModel.
+
+    Input:  [B, in_channels, H, W]
+    Output: [B, feature_size, H, W]
+    """
+
+    def __init__(self, in_channels: int = 256, feature_size: int = 256) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, feature_size, kernel_size=3, padding=1)
+        self.act1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
+        self.act2 = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.act1(self.conv1(x))
+        return self.act2(self.conv2(out))
 
 
 class Density_pred(nn.Module):
@@ -49,34 +72,35 @@ class Density_pred(nn.Module):
 
 
 class RegressionModel(nn.Module):
-    """Point coordinate regression head."""
+    """Point coordinate regression projection head.
+
+    Applies a single output convolution on features that have already been
+    processed by SharedPredictionTrunk.  The ``num_features_in`` argument is
+    retained for API compatibility; it must equal the trunk's ``feature_size``
+    (default 256).
+    """
 
     def __init__(
         self, num_features_in: int, num_anchor_points: int = 4, feature_size: int = 256
     ):
         super().__init__()
-        self.conv1 = nn.Conv2d(num_features_in, feature_size, kernel_size=3, padding=1)
-        self.act1 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act2 = nn.ReLU(inplace=True)
-        self.conv3 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act3 = nn.ReLU(inplace=True)
-        self.conv4 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act4 = nn.ReLU(inplace=True)
         self.output = nn.Conv2d(
-            feature_size, num_anchor_points * 2, kernel_size=3, padding=1
+            num_features_in, num_anchor_points * 2, kernel_size=3, padding=1
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.act1(self.conv1(x))
-        out = self.act2(self.conv2(out))
-        out = self.output(out)
+        out = self.output(x)
         out = out.permute(0, 2, 3, 1)
         return out.contiguous().view(out.shape[0], -1, 2)
 
 
 class ClassificationModel(nn.Module):
-    """Point classification head."""
+    """Point classification projection head.
+
+    Applies a single output convolution on features that have already been
+    processed by SharedPredictionTrunk.  The ``num_features_in`` and
+    ``prior`` arguments are retained for API compatibility.
+    """
 
     def __init__(
         self,
@@ -90,23 +114,13 @@ class ClassificationModel(nn.Module):
         self.num_classes = num_classes
         self.num_anchor_points = num_anchor_points
 
-        self.conv1 = nn.Conv2d(num_features_in, feature_size, kernel_size=3, padding=1)
-        self.act1 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act2 = nn.ReLU(inplace=True)
-        self.conv3 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act3 = nn.ReLU(inplace=True)
-        self.conv4 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
-        self.act4 = nn.ReLU(inplace=True)
         self.output = nn.Conv2d(
-            feature_size, num_anchor_points * num_classes, kernel_size=3, padding=1
+            num_features_in, num_anchor_points * num_classes, kernel_size=3, padding=1
         )
         self.output_act = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.act1(self.conv1(x))
-        out = self.act2(self.conv2(out))
-        out = self.output(out)
+        out = self.output(x)
         out1 = out.permute(0, 2, 3, 1)
         batch_size, width, height, _ = out1.shape
         out2 = out1.view(

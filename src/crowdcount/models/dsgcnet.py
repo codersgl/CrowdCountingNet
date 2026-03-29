@@ -11,6 +11,7 @@ from crowdcount.models.head import (
     ClassificationModel,
     Density_pred,
     RegressionModel,
+    SharedPredictionTrunk,
     DensityPred_Block3,
     DensityPred_Block4,
     DensityPred_Block5,
@@ -103,6 +104,7 @@ class DSGCnet(nn.Module):
         )
         num_anchor_points = row * line
 
+        self.pred_trunk = SharedPredictionTrunk(in_channels=256, feature_size=256)
         self.regression = RegressionModel(
             num_features_in=256, num_anchor_points=num_anchor_points
         )
@@ -462,8 +464,9 @@ class DSGCnet(nn.Module):
                 density if self._semc_use_density_hint else None,
             )
 
-        regression = self.regression(feature_fl) * 100
-        classification = self.classification(feature_fl)
+        shared_feat = self.pred_trunk(feature_fl)
+        regression = self.regression(shared_feat) * 100
+        classification = self.classification(shared_feat)
         anchor_points = self.anchor_points(samples).repeat(batch_size, 1, 1)
         output_coord = regression + anchor_points
         output_class = classification

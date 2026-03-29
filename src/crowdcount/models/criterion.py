@@ -46,8 +46,19 @@ class SetCriterion_Crowd(nn.Module):
         target_points = torch.cat(
             [t["point"][i] for t, (_, i) in zip(targets, indices)], dim=0
         )
-        loss_bbox = F.mse_loss(src_points, target_points, reduction="none")
+        loss_bbox = F.smooth_l1_loss(src_points, target_points, reduction="none", beta=1.0)
         return {"loss_points": loss_bbox.sum() / num_points}
+
+    def loss_count(self, outputs, targets, indices, num_points):
+        """Global counting loss: L1(predicted_count, gt_count)."""
+        pred_scores = outputs["pred_logits"].softmax(-1)[:, :, 1]  # [B, Q]
+        pred_counts = pred_scores.sum(dim=1)  # [B]
+        gt_counts = torch.tensor(
+            [t["point"].shape[0] for t in targets],
+            dtype=torch.float,
+            device=pred_scores.device,
+        )
+        return {"loss_count": F.l1_loss(pred_counts, gt_counts)}
 
     def _get_src_permutation_idx(self, indices):
         batch_idx = torch.cat(
@@ -64,7 +75,11 @@ class SetCriterion_Crowd(nn.Module):
         return batch_idx, tgt_idx
 
     def get_loss(self, loss, outputs, targets, indices, num_points, **kwargs):
-        loss_map = {"labels": self.loss_labels, "points": self.loss_points}
+        loss_map = {
+            "labels": self.loss_labels,
+            "points": self.loss_points,
+            "count": self.loss_count,
+        }
         assert loss in loss_map, f"Unknown loss: {loss}"
         return loss_map[loss](outputs, targets, indices, num_points, **kwargs)
 

@@ -47,8 +47,12 @@ def build_model(cfg: DictConfig, training: bool = False):
     if not training:
         return model
 
-    weight_dict = {"loss_ce": 1, "loss_points": cfg.model.point_loss_coef}
-    losses = ["labels", "points"]
+    weight_dict = {
+        "loss_ce": 1,
+        "loss_points": cfg.model.point_loss_coef,
+        "loss_count": getattr(cfg.model, "count_loss_coef", 0.0),
+    }
+    losses = ["labels", "points", "count"]
     matcher = build_matcher_crowd(cfg)
     criterion = SetCriterion_Crowd(
         num_classes=num_classes,

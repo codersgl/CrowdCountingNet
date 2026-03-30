@@ -5,10 +5,12 @@ Contains:
   - SharedPredictionTrunk: shared 2-layer conv trunk for regression & classification
   - RegressionModel:      point regression projection (used after SharedPredictionTrunk)
   - ClassificationModel:  point classification projection (used after SharedPredictionTrunk)
+  - PointRefineModule:    iterative coordinate refinement via feature re-sampling
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SharedPredictionTrunk(nn.Module):
@@ -214,3 +216,114 @@ class DensityPred_Block5(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(x)
+
+
+class PointRefineModule(nn.Module):
+    """Iterative point coordinate refinement via feature re-sampling.
+
+    At each step, bilinear-samples from the feature map at the current
+    predicted coordinates, then predicts a small residual offset via a
+    shared MLP.  After *T* steps the accumulated refinement significantly
+    reduces localisation error compared to single-shot regression.
+
+    Args:
+        feature_dim: Channel dimension of the feature map to sample from.
+        hidden_dim:  MLP hidden dimension.
+        num_steps:   Number of refinement iterations *T*.
+        share_weights: If True, all steps share the same MLP parameters.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int = 256,
+        hidden_dim: int = 256,
+        num_steps: int = 2,
+        share_weights: bool = True,
+    ) -> None:
+        super().__init__()
+        self.num_steps = num_steps
+        self.share_weights = share_weights
+
+        if share_weights:
+            self.mlp = nn.Sequential(
+                nn.Linear(feature_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, 2),
+            )
+        else:
+            self.mlps = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(feature_dim, hidden_dim),
+                        nn.ReLU(inplace=True),
+                        nn.Linear(hidden_dim, 2),
+                    )
+                    for _ in range(num_steps)
+                ]
+            )
+
+    def _sample_features(
+        self,
+        feature_map: torch.Tensor,
+        points: torch.Tensor,
+        img_h: int,
+        img_w: int,
+    ) -> torch.Tensor:
+        """Bilinear-sample features at *points* (pixel coords).
+
+        Args:
+            feature_map: [B, C, Hf, Wf]
+            points:      [B, Q, 2]  (x, y) in pixel space
+            img_h:       Original image height
+            img_w:       Original image width
+
+        Returns:
+            [B, Q, C] sampled feature vectors.
+        """
+        B, Q, _ = points.shape
+        # Normalise to [-1, 1] for grid_sample
+        grid_x = 2.0 * points[:, :, 0] / max(img_w - 1, 1) - 1.0
+        grid_y = 2.0 * points[:, :, 1] / max(img_h - 1, 1) - 1.0
+        grid = torch.stack([grid_x, grid_y], dim=-1)  # [B, Q, 2]
+        grid = grid.unsqueeze(2)  # [B, Q, 1, 2]
+
+        sampled = F.grid_sample(
+            feature_map,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )  # [B, C, Q, 1]
+        return sampled.squeeze(-1).permute(0, 2, 1)  # [B, Q, C]
+
+    def forward(
+        self,
+        feature_map: torch.Tensor,
+        init_points: torch.Tensor,
+        img_h: int,
+        img_w: int,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Run iterative refinement.
+
+        Args:
+            feature_map: [B, C, Hf, Wf] — the feature map to sample from.
+            init_points: [B, Q, 2] — initial point predictions (pixel coords).
+            img_h: Image height (pixels).
+            img_w: Image width (pixels).
+
+        Returns:
+            refined_points: [B, Q, 2] — final refined coordinates.
+            intermediates:  List of [B, Q, 2] tensors, one per step
+                            (including the initial prediction at index 0).
+        """
+        points = init_points
+        intermediates = [points]
+
+        for t in range(self.num_steps):
+            feat = self._sample_features(feature_map, points.detach(), img_h, img_w)
+            mlp = self.mlp if self.share_weights else self.mlps[t]
+            delta = mlp(feat)  # [B, Q, 2]
+            points = points + delta
+            intermediates.append(points)
+
+        return points, intermediates

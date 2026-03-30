@@ -69,6 +69,12 @@ def base_cfg():
                     "initial_value": 2.0,
                     "heads_range": 4.0,
                 },
+                "use_refine": False,
+                "refine": {
+                    "num_steps": 2,
+                    "hidden_dim": 256,
+                    "share_weights": True,
+                },
             },
             "optimizer": {
                 "name": "adam",

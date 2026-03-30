@@ -25,6 +25,9 @@ tensorboard_dir: runs/dsgc
 
 density_loss_weight: 0.01 # Global scale factor applied to all density map losses
 
+# Iterative Point Refinement loss weight (only used when model.use_refine: true)
+refine_loss_weight: 0.001
+
 # Multi-scale density prediction (experimental)
 density_multi_scale:
   enabled: false # Enable multi-scale density prediction with auxiliary supervision

@@ -122,6 +122,38 @@ class SetCriterion_Crowd(nn.Module):
         )
         return {"loss_count": F.l1_loss(pred_counts, gt_counts)}
 
+    def loss_refine(self, outputs, targets, indices, num_points):
+        """Intermediate refinement loss: weighted Smooth L1 across steps.
+
+        Uses the same Hungarian matching indices as the main point loss so
+        that each refinement step is supervised towards the same GT target.
+        """
+        intermediates = outputs.get("refine_intermediates")
+        if intermediates is None or len(intermediates) <= 1:
+            device = outputs["pred_logits"].device
+            return {"loss_refine": torch.tensor(0.0, device=device)}
+
+        idx = self._get_src_permutation_idx(indices)
+        target_points = torch.cat(
+            [t["point"][i] for t, (_, i) in zip(targets, indices)], dim=0
+        )
+
+        T = len(intermediates) - 1  # number of refinement steps
+        total = torch.tensor(0.0, device=target_points.device)
+        for t, pts in enumerate(intermediates):
+            # Linearly increasing weight: 0.5 for step 0 → 1.0 for step T
+            w_t = 0.5 + 0.5 * t / max(T, 1)
+            src = pts[idx]
+            step_loss = F.smooth_l1_loss(
+                src,
+                target_points,
+                reduction="none",
+                beta=1.0,
+            )
+            total = total + w_t * step_loss.sum() / max(num_points, 1)
+
+        return {"loss_refine": total / (T + 1)}
+
     def _get_src_permutation_idx(self, indices):
         batch_idx = torch.cat(
             [torch.full_like(src, i) for i, (src, _) in enumerate(indices)]
@@ -141,6 +173,7 @@ class SetCriterion_Crowd(nn.Module):
             "labels": self.loss_labels,
             "points": self.loss_points,
             "count": self.loss_count,
+            "refine": self.loss_refine,
         }
         assert loss in loss_map, f"Unknown loss: {loss}"
         return loss_map[loss](outputs, targets, indices, num_points, **kwargs)
@@ -149,6 +182,7 @@ class SetCriterion_Crowd(nn.Module):
         output1 = {
             "pred_logits": outputs["pred_logits"],
             "pred_points": outputs["pred_points"],
+            "refine_intermediates": outputs.get("refine_intermediates"),
         }
         indices1 = self.matcher(output1, targets)
 

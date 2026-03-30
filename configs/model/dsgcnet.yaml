@@ -70,3 +70,10 @@ focal_loss:
 
 # Deformable Convolution in PA-FPN (disabled by default)
 use_dcn: false
+
+# Iterative Point Refinement Decoder (disabled by default)
+use_refine: false
+refine:
+  num_steps: 2 # refinement iterations T
+  hidden_dim: 256 # MLP intermediate dimension
+  share_weights: true # share MLP parameters across steps

@@ -43,6 +43,8 @@ def build_model(cfg: DictConfig, training: bool = False):
         gcn_sim_threshold=getattr(cfg.model, "gcn_sim_threshold", 0.5),
         cfg=cfg,  # Pass config for multi-scale density prediction
         use_dcn=getattr(cfg.model, "use_dcn", False),
+        use_refine=getattr(cfg.model, "use_refine", False),
+        refine_cfg=getattr(cfg.model, "refine", None),
     )
 
     if not training:
@@ -52,8 +54,13 @@ def build_model(cfg: DictConfig, training: bool = False):
         "loss_ce": 1,
         "loss_points": cfg.model.point_loss_coef,
         "loss_count": getattr(cfg.model, "count_loss_coef", 0.0),
+        "loss_refine": float(getattr(cfg, "refine_loss_weight", 0.0))
+        if getattr(cfg.model, "use_refine", False)
+        else 0.0,
     }
     losses = ["labels", "points", "count"]
+    if getattr(cfg.model, "use_refine", False):
+        losses.append("refine")
     matcher = build_matcher_crowd(cfg)
 
     # Focal loss config

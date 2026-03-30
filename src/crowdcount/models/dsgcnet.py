@@ -10,6 +10,7 @@ from crowdcount.models.gcn import DensityGCNProcessor, FeatureGCNProcessor
 from crowdcount.models.head import (
     ClassificationModel,
     Density_pred,
+    PointRefineModule,
     RegressionModel,
     SharedPredictionTrunk,
     DensityPred_Block3,
@@ -89,6 +90,8 @@ class DSGCnet(nn.Module):
         gcn_sim_threshold: float = 0.5,
         cfg: DictConfig | None = None,
         use_dcn: bool = False,
+        use_refine: bool = False,
+        refine_cfg: DictConfig | None = None,
     ):
         super().__init__()
         self.backbone = backbone
@@ -366,6 +369,32 @@ class DSGCnet(nn.Module):
             self._semc_position = None
             self._semc_use_density_hint = False
 
+        # Iterative Point Refinement (optional, disabled by default)
+        if use_refine:
+            _refine_hidden = (
+                int(getattr(refine_cfg, "hidden_dim", 256))
+                if refine_cfg is not None
+                else 256
+            )
+            _refine_steps = (
+                int(getattr(refine_cfg, "num_steps", 2))
+                if refine_cfg is not None
+                else 2
+            )
+            _refine_share = (
+                bool(getattr(refine_cfg, "share_weights", True))
+                if refine_cfg is not None
+                else True
+            )
+            self.point_refine: PointRefineModule | None = PointRefineModule(
+                feature_dim=256,
+                hidden_dim=_refine_hidden,
+                num_steps=_refine_steps,
+                share_weights=_refine_share,
+            )
+        else:
+            self.point_refine = None
+
     def supports_moe(self) -> bool:
         return self.use_moe and self.moe is not None
 
@@ -506,7 +535,21 @@ class DSGCnet(nn.Module):
         output_coord = regression + anchor_points
         output_class = classification
 
+        # Iterative point refinement (optional)
+        if self.point_refine is not None:
+            img_h, img_w = samples.shape[-2], samples.shape[-1]
+            refined_coord, refine_intermediates = self.point_refine(
+                feature_fl,
+                output_coord,
+                img_h,
+                img_w,
+            )
+            output_dict["pred_points"] = refined_coord
+            output_dict["refine_intermediates"] = refine_intermediates
+        else:
+            output_dict["pred_points"] = output_coord
+            output_dict["refine_intermediates"] = None
+
         output_dict["pred_logits"] = output_class
-        output_dict["pred_points"] = output_coord
 
         return output_dict

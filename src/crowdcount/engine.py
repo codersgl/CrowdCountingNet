@@ -239,9 +239,12 @@ def train_one_epoch(
                 if key in moe_aux_losses:
                     metric_logger.update(**{key: float(moe_aux_losses[key].item())})
 
-            moe_module = getattr(model, "moe", None)
+            moe_module = getattr(model, "moe", None) or getattr(
+                model, "light_moe", None
+            )
             if moe_module is not None:
-                metric_logger.update(moe_temperature=float(moe_module.temperature))
+                if hasattr(moe_module, "temperature"):
+                    metric_logger.update(moe_temperature=float(moe_module.temperature))
                 # Log EMA expert usage spread for monitoring load balance
                 if hasattr(moe_module, "ema_usage"):
                     ema_u = moe_module.ema_usage

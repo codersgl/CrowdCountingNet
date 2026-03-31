@@ -15,7 +15,8 @@ use_msaa: false
 msaa_in_channels: 1280
 msaa_reduction: 4
 
-# Feature fusion branch selection: gcn | esca_moe
+# Feature fusion branch selection: gcn | esca_moe | gcn_moe
+# gcn_moe: GCN dual-stream + LightMoE post-refinement (recommended)
 fusion_mode: gcn
 
 # Adaptive GCN graph construction (only used when fusion_mode: gcn)
@@ -27,13 +28,13 @@ gcn_density_scale: 4.0 # adaptive DensityGCN: scale factor for density → k map
 gcn_sim_threshold: 0.5 # adaptive FeatureGCN: cosine similarity threshold
 
 moe:
-  top_k: 2
+  top_k: 3 # all experts active (soft routing); kept for API compat
   temperature_init: 1.0
   temperature_min: 0.4
   temperature_decay: 0.99998
-  aux_loss_weight: 0.2 # reduced from 2.0 to keep MoE aux << task loss
-  lambda_balance: 0.05
-  lambda_decorr: 10.0
+  aux_loss_weight: 0.2
+  lambda_balance: 0.01
+  grid_stride: 4
   use_density_hint: true
 
 use_dino_inject: false

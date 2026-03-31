@@ -8,12 +8,13 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from crowdcount.models.dsgcnet import DSGCnet
 from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
-from crowdcount.plugins.moe import ESCA, MoE
+from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
 
@@ -437,7 +438,18 @@ def test_density_hint_wired_through_to_moe() -> None:
     assert len(first_conv_inputs) == 1, "未捕获到 context_encoder 的第一层输入"
     routed_input = first_conv_inputs[0]
     assert routed_input.shape[1] == esca_feature.shape[1] + 1
-    assert torch.allclose(routed_input[:, -1:], density, atol=1e-6), (
+    # GridSoftRouter uses AvgPool (grid_stride) before score_net, so the
+    # captured input is at coarse resolution.  Verify that the density
+    # channel is present and comes from avg-pooling the original density.
+    coarse_density = routed_input[:, -1:]
+    grid_stride = model.moe.router.grid_stride  # type: ignore[union-attr]
+    expected_density = F.avg_pool2d(
+        density, kernel_size=grid_stride, stride=grid_stride
+    )
+    assert coarse_density.shape == expected_density.shape, (
+        f"coarse density shape {coarse_density.shape} != expected {expected_density.shape}"
+    )
+    assert torch.allclose(coarse_density, expected_density, atol=1e-5), (
         "density_hint 没有作为额外通道送入路由网络"
     )
     model.moe.forward = _orig_forward  # type: ignore[union-attr]
@@ -460,3 +472,108 @@ def test_checkpoint_temperature_restore_syncs_router() -> None:
     model.update_moe_temperature(decay_rate=0.9)
     assert model.moe.temperature < saved_temp  # type: ignore[union-attr]
     assert model.moe.router.temperature == model.moe.temperature  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# GCN + LightMoE (gcn_moe mode) tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def gcn_moe_model():
+    backbone = TinyVGGBackbone()
+    moe_cfg = OmegaConf.create(
+        {"grid_stride": 4, "use_density_hint": True, "lambda_balance": 0.01}
+    )
+    return DSGCnet(backbone, row=2, line=2, fusion_mode="gcn_moe", moe_cfg=moe_cfg)
+
+
+def test_gcn_moe_init_has_both_gcn_and_light_moe(gcn_moe_model) -> None:
+    """gcn_moe mode should have GCN processors AND LightMoE."""
+    assert gcn_moe_model.density_gcn is not None
+    assert gcn_moe_model.feature_gcn is not None
+    assert gcn_moe_model.alpha is not None
+    assert gcn_moe_model.light_moe is not None
+    assert isinstance(gcn_moe_model.light_moe, LightMoE)
+    # esca_moe-specific modules should be absent
+    assert gcn_moe_model.esca is None
+    assert gcn_moe_model.moe is None
+
+
+def test_gcn_moe_forward_output_keys(gcn_moe_model) -> None:
+    gcn_moe_model.eval()
+    with torch.no_grad():
+        out = gcn_moe_model(torch.zeros(1, 3, 128, 128))
+    assert "pred_logits" in out
+    assert "pred_points" in out
+    assert "density_out" in out
+    assert out["moe_weights"] is not None
+    assert out["moe_aux_losses"] is not None
+
+
+def test_gcn_moe_forward_shapes(gcn_moe_model) -> None:
+    gcn_moe_model.eval()
+    with torch.no_grad():
+        out = gcn_moe_model(torch.zeros(2, 3, 128, 128))
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_points"].shape[0] == 2
+    assert out["moe_weights"].shape[0] == 2
+    assert out["moe_weights"].shape[1] == 3  # 3 micro-experts
+
+
+def test_gcn_moe_weights_sum_to_one(gcn_moe_model) -> None:
+    gcn_moe_model.eval()
+    with torch.no_grad():
+        out = gcn_moe_model(torch.zeros(2, 3, 128, 128))
+    w = out["moe_weights"]
+    sums = w.sum(dim=1)  # [B, H, W]
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+
+
+def test_gcn_moe_supports_moe(gcn_moe_model) -> None:
+    assert gcn_moe_model.supports_moe() is True
+
+
+def test_gcn_moe_gating_parameters_from_light_moe(gcn_moe_model) -> None:
+    params = gcn_moe_model.get_moe_gating_parameters()
+    assert len(params) > 0
+    # All should come from light_moe.router
+    router_params = set(id(p) for p in gcn_moe_model.light_moe.router.parameters())
+    for p in params:
+        assert id(p) in router_params
+
+
+def test_gcn_moe_training_produces_aux_loss() -> None:
+    backbone = TinyVGGBackbone()
+    moe_cfg = OmegaConf.create({"grid_stride": 4, "use_density_hint": True})
+    model = DSGCnet(backbone, row=2, line=2, fusion_mode="gcn_moe", moe_cfg=moe_cfg)
+    model.train()
+    out = model(torch.randn(2, 3, 128, 128))
+    assert out["moe_aux_total"] is not None
+    assert out["moe_aux_total"].requires_grad
+
+
+def test_gcn_moe_light_moe_param_count_small(gcn_moe_model) -> None:
+    """LightMoE should add < 0.5M parameters."""
+    light_params = sum(p.numel() for p in gcn_moe_model.light_moe.parameters())
+    assert light_params < 500_000, (
+        f"LightMoE has {light_params} params, expected < 500k"
+    )
+
+
+def test_gcn_moe_with_gm() -> None:
+    """gcn_moe should work together with gate mechanism."""
+    backbone = TinyVGGBackbone()
+    moe_cfg = OmegaConf.create({"grid_stride": 4})
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        fusion_mode="gcn_moe",
+        use_gm=True,
+        moe_cfg=moe_cfg,
+    ).eval()
+    with torch.no_grad():
+        out = model(torch.zeros(1, 3, 128, 128))
+    assert out["pred_logits"] is not None
+    assert out["moe_weights"] is not None

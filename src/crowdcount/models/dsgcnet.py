@@ -28,7 +28,7 @@ from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
 from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
-from crowdcount.plugins.moe import ESCA, MoE
+from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
 
@@ -112,15 +112,16 @@ class DSGCnet(nn.Module):
         self.cfg = cfg
         self.fusion_mode = fusion_mode
         self.use_moe = fusion_mode == "esca_moe"
+        self.use_gcn_moe = fusion_mode == "gcn_moe"
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
         self.use_freq_head = use_freq_head
         self.use_subpix_refine = use_subpix_refine
         self._gcn_mode = gcn_mode
 
-        if self.fusion_mode not in {"gcn", "esca_moe"}:
+        if self.fusion_mode not in {"gcn", "esca_moe", "gcn_moe"}:
             raise ValueError(
-                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn' or 'esca_moe'"
+                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', or 'gcn_moe'"
             )
 
         density_cfg = (
@@ -167,19 +168,17 @@ class DSGCnet(nn.Module):
                 else 0.4
             )
             lambda_balance = (
-                float(getattr(moe_cfg, "lambda_balance", 0.05))
+                float(getattr(moe_cfg, "lambda_balance", 0.01))
                 if moe_cfg is not None
-                else 0.05
-            )
-            lambda_decorr = (
-                float(getattr(moe_cfg, "lambda_decorr", 10.0))
-                if moe_cfg is not None
-                else 10.0
+                else 0.01
             )
             use_density_hint = (
                 bool(getattr(moe_cfg, "use_density_hint", True))
                 if moe_cfg is not None
                 else True
+            )
+            grid_stride = (
+                int(getattr(moe_cfg, "grid_stride", 4)) if moe_cfg is not None else 4
             )
 
             self.esca: ESCA | None = ESCA(256)
@@ -189,8 +188,8 @@ class DSGCnet(nn.Module):
                 temperature_init=temperature_init,
                 temperature_min=temperature_min,
                 lambda_balance=lambda_balance,
-                lambda_decorr=lambda_decorr,
                 use_density_hint=use_density_hint,
+                grid_stride=grid_stride,
             )
             self.density_gcn = None
             self.feature_gcn = None
@@ -240,6 +239,30 @@ class DSGCnet(nn.Module):
                 self.gm = None
             self.esca = None
             self.moe = None
+
+        # LightMoE post-GCN refinement (only for gcn_moe mode)
+        if self.use_gcn_moe:
+            _light_grid = (
+                int(getattr(moe_cfg, "grid_stride", 4)) if moe_cfg is not None else 4
+            )
+            _light_density = (
+                bool(getattr(moe_cfg, "use_density_hint", True))
+                if moe_cfg is not None
+                else True
+            )
+            _light_balance = (
+                float(getattr(moe_cfg, "lambda_balance", 0.01))
+                if moe_cfg is not None
+                else 0.01
+            )
+            self.light_moe: LightMoE | None = LightMoE(
+                input_dim=256,
+                grid_stride=_light_grid,
+                use_density_hint=_light_density,
+                lambda_balance=_light_balance,
+            )
+        else:
+            self.light_moe = None
 
         self.msaa: MsaaAdaptiveLayer | None = (
             MsaaAdaptiveLayer(in_channels=msaa_in_channels, reduction=msaa_reduction)
@@ -451,9 +474,11 @@ class DSGCnet(nn.Module):
             self.subpix_refine = None
 
     def supports_moe(self) -> bool:
-        return self.use_moe and self.moe is not None
+        return (self.use_moe and self.moe is not None) or self.light_moe is not None
 
     def get_moe_gating_parameters(self) -> list[nn.Parameter]:
+        if self.light_moe is not None:
+            return list(self.light_moe.router.parameters())
         if self.moe is None:
             return []
         return list(self.moe.context_encoder.parameters()) + list(
@@ -580,6 +605,15 @@ class DSGCnet(nn.Module):
                         + w[1] * density_gcn_feature
                         + w[2] * feature_gcn_feature
                     )
+
+        # LightMoE post-GCN conditional refinement (gcn_moe mode)
+        if self.light_moe is not None and not self.use_moe:
+            feature_fl, light_aux, light_weights = self.light_moe(
+                feature_fl, density_hint=density, training=self.training
+            )
+            output_dict["moe_aux_losses"] = light_aux
+            output_dict["moe_aux_total"] = light_aux.get("total_aux")
+            output_dict["moe_weights"] = light_weights
 
         # SEMC post-GCN enhancement (optional, disabled by default)
         if self.semc_enhancer is not None and not self.use_moe:

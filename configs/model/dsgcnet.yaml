@@ -77,3 +77,24 @@ refine:
   num_steps: 2 # refinement iterations T
   hidden_dim: 256 # MLP intermediate dimension
   share_weights: true # share MLP parameters across steps
+
+# Super-Node GCN mode (alternative to dual-stream GCN; disabled by default)
+# When gcn_mode is "supernode", replaces DensityGCN + FeatureGCN with a single
+# Gather→Process→Scatter super-node GCN that runs in O(NM) instead of O(N²).
+gcn_mode: fixed # fixed | supernode
+gcn_num_supernodes: 8 # number of learnable prototype super-nodes
+gcn_supernode_heads: 4 # multi-head attention heads in gather/scatter
+
+# Frequency-Decoupled Head routing (disabled by default)
+# Splits shared trunk features into low-freq (→ density) and high-freq (→ regression)
+# via Laplacian decomposition. Zero learnable parameters.
+use_freq_head: false
+freq_head_kernel: 3 # AvgPool kernel size for low-pass filter
+
+# Sub-Pixel Refinement (disabled by default)
+# For top-K high-confidence points, bilinear-samples from C3 (stride 8) features
+# and predicts residual offset, improving localisation in dense regions.
+use_subpix_refine: false
+subpix_refine:
+  top_k: 512 # number of high-confidence points to refine
+  hidden_dim: 128 # MLP hidden dimension

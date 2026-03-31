@@ -6,13 +6,19 @@ from torch import nn
 from omegaconf import DictConfig
 
 from crowdcount.models.anchor import AnchorPoints
-from crowdcount.models.gcn import DensityGCNProcessor, FeatureGCNProcessor
+from crowdcount.models.gcn import (
+    DensityGCNProcessor,
+    FeatureGCNProcessor,
+    SuperNodeGCNProcessor,
+)
 from crowdcount.models.head import (
     ClassificationModel,
     Density_pred,
+    FreqDecoupledRouter,
     PointRefineModule,
     RegressionModel,
     SharedPredictionTrunk,
+    SubPixelRefineModule,
     DensityPred_Block3,
     DensityPred_Block4,
     DensityPred_Block5,
@@ -88,10 +94,17 @@ class DSGCnet(nn.Module):
         gcn_k_max: int = 8,
         gcn_density_scale: float = 4.0,
         gcn_sim_threshold: float = 0.5,
+        gcn_mode: str = "fixed",
+        gcn_num_supernodes: int = 8,
+        gcn_supernode_heads: int = 4,
         cfg: DictConfig | None = None,
         use_dcn: bool = False,
         use_refine: bool = False,
         refine_cfg: DictConfig | None = None,
+        use_freq_head: bool = False,
+        freq_head_kernel: int = 3,
+        use_subpix_refine: bool = False,
+        subpix_refine_cfg: DictConfig | None = None,
     ):
         super().__init__()
         self.backbone = backbone
@@ -101,6 +114,9 @@ class DSGCnet(nn.Module):
         self.use_moe = fusion_mode == "esca_moe"
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
+        self.use_freq_head = use_freq_head
+        self.use_subpix_refine = use_subpix_refine
+        self._gcn_mode = gcn_mode
 
         if self.fusion_mode not in {"gcn", "esca_moe"}:
             raise ValueError(
@@ -181,23 +197,36 @@ class DSGCnet(nn.Module):
             self.alpha = None
             self.gm = None
         else:
-            self.density_gcn: DensityGCNProcessor | None = DensityGCNProcessor(
-                k=gcn_k,
-                adaptive=gcn_adaptive,
-                k_min=gcn_k_min,
-                k_max=gcn_k_max,
-                density_scale=gcn_density_scale,
-            )
-            self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(
-                k=gcn_k,
-                adaptive=gcn_adaptive,
-                k_min=gcn_k_min,
-                k_max=gcn_k_max,
-                sim_threshold=gcn_sim_threshold,
-            )
-            self.alpha: nn.Parameter | None = nn.Parameter(
-                torch.ones(3, dtype=torch.float32)
-            )
+            if gcn_mode == "supernode":
+                self.supernode_gcn: SuperNodeGCNProcessor | None = (
+                    SuperNodeGCNProcessor(
+                        in_channels=256,
+                        num_supernodes=gcn_num_supernodes,
+                        num_heads=gcn_supernode_heads,
+                    )
+                )
+                self.density_gcn = None
+                self.feature_gcn = None
+                self.alpha = None
+            else:
+                self.supernode_gcn = None
+                self.density_gcn: DensityGCNProcessor | None = DensityGCNProcessor(
+                    k=gcn_k,
+                    adaptive=gcn_adaptive,
+                    k_min=gcn_k_min,
+                    k_max=gcn_k_max,
+                    density_scale=gcn_density_scale,
+                )
+                self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(
+                    k=gcn_k,
+                    adaptive=gcn_adaptive,
+                    k_min=gcn_k_min,
+                    k_max=gcn_k_max,
+                    sim_threshold=gcn_sim_threshold,
+                )
+                self.alpha: nn.Parameter | None = nn.Parameter(
+                    torch.ones(3, dtype=torch.float32)
+                )
             if use_gm:
                 if gm_spatial:
                     self.gm: SpatialGateMechanism | GateMechanism | None = (
@@ -395,6 +424,32 @@ class DSGCnet(nn.Module):
         else:
             self.point_refine = None
 
+        # Frequency-Decoupled Head routing (optional, disabled by default)
+        self.freq_router: FreqDecoupledRouter | None = (
+            FreqDecoupledRouter(kernel_size=freq_head_kernel) if use_freq_head else None
+        )
+
+        # Sub-Pixel Refinement (optional, disabled by default)
+        if use_subpix_refine:
+            _sp_top_k = (
+                int(getattr(subpix_refine_cfg, "top_k", 512))
+                if subpix_refine_cfg is not None
+                else 512
+            )
+            _sp_hidden = (
+                int(getattr(subpix_refine_cfg, "hidden_dim", 128))
+                if subpix_refine_cfg is not None
+                else 128
+            )
+            self.subpix_refine: SubPixelRefineModule | None = SubPixelRefineModule(
+                hr_channels=256,
+                lr_channels=256,
+                hidden_dim=_sp_hidden,
+                top_k=_sp_top_k,
+            )
+        else:
+            self.subpix_refine = None
+
     def supports_moe(self) -> bool:
         return self.use_moe and self.moe is not None
 
@@ -424,6 +479,7 @@ class DSGCnet(nn.Module):
         # Use stable list indices across VGG and DINO backbones:
         # c3: 256ch, c4: 512ch, c5: 512ch
         c3, c4, c5 = features_list[1], features_list[2], features_list[3]
+        c3_hr = c3  # Cache high-res features for optional sub-pixel refinement
 
         # Depth dual-stream fusion: fuse each scale before PA-FPN
         if self.use_depth and depth_map is not None:
@@ -489,37 +545,41 @@ class DSGCnet(nn.Module):
             output_dict["moe_aux_total"] = moe_aux_losses.get("total_aux")
             output_dict["moe_weights"] = moe_weights
         else:
-            assert self.density_gcn is not None
-            assert self.feature_gcn is not None
-            density_gcn_feature = self.density_gcn(density, features_pa)
-            feature_gcn_feature = self.feature_gcn(features_pa)
-            if self.gm is not None:
-                gate_weight = self.gm(features_pa)
-                if gate_weight.dim() == 4:
-                    # SpatialGateMechanism: [B, 3, H, W]
-                    feature_fl = (
-                        features_pa * gate_weight[:, 0:1]
-                        + density_gcn_feature * gate_weight[:, 1:2]
-                        + feature_gcn_feature * gate_weight[:, 2:3]
-                    )
-                else:
-                    # Legacy GateMechanism: [B, 3]
-                    w_1 = gate_weight[:, 0].view(-1, 1, 1, 1)
-                    w_2 = gate_weight[:, 1].view(-1, 1, 1, 1)
-                    w_3 = gate_weight[:, 2].view(-1, 1, 1, 1)
-                    feature_fl = (
-                        features_pa * w_1
-                        + density_gcn_feature * w_2
-                        + feature_gcn_feature * w_3
-                    )
+            if self._gcn_mode == "supernode":
+                assert self.supernode_gcn is not None
+                feature_fl = self.supernode_gcn(features_pa, density)
             else:
-                assert self.alpha is not None
-                w = F.softmax(self.alpha, dim=0)
-                feature_fl = (
-                    w[0] * features_pa
-                    + w[1] * density_gcn_feature
-                    + w[2] * feature_gcn_feature
-                )
+                assert self.density_gcn is not None
+                assert self.feature_gcn is not None
+                density_gcn_feature = self.density_gcn(density, features_pa)
+                feature_gcn_feature = self.feature_gcn(features_pa)
+                if self.gm is not None:
+                    gate_weight = self.gm(features_pa)
+                    if gate_weight.dim() == 4:
+                        # SpatialGateMechanism: [B, 3, H, W]
+                        feature_fl = (
+                            features_pa * gate_weight[:, 0:1]
+                            + density_gcn_feature * gate_weight[:, 1:2]
+                            + feature_gcn_feature * gate_weight[:, 2:3]
+                        )
+                    else:
+                        # Legacy GateMechanism: [B, 3]
+                        w_1 = gate_weight[:, 0].view(-1, 1, 1, 1)
+                        w_2 = gate_weight[:, 1].view(-1, 1, 1, 1)
+                        w_3 = gate_weight[:, 2].view(-1, 1, 1, 1)
+                        feature_fl = (
+                            features_pa * w_1
+                            + density_gcn_feature * w_2
+                            + feature_gcn_feature * w_3
+                        )
+                else:
+                    assert self.alpha is not None
+                    w = F.softmax(self.alpha, dim=0)
+                    feature_fl = (
+                        w[0] * features_pa
+                        + w[1] * density_gcn_feature
+                        + w[2] * feature_gcn_feature
+                    )
 
         # SEMC post-GCN enhancement (optional, disabled by default)
         if self.semc_enhancer is not None and not self.use_moe:
@@ -529,8 +589,15 @@ class DSGCnet(nn.Module):
             )
 
         shared_feat = self.pred_trunk(feature_fl)
-        regression = self.regression(shared_feat) * 100
-        classification = self.classification(shared_feat)
+
+        # Frequency-decoupled head routing (optional)
+        if self.freq_router is not None:
+            _f_low, f_high, f_full = self.freq_router(shared_feat)
+            regression = self.regression(f_high) * 100
+            classification = self.classification(f_full)
+        else:
+            regression = self.regression(shared_feat) * 100
+            classification = self.classification(shared_feat)
         anchor_points = self.anchor_points(samples).repeat(batch_size, 1, 1)
         output_coord = regression + anchor_points
         output_class = classification
@@ -551,5 +618,18 @@ class DSGCnet(nn.Module):
             output_dict["refine_intermediates"] = None
 
         output_dict["pred_logits"] = output_class
+
+        # Sub-pixel refinement for dense-region points (optional)
+        if self.subpix_refine is not None:
+            img_h, img_w = samples.shape[-2], samples.shape[-1]
+            fg_scores = output_class[:, :, 1].sigmoid()
+            output_dict["pred_points"] = self.subpix_refine(
+                hr_feat=c3_hr,
+                lr_feat=features_pa,
+                pred_points=output_dict["pred_points"],
+                pred_scores=fg_scores,
+                img_h=img_h,
+                img_w=img_w,
+            )
 
         return output_dict

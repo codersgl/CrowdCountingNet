@@ -45,6 +45,13 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_dcn=getattr(cfg.model, "use_dcn", False),
         use_refine=getattr(cfg.model, "use_refine", False),
         refine_cfg=getattr(cfg.model, "refine", None),
+        gcn_mode=getattr(cfg.model, "gcn_mode", "fixed"),
+        gcn_num_supernodes=getattr(cfg.model, "gcn_num_supernodes", 8),
+        gcn_supernode_heads=getattr(cfg.model, "gcn_supernode_heads", 4),
+        use_freq_head=getattr(cfg.model, "use_freq_head", False),
+        freq_head_kernel=getattr(cfg.model, "freq_head_kernel", 3),
+        use_subpix_refine=getattr(cfg.model, "use_subpix_refine", False),
+        subpix_refine_cfg=getattr(cfg.model, "subpix_refine", None),
     )
 
     if not training:

@@ -1,11 +1,13 @@
 """Prediction head modules for DSGCNet.
 
 Contains:
-  - Density_pred:         density map regression head
-  - SharedPredictionTrunk: shared 2-layer conv trunk for regression & classification
-  - RegressionModel:      point regression projection (used after SharedPredictionTrunk)
-  - ClassificationModel:  point classification projection (used after SharedPredictionTrunk)
-  - PointRefineModule:    iterative coordinate refinement via feature re-sampling
+  - Density_pred:           density map regression head
+  - SharedPredictionTrunk:  shared 2-layer conv trunk for regression & classification
+  - RegressionModel:        point regression projection (used after SharedPredictionTrunk)
+  - ClassificationModel:    point classification projection (used after SharedPredictionTrunk)
+  - PointRefineModule:      iterative coordinate refinement via feature re-sampling
+  - FreqDecoupledRouter:    frequency-domain Laplacian decomposition for head routing
+  - SubPixelRefineModule:   dense-region sub-pixel refinement via high-res feature sampling
 """
 
 import torch
@@ -129,6 +131,149 @@ class ClassificationModel(nn.Module):
             batch_size, width, height, self.num_anchor_points, self.num_classes
         )
         return out2.contiguous().view(x.shape[0], -1, self.num_classes)
+
+
+class FreqDecoupledRouter(nn.Module):
+    """Frequency-domain Laplacian decomposition for task-specific head routing.
+
+    Splits the shared trunk features into low-frequency and high-frequency
+    components using a simple AvgPool-based Laplacian decomposition:
+        F_low  = AvgPool(F)           — smooth / low-freq component
+        F_high = F - F_low            — edge / high-freq component
+
+    Routes:
+        - Density head    ← F_low   (density maps are Gaussian-smoothed → low-freq)
+        - Regression head ← F_high  (point coords are Dirac-like → high-freq)
+        - Classification  ← F       (original, no frequency bias)
+
+    Zero learnable parameters, zero information loss (F_low + F_high = F).
+    """
+
+    def __init__(self, kernel_size: int = 3) -> None:
+        super().__init__()
+        self.pool = nn.AvgPool2d(
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            count_include_pad=False,
+        )
+
+    def forward(
+        self, shared_feat: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (feat_for_density, feat_for_regression, feat_for_classification)."""
+        f_low = self.pool(shared_feat)
+        f_high = shared_feat - f_low
+        return f_low, f_high, shared_feat
+
+
+class SubPixelRefineModule(nn.Module):
+    """Dense-region sub-pixel refinement via high-resolution feature sampling.
+
+    For the top-K highest-confidence predicted points, bilinear-samples from
+    the high-resolution backbone feature map (C3, stride 8) and predicts a
+    residual coordinate offset, breaking the Nyquist resolution limit of the
+    H/16 prediction grid.
+
+    Args:
+        hr_channels: Channel dim of the high-res feature map (default 256 for C3).
+        lr_channels: Channel dim of the low-res feature map (default 256 for features_pa).
+        hidden_dim:  MLP hidden dimension.
+        top_k:       Number of high-confidence points to refine.
+    """
+
+    def __init__(
+        self,
+        hr_channels: int = 256,
+        lr_channels: int = 256,
+        hidden_dim: int = 128,
+        top_k: int = 512,
+    ) -> None:
+        super().__init__()
+        self.top_k = top_k
+        self.mlp = nn.Sequential(
+            nn.Linear(hr_channels + lr_channels, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 2),
+        )
+        # Initialize to zero offset (identity residual)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    @staticmethod
+    def _sample_at(
+        feat_map: torch.Tensor,
+        points: torch.Tensor,
+        img_h: int,
+        img_w: int,
+    ) -> torch.Tensor:
+        """Bilinear-sample *feat_map* at pixel coordinates *points*.
+
+        Args:
+            feat_map: [B, C, Hf, Wf]
+            points:   [B, K, 2]  (x, y) in original image pixel space
+            img_h, img_w: original image dimensions for normalisation
+
+        Returns:
+            [B, K, C] sampled feature vectors.
+        """
+        grid_x = 2.0 * points[:, :, 0] / max(img_w - 1, 1) - 1.0
+        grid_y = 2.0 * points[:, :, 1] / max(img_h - 1, 1) - 1.0
+        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(2)  # [B, K, 1, 2]
+        sampled = F.grid_sample(
+            feat_map,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )  # [B, C, K, 1]
+        return sampled.squeeze(-1).permute(0, 2, 1)  # [B, K, C]
+
+    def forward(
+        self,
+        hr_feat: torch.Tensor,
+        lr_feat: torch.Tensor,
+        pred_points: torch.Tensor,
+        pred_scores: torch.Tensor,
+        img_h: int,
+        img_w: int,
+    ) -> torch.Tensor:
+        """Refine top-K points using high-resolution features.
+
+        Args:
+            hr_feat:      [B, C_hr, H/8, W/8] high-res backbone feature (C3).
+            lr_feat:      [B, C_lr, H/16, W/16] low-res fused feature.
+            pred_points:  [B, Q, 2] predicted point coordinates.
+            pred_scores:  [B, Q] foreground confidence scores.
+            img_h, img_w: original image dimensions.
+
+        Returns:
+            refined_points: [B, Q, 2] with top-K points refined in-place.
+        """
+        B, Q, _ = pred_points.shape
+        K = min(self.top_k, Q)
+
+        # Select top-K confident points per image
+        _, topk_idx = torch.topk(pred_scores, K, dim=1)  # [B, K]
+
+        # Gather coordinates for selected points
+        topk_points = torch.gather(
+            pred_points, 1, topk_idx.unsqueeze(-1).expand(-1, -1, 2)
+        )  # [B, K, 2]
+
+        # Sample features from both resolutions
+        hr_sampled = self._sample_at(hr_feat, topk_points.detach(), img_h, img_w)
+        lr_sampled = self._sample_at(lr_feat, topk_points.detach(), img_h, img_w)
+
+        # Predict residual offset
+        delta = self.mlp(torch.cat([hr_sampled, lr_sampled], dim=-1))  # [B, K, 2]
+
+        # Scatter refined offsets back
+        refined = pred_points.clone()
+        scatter_idx = topk_idx.unsqueeze(-1).expand(-1, -1, 2)
+        refined = refined.scatter(1, scatter_idx, topk_points + delta)
+
+        return refined
 
 
 class DensityPred_Backbone(nn.Module):

@@ -1,7 +1,7 @@
 """GCN modules for DSGCNet.
 
 Density-guided and feature-guided graph convolutional processors.
-Supports both fixed-k and adaptive graph construction strategies.
+Supports fixed-k, adaptive, and super-node graph construction strategies.
 """
 
 import torch
@@ -285,3 +285,152 @@ class FeatureGCNProcessor(nn.Module):
         node_features = feature_maps.permute(0, 2, 3, 1).contiguous().view(-1, C)
         out = self.gcn(node_features, edge_index)
         return out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+
+
+class SuperNodeGCNProcessor(nn.Module):
+    """Super-Node GCN: global scene reasoning via learnable prototypes.
+
+    Instead of building an O(N²) pixel-to-pixel graph, introduces M learnable
+    "super-node" prototypes that act as global scene codebook entries.
+
+    Three-step message passing:
+      1. **Gather**: Each super-node attends to all pixel nodes → absorbs
+         region-level statistics (O(NM) complexity).
+      2. **Process**: Super-nodes exchange information via a fully-connected
+         GCN layer (O(M²) complexity, M is tiny).
+      3. **Scatter**: Pixel nodes attend to refined super-nodes → receive
+         global context (O(NM) complexity).
+
+    Total complexity: O(NM + M²) << O(N²) when M << N.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        num_supernodes: int = 8,
+        num_heads: int = 4,
+        hidden_channels: int = 512,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_supernodes = num_supernodes
+        self.num_heads = num_heads
+        head_dim = in_channels // num_heads
+
+        # Learnable super-node embeddings (scene prototypes)
+        self.prototypes = nn.Parameter(
+            torch.randn(1, num_supernodes, in_channels) * 0.02
+        )
+
+        # Gather: pixel → super-node cross-attention
+        self.gather_q = nn.Linear(in_channels, in_channels, bias=False)
+        self.gather_k = nn.Linear(in_channels, in_channels, bias=False)
+        self.gather_v = nn.Linear(in_channels, in_channels, bias=False)
+
+        # Process: super-node ↔ super-node (small fully-connected GCN)
+        self.sn_conv = GCNConv(in_channels, hidden_channels)
+        self.sn_conv2 = GCNConv(hidden_channels, in_channels)
+
+        # Scatter: super-node → pixel cross-attention
+        self.scatter_q = nn.Linear(in_channels, in_channels, bias=False)
+        self.scatter_k = nn.Linear(in_channels, in_channels, bias=False)
+        self.scatter_v = nn.Linear(in_channels, in_channels, bias=False)
+
+        # Output projection with residual gate (initialised to 0 → identity)
+        self.out_proj = nn.Linear(in_channels, in_channels)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+        self._head_dim = head_dim
+        # Pre-build fully-connected edge_index for M super-nodes
+        src = []
+        tgt = []
+        for i in range(num_supernodes):
+            for j in range(num_supernodes):
+                src.append(i)
+                tgt.append(j)
+        self.register_buffer(
+            "_fc_edges",
+            torch.tensor([src, tgt], dtype=torch.long),
+        )
+
+    def _multihead_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Multi-head scaled dot-product attention.
+
+        Args:
+            q: [B, Nq, C]
+            k: [B, Nk, C]
+            v: [B, Nk, C]
+
+        Returns:
+            [B, Nq, C]
+        """
+        B, Nq, C = q.shape
+        Nk = k.shape[1]
+        H = self.num_heads
+        d = self._head_dim
+
+        q = q.view(B, Nq, H, d).transpose(1, 2)  # [B, H, Nq, d]
+        k = k.view(B, Nk, H, d).transpose(1, 2)  # [B, H, Nk, d]
+        v = v.view(B, Nk, H, d).transpose(1, 2)  # [B, H, Nk, d]
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) / (d**0.5)  # [B, H, Nq, Nk]
+        attn = attn.softmax(dim=-1)
+        out = torch.matmul(attn, v)  # [B, H, Nq, d]
+        return out.transpose(1, 2).contiguous().view(B, Nq, C)
+
+    def forward(
+        self,
+        feature_maps: torch.Tensor,
+        density_maps: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            feature_maps: [B, C, H, W] PA-FPN fused features.
+            density_maps: [B, 1, H, W] optional density (unused in current
+                          version; reserved for density-conditioned gather).
+
+        Returns:
+            [B, C, H, W] features enhanced with global super-node context.
+        """
+        B, C, H, W = feature_maps.shape
+        N = H * W
+        M = self.num_supernodes
+
+        # Flatten spatial dims: [B, N, C]
+        pixels = feature_maps.permute(0, 2, 3, 1).contiguous().view(B, N, C)
+        protos = self.prototypes.expand(B, -1, -1)  # [B, M, C]
+
+        # --- Step 1: Gather (pixel → super-node) ---
+        q_g = self.gather_q(protos)  # [B, M, C]
+        k_g = self.gather_k(pixels)  # [B, N, C]
+        v_g = self.gather_v(pixels)  # [B, N, C]
+        supernodes = self._multihead_attn(q_g, k_g, v_g)  # [B, M, C]
+
+        # --- Step 2: Process (super-node ↔ super-node GCN) ---
+        # Flatten batch for torch_geometric
+        sn_flat = supernodes.view(B * M, C)
+        batch_offset = torch.arange(B, device=feature_maps.device).view(B, 1, 1) * M
+        edges = self._fc_edges.unsqueeze(0).expand(B, -1, -1) + batch_offset
+        edges = edges.view(2, -1)  # [2, B*M*M]
+        sn_flat = F.relu(self.sn_conv(sn_flat, edges))
+        sn_flat = F.dropout(sn_flat, p=0.3, training=self.training)
+        sn_flat = F.relu(self.sn_conv2(sn_flat, edges))
+        supernodes_refined = sn_flat.view(B, M, C)
+
+        # --- Step 3: Scatter (super-node → pixel) ---
+        q_s = self.scatter_q(pixels)  # [B, N, C]
+        k_s = self.scatter_k(supernodes_refined)  # [B, M, C]
+        v_s = self.scatter_v(supernodes_refined)  # [B, M, C]
+        pixel_update = self._multihead_attn(q_s, k_s, v_s)  # [B, N, C]
+
+        # Gated residual (gate=0 at init → identity)
+        pixel_update = self.out_proj(pixel_update)
+        enhanced = pixels + self.gate.tanh() * pixel_update
+
+        return enhanced.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()

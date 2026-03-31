@@ -75,6 +75,16 @@ def base_cfg():
                     "hidden_dim": 256,
                     "share_weights": True,
                 },
+                "gcn_mode": "fixed",
+                "gcn_num_supernodes": 8,
+                "gcn_supernode_heads": 4,
+                "use_freq_head": False,
+                "freq_head_kernel": 3,
+                "use_subpix_refine": False,
+                "subpix_refine": {
+                    "top_k": 512,
+                    "hidden_dim": 128,
+                },
             },
             "optimizer": {
                 "name": "adam",

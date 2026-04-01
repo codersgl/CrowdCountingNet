@@ -19,3 +19,4 @@ wheels/
 /checkpoints
 /runs
 *.zip
+*.pdf

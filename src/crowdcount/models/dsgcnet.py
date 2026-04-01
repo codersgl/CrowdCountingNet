@@ -13,6 +13,7 @@ from crowdcount.models.gcn import (
 )
 from crowdcount.models.head import (
     ClassificationModel,
+    DensityAttentionMask,
     Density_pred,
     FreqDecoupledRouter,
     PointRefineModule,
@@ -103,6 +104,8 @@ class DSGCnet(nn.Module):
         refine_cfg: DictConfig | None = None,
         use_freq_head: bool = False,
         freq_head_kernel: int = 3,
+        use_density_attention: bool = False,
+        density_attention_mode: str = "sigmoid",
         use_subpix_refine: bool = False,
         subpix_refine_cfg: DictConfig | None = None,
     ):
@@ -116,6 +119,7 @@ class DSGCnet(nn.Module):
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
         self.use_freq_head = use_freq_head
+        self.use_density_attention = use_density_attention
         self.use_subpix_refine = use_subpix_refine
         self._gcn_mode = gcn_mode
 
@@ -148,6 +152,11 @@ class DSGCnet(nn.Module):
         else:
             self.pa = Decoder_SPD_PAFPN(256, 512, 512, use_dcn=use_dcn)
         self.density_pred = Density_pred()
+        self.density_attention: DensityAttentionMask | None = (
+            DensityAttentionMask(mode=density_attention_mode)
+            if use_density_attention
+            else None
+        )
 
         # Multi-scale density prediction (optional)
         if self.use_multi_scale_density:
@@ -616,6 +625,12 @@ class DSGCnet(nn.Module):
             output_dict["moe_weights"] = light_weights
 
         # SEMC post-GCN enhancement (optional, disabled by default)
+        if self.density_attention is not None:
+            attention_mask = self.density_attention(density.detach()).to(
+                feature_fl.dtype
+            )
+            feature_fl = feature_fl * attention_mask
+
         if self.semc_enhancer is not None and not self.use_moe:
             feature_fl = self.semc_enhancer(
                 feature_fl,

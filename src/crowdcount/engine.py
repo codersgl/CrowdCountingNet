@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import sys
-from typing import Iterable, Optional
+from typing import Iterable, Optional, cast
 
 import torch
 import torch.nn as nn
@@ -29,6 +29,7 @@ def train_one_epoch(
     epoch: int,
     max_norm: float = 0,
     cfg=None,
+    ssim_criterion: nn.Module | None = None,
 ) -> dict:
     """Train for one epoch.
 
@@ -55,6 +56,20 @@ def train_one_epoch(
     )
     density_loss_weight = (
         float(getattr(cfg, "density_loss_weight", 0.01)) if cfg is not None else 0.01
+    )
+    density_ssim_cfg = getattr(cfg, "density_ssim", None) if cfg is not None else None
+    use_density_ssim = (
+        bool(
+            getattr(density_ssim_cfg, "enabled", False)
+            if density_ssim_cfg is not None
+            else False
+        )
+        and ssim_criterion is not None
+    )
+    density_ssim_weight = (
+        float(getattr(density_ssim_cfg, "weight", 0.005))
+        if density_ssim_cfg is not None
+        else 0.005
     )
     model_moe_cfg = getattr(getattr(cfg, "model", None), "moe", None)
     moe_aux_weight = (
@@ -96,9 +111,14 @@ def train_one_epoch(
         else:
             outputs = model(samples)
         loss_dict = criterion(outputs, targets)
-        weight_dict = criterion.weight_dict
+        weight_dict = cast(dict[str, torch.Tensor | float], criterion.weight_dict)
         losses = sum(
-            loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict
+            (
+                loss_dict[k] * weight_dict[k]
+                for k in loss_dict.keys()
+                if k in weight_dict
+            ),
+            torch.tensor(0.0, device=samples.device),
         )
 
         et_dmap = outputs["density_out"]
@@ -182,6 +202,12 @@ def train_one_epoch(
                 * density_loss_weight
             )
 
+        density_ssim_loss = torch.tensor(0.0, device=samples.device)
+        if use_density_ssim:
+            assert ssim_criterion is not None
+            density_ssim_loss = density_ssim_weight * ssim_criterion(et_dmap, gt_dmap)
+            density_loss = density_loss + density_ssim_loss
+
         moe_aux_total = outputs.get("moe_aux_total")
         moe_aux_component = torch.tensor(0.0, device=samples.device)
         if moe_aux_total is not None:
@@ -198,7 +224,10 @@ def train_one_epoch(
             for k, v in loss_dict_reduced.items()
             if k in weight_dict
         }
-        losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
+        losses_reduced_scaled = sum(
+            loss_dict_reduced_scaled.values(),
+            torch.tensor(0.0, device=samples.device),
+        )
         loss_value = losses_reduced_scaled.item()
 
         if not math.isfinite(loss_sum.item()):
@@ -228,6 +257,8 @@ def train_one_epoch(
             **loss_dict_reduced_scaled,
             **loss_dict_reduced_unscaled,
         )
+        if use_density_ssim:
+            metric_logger.update(den_ssim=density_ssim_loss.item())
 
         if moe_aux_total is not None:
             metric_logger.update(
@@ -301,13 +332,9 @@ def evaluate_crowd_no_overlap(
             "evaluate_crowd_no_overlap expects batch_size=1"
         )
         outputs_scores = outputs_scores[0]
-        outputs_points = outputs["pred_points"][0]
         gt_cnt = targets[0]["point"].shape[0]
         threshold = 0.5
 
-        points = (
-            outputs_points[outputs_scores > threshold].detach().cpu().numpy().tolist()
-        )
         predict_cnt = int((outputs_scores > threshold).sum())
 
         mae = abs(predict_cnt - gt_cnt)

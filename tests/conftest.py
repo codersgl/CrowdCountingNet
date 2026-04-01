@@ -40,6 +40,12 @@ def base_cfg():
             "start_epoch": 0,
             "checkpoints_dir": "/tmp/test_ckpts",
             "tensorboard_dir": "/tmp/test_runs",
+            "density_ssim": {
+                "enabled": False,
+                "weight": 0.005,
+                "window_size": 7,
+                "sigma": 1.5,
+            },
             "data": {
                 "dataset": "SHHA",
                 "data_root": "",
@@ -80,6 +86,8 @@ def base_cfg():
                 "gcn_supernode_heads": 4,
                 "use_freq_head": False,
                 "freq_head_kernel": 3,
+                "use_density_attention": False,
+                "density_attention_mode": "sigmoid",
                 "use_subpix_refine": False,
                 "subpix_refine": {
                     "top_k": 512,

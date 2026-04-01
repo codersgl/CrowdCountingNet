@@ -11,6 +11,8 @@ use_gm: false
 gm_input_dim: 256
 gm_hidden_dim: 128
 gm_spatial: true # true: per-pixel spatial gate | false: legacy global gate
+use_density_attention: false # Use density_out as a spatial attention mask on fused features
+density_attention_mode: sigmoid # sigmoid | learned
 use_msaa: false
 msaa_in_channels: 1280
 msaa_reduction: 4

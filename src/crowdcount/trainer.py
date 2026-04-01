@@ -9,6 +9,7 @@ import os
 import random
 import time
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import torch
@@ -22,6 +23,7 @@ from crowdcount.data import build_dataset, collate_fn_crowd, collate_fn_crowd_tr
 from crowdcount.data.collate import collate_fn_crowd_depth, collate_fn_crowd_train_depth
 from crowdcount.engine import evaluate_crowd_no_overlap, train_one_epoch
 from crowdcount.models import build_model
+from crowdcount.models.ssim_loss import SSIMLoss
 from crowdcount.utils.logging import logger, setup_logger
 from crowdcount.utils.misc import get_rank
 
@@ -52,12 +54,22 @@ class Trainer:
         setup_logger(log_dir=str(hydra_output), log_file="train.log")
 
         # Model
-        model, criterion = build_model(cfg, training=True)
+        model, criterion = cast(
+            tuple[nn.Module, nn.Module], build_model(cfg, training=True)
+        )
         model.to(self.device)
         criterion.to(self.device)
         self.model = model
         self.criterion = criterion
         self.density_criterion = nn.MSELoss(reduction="sum").to(self.device)
+        density_ssim_cfg = getattr(cfg, "density_ssim", None)
+        if bool(getattr(density_ssim_cfg, "enabled", False)):
+            self.ssim_criterion: nn.Module | None = SSIMLoss(
+                window_size=int(getattr(density_ssim_cfg, "window_size", 11)),
+                sigma=float(getattr(density_ssim_cfg, "sigma", 1.5)),
+            ).to(self.device)
+        else:
+            self.ssim_criterion = None
 
         self.use_moe = bool(getattr(self.model, "supports_moe", lambda: False)())
         self.use_depth = bool(getattr(cfg.model, "use_depth", False))
@@ -139,9 +151,10 @@ class Trainer:
             if not reset_opt and "lr_scheduler" in ckpt:
                 self.lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
             if "moe_temperature" in ckpt and ckpt["moe_temperature"] is not None:
-                if hasattr(model, "moe"):
-                    model.moe.temperature = ckpt["moe_temperature"]
-                    model.moe.router.temperature = ckpt["moe_temperature"]
+                moe_module = getattr(model, "moe", None)
+                if moe_module is not None:
+                    moe_module.temperature = ckpt["moe_temperature"]
+                    moe_module.router.temperature = ckpt["moe_temperature"]
             if "epoch" in ckpt and not reset_opt:
                 cfg.start_epoch = ckpt["epoch"] + 1
             if "mae_history" in ckpt:
@@ -214,12 +227,9 @@ class Trainer:
         step = 0
 
         for epoch in range(cfg.start_epoch, cfg.epochs):
-            if (
-                self.use_moe
-                and hasattr(self.model, "moe")
-                and self.model.moe is not None
-            ):
-                self.model.moe.update_noise_scale(epoch / cfg.epochs)
+            moe_module = getattr(self.model, "moe", None)
+            if self.use_moe and moe_module is not None:
+                moe_module.update_noise_scale(epoch / cfg.epochs)
 
             t1 = time.time()
             stat = train_one_epoch(
@@ -232,6 +242,7 @@ class Trainer:
                 epoch,
                 cfg.clip_max_norm,
                 cfg=cfg,  # Pass config for multi-scale density prediction
+                ssim_criterion=self.ssim_criterion,
             )
             t2 = time.time()
 
@@ -251,6 +262,11 @@ class Trainer:
 
             # Save latest checkpoint
             ckpt_path = self.checkpoints_dir / "latest.pth"
+            moe_temperature = (
+                getattr(moe_module, "temperature", None)
+                if moe_module is not None
+                else None
+            )
             torch.save(
                 {
                     "model": self.model.state_dict(),
@@ -259,9 +275,7 @@ class Trainer:
                     "epoch": epoch,
                     "mae_history": mae_history,
                     "density_mae_history": density_mae_history,
-                    "moe_temperature": self.model.moe.temperature
-                    if hasattr(self.model, "moe") and self.model.moe is not None
-                    else None,
+                    "moe_temperature": moe_temperature,
                 },
                 ckpt_path,
             )
@@ -307,9 +321,7 @@ class Trainer:
                             "epoch": epoch,
                             "mae_history": mae_history,
                             "density_mae_history": density_mae_history,
-                            "moe_temperature": self.model.moe.temperature
-                            if hasattr(self.model, "moe") and self.model.moe is not None
-                            else None,
+                            "moe_temperature": moe_temperature,
                         },
                         self.checkpoints_dir / "best_mae.pth",
                     )

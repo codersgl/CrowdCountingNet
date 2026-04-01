@@ -15,6 +15,38 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class DensityAttentionMask(nn.Module):
+    """Convert density maps into a broadcastable spatial attention mask."""
+
+    def __init__(self, mode: str = "sigmoid", hidden_channels: int = 16) -> None:
+        super().__init__()
+        if mode not in {"sigmoid", "learned"}:
+            raise ValueError(
+                f"Unsupported density attention mode={mode}, expected 'sigmoid' or 'learned'"
+            )
+        self.mode = mode
+
+        if mode == "sigmoid":
+            self.scale = nn.Parameter(torch.tensor(1.0))
+            self.bias = nn.Parameter(torch.tensor(0.0))
+            self.proj = None
+        else:
+            self.scale = None
+            self.bias = None
+            self.proj = nn.Sequential(
+                nn.Conv2d(1, hidden_channels, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_channels, 1, kernel_size=1),
+            )
+
+    def forward(self, density: torch.Tensor) -> torch.Tensor:
+        if self.mode == "sigmoid":
+            assert self.scale is not None and self.bias is not None
+            return torch.sigmoid(density * self.scale + self.bias)
+        assert self.proj is not None
+        return torch.sigmoid(self.proj(density))
+
+
 class SharedPredictionTrunk(nn.Module):
     """Shared 2-layer conv feature extractor for regression and classification heads.
 
@@ -197,8 +229,10 @@ class SubPixelRefineModule(nn.Module):
             nn.Linear(hidden_dim, 2),
         )
         # Initialize to zero offset (identity residual)
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        output_layer = self.mlp[-1]
+        assert isinstance(output_layer, nn.Linear)
+        nn.init.zeros_(output_layer.weight)
+        nn.init.zeros_(output_layer.bias)
 
     @staticmethod
     def _sample_at(

@@ -25,6 +25,15 @@ tensorboard_dir: runs/dsgc
 
 density_loss_weight: 0.01 # Global scale factor applied to all density map losses
 
+density_ssim:
+  enabled: false # Add SSIM structure loss on the main density map
+  weight: 0.005 # Relative weight of SSIM loss before adding into den_loss
+  # window_size: density maps are downsampled to 16x16 before SSIM.
+  # ws=11 → 14% interior coverage; ws=7 → 39%; ws=5 → 56%.
+  # Recommend 7 for 16x16 targets, 11 for full-resolution if used elsewhere.
+  window_size: 7 # Must be odd; 7 is a good default for 16x16 density maps
+  sigma: 1.5 # Gaussian kernel sigma for SSIM window
+
 # Iterative Point Refinement loss weight (only used when model.use_refine: true)
 refine_loss_weight: 0.001
 

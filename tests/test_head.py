@@ -7,10 +7,12 @@ import torch
 
 from crowdcount.models.head import (
     ClassificationModel,
+    DensityAttentionMask,
     Density_pred,
     RegressionModel,
     SharedPredictionTrunk,
 )
+from crowdcount.models.ssim_loss import SSIMLoss
 
 
 @pytest.fixture
@@ -108,3 +110,28 @@ def test_shared_trunk_is_distinct_from_heads():
     cls_ids = {id(p) for p in cls.parameters()}
     assert trunk_ids.isdisjoint(reg_ids)
     assert trunk_ids.isdisjoint(cls_ids)
+
+
+@pytest.mark.parametrize("mode", ["sigmoid", "learned"])
+def test_density_attention_mask_shape_and_range(mode):
+    mask = DensityAttentionMask(mode=mode)
+    density = torch.rand(2, 1, 16, 16)
+    out = mask(density)
+    assert out.shape == density.shape
+    assert (out >= 0).all()
+    assert (out <= 1).all()
+
+
+def test_ssim_loss_zero_for_identical_maps():
+    criterion = SSIMLoss(window_size=11, sigma=1.5)
+    density = torch.rand(2, 1, 16, 16)
+    loss = criterion(density, density)
+    assert torch.allclose(loss, torch.tensor(0.0), atol=1e-5)
+
+
+def test_ssim_loss_positive_for_different_maps():
+    criterion = SSIMLoss(window_size=11, sigma=1.5)
+    pred = torch.zeros(2, 1, 16, 16)
+    target = torch.ones(2, 1, 16, 16)
+    loss = criterion(pred, target)
+    assert loss > 0

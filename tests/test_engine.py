@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 from crowdcount.engine import evaluate_crowd_no_overlap, train_one_epoch
 from crowdcount.models.criterion import SetCriterion_Crowd
 from crowdcount.models.matcher import HungarianMatcher_Crowd
+from crowdcount.models.ssim_loss import SSIMLoss
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +106,44 @@ def test_train_one_epoch_loss_decreases_with_steps():
         model, criterion, loader, optimizer, density_criterion, device, epoch=0
     )
     assert torch.isfinite(torch.tensor(stat["loss_sum"]))
+
+
+def test_train_one_epoch_with_density_ssim_reports_metric():
+    model = DummyDSGC()
+    matcher = HungarianMatcher_Crowd(cost_class=1.0, cost_point=0.05)
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_points": 0.0002},
+        eos_coef=0.5,
+        losses=["labels", "points"],
+    )
+    density_criterion = nn.MSELoss(reduction="sum")
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    loader = [_make_train_batch()]
+    device = torch.device("cpu")
+    cfg = OmegaConf.create(
+        {
+            "density_loss_weight": 0.01,
+            "density_ssim": {"enabled": True, "weight": 0.005},
+            "model": {},
+        }
+    )
+
+    stat = train_one_epoch(
+        model,
+        criterion,
+        loader,
+        optimizer,
+        density_criterion,
+        device,
+        epoch=0,
+        cfg=cfg,
+        ssim_criterion=SSIMLoss(),
+    )
+
+    assert "den_ssim" in stat
+    assert stat["den_ssim"] >= 0
 
 
 # ---------------------------------------------------------------------------

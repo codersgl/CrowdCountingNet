@@ -50,6 +50,8 @@ def build_model(cfg: DictConfig, training: bool = False):
         gcn_supernode_heads=getattr(cfg.model, "gcn_supernode_heads", 4),
         use_freq_head=getattr(cfg.model, "use_freq_head", False),
         freq_head_kernel=getattr(cfg.model, "freq_head_kernel", 3),
+        use_density_attention=getattr(cfg.model, "use_density_attention", False),
+        density_attention_mode=getattr(cfg.model, "density_attention_mode", "sigmoid"),
         use_subpix_refine=getattr(cfg.model, "use_subpix_refine", False),
         subpix_refine_cfg=getattr(cfg.model, "subpix_refine", None),
     )

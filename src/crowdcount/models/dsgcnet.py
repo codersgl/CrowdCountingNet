@@ -10,6 +10,7 @@ from crowdcount.models.gcn import (
     DensityGCNProcessor,
     FeatureGCNProcessor,
     SuperNodeGCNProcessor,
+    compute_uncertainty,
 )
 from crowdcount.models.head import (
     ClassificationModel,
@@ -108,6 +109,8 @@ class DSGCnet(nn.Module):
         density_attention_mode: str = "sigmoid",
         use_subpix_refine: bool = False,
         subpix_refine_cfg: DictConfig | None = None,
+        use_uncertainty: bool = False,
+        uncertainty_scale: float = 6.0,
     ):
         super().__init__()
         self.backbone = backbone
@@ -122,6 +125,7 @@ class DSGCnet(nn.Module):
         self.use_density_attention = use_density_attention
         self.use_subpix_refine = use_subpix_refine
         self._gcn_mode = gcn_mode
+        self.use_uncertainty = use_uncertainty
 
         if self.fusion_mode not in {"gcn", "esca_moe", "gcn_moe"}:
             raise ValueError(
@@ -224,6 +228,8 @@ class DSGCnet(nn.Module):
                     k_min=gcn_k_min,
                     k_max=gcn_k_max,
                     density_scale=gcn_density_scale,
+                    use_uncertainty=use_uncertainty,
+                    uncertainty_scale=uncertainty_scale,
                 )
                 self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(
                     k=gcn_k,
@@ -546,11 +552,17 @@ class DSGCnet(nn.Module):
         batch_size = features_list[0].shape[0]
         density = self.density_pred(features_pa)
 
+        # Uncertainty map from density prediction (detach to avoid gradient leak)
+        uncertainty = (
+            compute_uncertainty(density.detach()) if self.use_uncertainty else None
+        )
+
         # Multi-scale density prediction (if enabled)
         output_dict = {
             "pred_logits": None,
             "pred_points": None,
             "density_out": density,
+            "uncertainty_map": uncertainty,
             "moe_aux_losses": None,
             "moe_aux_total": None,
             "moe_weights": None,
@@ -585,7 +597,9 @@ class DSGCnet(nn.Module):
             else:
                 assert self.density_gcn is not None
                 assert self.feature_gcn is not None
-                density_gcn_feature = self.density_gcn(density, features_pa)
+                density_gcn_feature = self.density_gcn(
+                    density, features_pa, uncertainty=uncertainty
+                )
                 feature_gcn_feature = self.feature_gcn(features_pa)
                 if self.gm is not None:
                     gate_weight = self.gm(features_pa)

@@ -58,6 +58,8 @@ class SetCriterion_Crowd(nn.Module):
         use_focal_loss: bool = False,
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
+        use_uncertainty_weighting: bool = False,
+        uncertainty_boost: float = 2.0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -68,6 +70,8 @@ class SetCriterion_Crowd(nn.Module):
         self.use_focal_loss = use_focal_loss
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
+        self.use_uncertainty_weighting = use_uncertainty_weighting
+        self.uncertainty_boost = uncertainty_boost
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[0] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
@@ -109,6 +113,35 @@ class SetCriterion_Crowd(nn.Module):
         loss_bbox = F.smooth_l1_loss(
             src_points, target_points, reduction="none", beta=1.0
         )
+
+        # Uncertainty weighting: boost loss for points in high-uncertainty regions
+        uncertainty_map = outputs.get("uncertainty_map")
+        if self.use_uncertainty_weighting and uncertainty_map is not None:
+            # Sample uncertainty at each matched GT point location
+            # target_points are in pixel coords; uncertainty_map is [B,1,H,W]
+            _, _, H_unc, W_unc = uncertainty_map.shape
+            per_point_unc = []
+            for b_val, t_pts, (_, J) in zip(range(len(targets)), targets, indices):
+                pts = t_pts["point"][J]  # [n, 2] in pixel coords
+                if pts.numel() == 0:
+                    continue
+                # Normalise coords to [-1, 1] for grid_sample
+                grid_x = (pts[:, 0] / max(W_unc - 1, 1)) * 2.0 - 1.0
+                grid_y = (pts[:, 1] / max(H_unc - 1, 1)) * 2.0 - 1.0
+                grid = torch.stack([grid_x, grid_y], dim=-1).view(1, 1, -1, 2)
+                sampled = F.grid_sample(
+                    uncertainty_map[b_val : b_val + 1],
+                    grid,
+                    mode="bilinear",
+                    padding_mode="border",
+                    align_corners=True,
+                )  # [1, 1, 1, n]
+                per_point_unc.append(sampled.view(-1))
+            if per_point_unc:
+                unc_weights = torch.cat(per_point_unc, dim=0)  # [total_matched]
+                weights = 1.0 + self.uncertainty_boost * unc_weights  # [1, 1+boost]
+                loss_bbox = loss_bbox * weights.unsqueeze(-1)
+
         return {"loss_points": loss_bbox.sum() / num_points}
 
     def loss_count(self, outputs, targets, indices, num_points):
@@ -183,6 +216,7 @@ class SetCriterion_Crowd(nn.Module):
             "pred_logits": outputs["pred_logits"],
             "pred_points": outputs["pred_points"],
             "refine_intermediates": outputs.get("refine_intermediates"),
+            "uncertainty_map": outputs.get("uncertainty_map"),
         }
         indices1 = self.matcher(output1, targets)
 

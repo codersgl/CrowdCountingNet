@@ -13,6 +13,8 @@ from crowdcount.models.gcn import (
     FeatureGCNProcessor,
     FeatureGraphBuilder,
     GCNModel,
+    UncertaintyAdaptiveDensityGraphBuilder,
+    compute_uncertainty,
 )
 
 
@@ -147,4 +149,97 @@ def test_adaptive_feature_gcn_processor_output_shape(small_feature_map):
         sim_threshold=0.3,
     )
     out = proc(small_feature_map)
+    assert out.shape == small_feature_map.shape
+
+
+# ---------------------------------------------------------------------------
+# Uncertainty
+# ---------------------------------------------------------------------------
+
+
+def test_compute_uncertainty_output_range():
+    density = torch.randn(2, 1, 8, 8)
+    unc = compute_uncertainty(density)
+    assert unc.shape == (2, 1, 8, 8)
+    assert unc.min() >= 0.0 - 1e-5
+    assert unc.max() <= 1.0 + 1e-5
+
+
+def test_compute_uncertainty_uniform_density():
+    """Uniform density should produce near-zero uncertainty range."""
+    density = torch.ones(1, 1, 4, 4) * 5.0
+    unc = compute_uncertainty(density)
+    assert unc.max() - unc.min() < 0.01
+
+
+def test_uncertainty_adaptive_graph_builder(small_density_map):
+    unc = compute_uncertainty(small_density_map)
+    builder = UncertaintyAdaptiveDensityGraphBuilder(
+        k_base=3, k_min=2, k_max=8, uncertainty_scale=6.0
+    )
+    edge_index, num_nodes_total, H, W = builder.build_batch_graph(
+        small_density_map, uncertainty=unc
+    )
+    assert edge_index.shape[0] == 2
+    assert num_nodes_total == 2 * 8 * 8
+
+
+def test_uncertainty_builder_more_edges_for_high_uncertainty():
+    """High-uncertainty regions should produce more graph edges."""
+    density = torch.rand(1, 1, 4, 4)
+    unc = torch.zeros(1, 1, 4, 4)
+    unc[:, :, :2, :] = 1.0  # high uncertainty top rows
+    builder = UncertaintyAdaptiveDensityGraphBuilder(
+        k_base=2, k_min=2, k_max=6, uncertainty_scale=4.0
+    )
+    edge_index, _, _, _ = builder.build_batch_graph(density, uncertainty=unc)
+    num_nodes = 4 * 4
+    num_edges_no_self = edge_index.shape[1] - num_nodes
+    assert num_edges_no_self > num_nodes * 2  # more than k_min=2 per node on average
+
+
+def test_uncertainty_builder_fallback_without_uncertainty(small_density_map):
+    """Without uncertainty, should fall back to density-based modulation."""
+    builder = UncertaintyAdaptiveDensityGraphBuilder(
+        k_base=3, k_min=2, k_max=6, density_scale=2.0
+    )
+    edge_index, num_nodes_total, H, W = builder.build_batch_graph(
+        small_density_map, uncertainty=None
+    )
+    assert edge_index.shape[0] == 2
+    assert num_nodes_total == 2 * 8 * 8
+
+
+def test_density_gcn_processor_with_uncertainty(small_feature_map, small_density_map):
+    proc = DensityGCNProcessor(
+        k=3,
+        in_channels=256,
+        hidden_channels=128,
+        out_channels=256,
+        adaptive=True,
+        k_min=2,
+        k_max=6,
+        use_uncertainty=True,
+        uncertainty_scale=4.0,
+    )
+    unc = compute_uncertainty(small_density_map)
+    out = proc(small_density_map, small_feature_map, uncertainty=unc)
+    assert out.shape == small_feature_map.shape
+
+
+def test_density_gcn_processor_uncertainty_none_fallback(
+    small_feature_map, small_density_map
+):
+    """use_uncertainty=True but uncertainty=None should still work (fallback)."""
+    proc = DensityGCNProcessor(
+        k=3,
+        in_channels=256,
+        hidden_channels=128,
+        out_channels=256,
+        adaptive=True,
+        k_min=2,
+        k_max=6,
+        use_uncertainty=True,
+    )
+    out = proc(small_density_map, small_feature_map, uncertainty=None)
     assert out.shape == small_feature_map.shape

@@ -54,6 +54,8 @@ def build_model(cfg: DictConfig, training: bool = False):
         density_attention_mode=getattr(cfg.model, "density_attention_mode", "sigmoid"),
         use_subpix_refine=getattr(cfg.model, "use_subpix_refine", False),
         subpix_refine_cfg=getattr(cfg.model, "subpix_refine", None),
+        use_uncertainty=getattr(cfg.model, "use_uncertainty", False),
+        uncertainty_scale=float(getattr(cfg.model, "uncertainty_scale", 6.0)),
     )
 
     if not training:
@@ -87,6 +89,8 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_focal_loss=use_focal,
         focal_alpha=focal_alpha,
         focal_gamma=focal_gamma,
+        use_uncertainty_weighting=getattr(cfg.model, "use_uncertainty", False),
+        uncertainty_boost=float(getattr(cfg.model, "uncertainty_boost", 2.0)),
     )
     return model, criterion
 

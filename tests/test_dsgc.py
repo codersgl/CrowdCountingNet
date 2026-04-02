@@ -597,3 +597,26 @@ def test_gcn_moe_with_gm() -> None:
         out = model(torch.zeros(1, 3, 128, 128))
     assert out["pred_logits"] is not None
     assert out["moe_weights"] is not None
+
+
+def test_uncertainty_forward() -> None:
+    """DSGCnet with use_uncertainty=True should produce uncertainty_map in output."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        gcn_adaptive=True,
+        use_uncertainty=True,
+        uncertainty_scale=6.0,
+    ).eval()
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+    assert "uncertainty_map" in out
+    assert out["uncertainty_map"].shape[0] == 2
+    # uncertainty should be in [0, 1]
+    assert out["uncertainty_map"].min() >= 0.0
+    assert out["uncertainty_map"].max() <= 1.0
+    # other outputs still present
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_points"].shape[0] == 2

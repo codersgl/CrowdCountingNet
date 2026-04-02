@@ -1,7 +1,7 @@
 """GCN modules for DSGCNet.
 
 Density-guided and feature-guided graph convolutional processors.
-Supports fixed-k, adaptive, and super-node graph construction strategies.
+Supports fixed-k, adaptive, uncertainty-guided, and super-node graph construction strategies.
 """
 
 import torch
@@ -9,6 +9,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import add_self_loops
+
+
+def compute_uncertainty(density: torch.Tensor) -> torch.Tensor:
+    """Compute pixel-wise uncertainty from a density prediction.
+
+    Uses binary entropy of the sigmoid-normalised density as the
+    uncertainty measure: u = -p*log(p) - (1-p)*log(1-p), then
+    min-max normalised per image to [0, 1].
+
+    Args:
+        density: [B, 1, H, W] raw density prediction (detached recommended).
+
+    Returns:
+        [B, 1, H, W] uncertainty map in [0, 1].
+    """
+    p = density.sigmoid()  # [B, 1, H, W] in (0, 1)
+    eps = 1e-6
+    entropy = -(p * torch.log(p + eps) + (1 - p) * torch.log(1 - p + eps))  # [B,1,H,W]
+    # Per-image min-max normalisation
+    B = entropy.shape[0]
+    flat = entropy.view(B, -1)  # [B, N]
+    e_min = flat.min(dim=1, keepdim=True).values.view(B, 1, 1, 1)
+    e_max = flat.max(dim=1, keepdim=True).values.view(B, 1, 1, 1)
+    return (entropy - e_min) / (e_max - e_min + eps)
 
 
 class DensityGraphBuilder:
@@ -91,6 +115,82 @@ class AdaptiveDensityGraphBuilder:
         ]  # [B, N, k_max]
 
         # Boolean mask: keep only the first k_per_node[b, i] neighbours
+        range_idx = torch.arange(self.k_max, device=device).view(1, 1, -1)
+        mask = range_idx < k_per_node.unsqueeze(2)  # [B, N, k_max]
+
+        batch_offset = torch.arange(B, device=device).view(B, 1, 1) * num_nodes
+        src = (
+            torch.arange(num_nodes, device=device)
+            .view(1, -1, 1)
+            .expand(B, num_nodes, self.k_max)
+            + batch_offset
+        )
+        tgt = sorted_indices + batch_offset
+
+        edge_index = torch.stack([src[mask], tgt[mask]], dim=0)
+        num_nodes_total = B * num_nodes
+        edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes_total)
+        return edge_index, num_nodes_total, H, W
+
+
+class UncertaintyAdaptiveDensityGraphBuilder:
+    """Uncertainty-guided adaptive graph builder.
+
+    Like AdaptiveDensityGraphBuilder but uses an external uncertainty map
+    (instead of density) to modulate per-node k: higher uncertainty → more
+    neighbours, giving GCN more context to disambiguate hard regions.
+    Falls back to density-based modulation when no uncertainty is provided.
+    """
+
+    def __init__(
+        self,
+        k_base: int = 4,
+        k_min: int = 2,
+        k_max: int = 8,
+        density_scale: float = 4.0,
+        uncertainty_scale: float = 6.0,
+    ):
+        self.k_base = k_base
+        self.k_min = k_min
+        self.k_max = k_max
+        self.density_scale = density_scale
+        self.uncertainty_scale = uncertainty_scale
+
+    def build_batch_graph(
+        self,
+        density_maps: torch.Tensor,
+        uncertainty: torch.Tensor | None = None,
+    ):
+        B, C, H, W = density_maps.shape
+        num_nodes = H * W
+        device = density_maps.device
+        flat_density = density_maps.view(B, -1)  # [B, N]
+
+        # Decide modulation source: uncertainty if available, else density
+        if uncertainty is not None:
+            mod_map = uncertainty.view(B, -1)  # already in [0, 1]
+            scale = self.uncertainty_scale
+        else:
+            d_min = flat_density.min(dim=1, keepdim=True).values
+            d_max = flat_density.max(dim=1, keepdim=True).values
+            mod_map = (flat_density - d_min) / (d_max - d_min + 1e-8)
+            scale = self.density_scale
+
+        k_per_node = torch.clamp(
+            torch.round(
+                torch.tensor(self.k_base, dtype=torch.float32, device=device)
+                + scale * mod_map
+            ).long(),
+            min=self.k_min,
+            max=self.k_max,
+        )  # [B, N]
+
+        # Pairwise density distance → top-k_max candidates
+        dist = torch.abs(flat_density.unsqueeze(2) - flat_density.unsqueeze(1))
+        sorted_indices = torch.argsort(dist, dim=2)[
+            :, :, 1 : self.k_max + 1
+        ]  # [B, N, k_max]
+
         range_idx = torch.arange(self.k_max, device=device).view(1, 1, -1)
         mask = range_idx < k_per_node.unsqueeze(2)  # [B, N, k_max]
 
@@ -236,9 +336,20 @@ class DensityGCNProcessor(nn.Module):
         k_min: int = 2,
         k_max: int = 8,
         density_scale: float = 4.0,
+        use_uncertainty: bool = False,
+        uncertainty_scale: float = 6.0,
     ):
         super().__init__()
-        if adaptive:
+        self._use_uncertainty = use_uncertainty
+        if use_uncertainty and adaptive:
+            self.graph_builder = UncertaintyAdaptiveDensityGraphBuilder(
+                k_base=k,
+                k_min=k_min,
+                k_max=k_max,
+                density_scale=density_scale,
+                uncertainty_scale=uncertainty_scale,
+            )
+        elif adaptive:
             self.graph_builder = AdaptiveDensityGraphBuilder(
                 k_base=k, k_min=k_min, k_max=k_max, density_scale=density_scale
             )
@@ -247,10 +358,20 @@ class DensityGCNProcessor(nn.Module):
         self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
 
     def forward(
-        self, density_maps: torch.Tensor, feature_maps: torch.Tensor
+        self,
+        density_maps: torch.Tensor,
+        feature_maps: torch.Tensor,
+        uncertainty: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, in_channels, H, W = feature_maps.shape
-        edge_index, _, H, W = self.graph_builder.build_batch_graph(density_maps)
+        if self._use_uncertainty and isinstance(
+            self.graph_builder, UncertaintyAdaptiveDensityGraphBuilder
+        ):
+            edge_index, _, H, W = self.graph_builder.build_batch_graph(
+                density_maps, uncertainty=uncertainty
+            )
+        else:
+            edge_index, _, H, W = self.graph_builder.build_batch_graph(density_maps)
         node_features = (
             feature_maps.permute(0, 2, 3, 1).contiguous().view(-1, in_channels)
         )

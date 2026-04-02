@@ -244,3 +244,133 @@ def test_sigmoid_focal_loss_reduces_easy_examples():
     # Compare with gamma=0 (equivalent to weighted BCE)
     no_focus = sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=0.0)
     assert focal < no_focus, "Focal loss should be smaller than BCE for easy examples"
+
+
+# ---------------------------------------------------------------------------
+# Uncertainty weighting
+# ---------------------------------------------------------------------------
+
+
+def test_criterion_uncertainty_weighting_forward(dummy_outputs, dummy_targets, cfg):
+    """Criterion with uncertainty weighting should produce valid losses."""
+    matcher = build_matcher_crowd(cfg)
+    # Add uncertainty_map to outputs
+    dummy_outputs["uncertainty_map"] = torch.rand(2, 1, 16, 16)
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={
+            "loss_ce": 1,
+            "loss_points": cfg.model.point_loss_coef,
+            "loss_count": cfg.model.count_loss_coef,
+        },
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points", "count"],
+        use_uncertainty_weighting=True,
+        uncertainty_boost=2.0,
+    )
+    losses = criterion(dummy_outputs, dummy_targets)
+    assert "loss_points" in losses
+    assert torch.isfinite(losses["loss_points"])
+    assert losses["loss_points"].dim() == 0
+
+
+def test_uncertainty_weighting_boosts_loss(dummy_targets, cfg):
+    """High uncertainty should produce higher point regression loss."""
+    matcher = build_matcher_crowd(cfg)
+    B, Q = 2, 20
+    base_outputs = {
+        "pred_logits": torch.rand(B, Q, 2),
+        "pred_points": torch.rand(B, Q, 2) * 128,
+        "density_out": torch.rand(B, 1, 16, 16),
+    }
+
+    # Low uncertainty everywhere
+    low_unc_outputs = {**base_outputs, "uncertainty_map": torch.zeros(B, 1, 16, 16)}
+    # High uncertainty everywhere
+    high_unc_outputs = {**base_outputs, "uncertainty_map": torch.ones(B, 1, 16, 16)}
+
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={
+            "loss_ce": 1,
+            "loss_points": cfg.model.point_loss_coef,
+            "loss_count": cfg.model.count_loss_coef,
+        },
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points"],
+        use_uncertainty_weighting=True,
+        uncertainty_boost=2.0,
+    )
+    low_losses = criterion(low_unc_outputs, dummy_targets)
+    high_losses = criterion(high_unc_outputs, dummy_targets)
+    # High uncertainty should produce higher point loss (boosted by up to 3x)
+    assert high_losses["loss_points"] >= low_losses["loss_points"]
+
+
+def test_uncertainty_weighting_disabled_ignores_map(dummy_outputs, dummy_targets, cfg):
+    """When use_uncertainty_weighting=False, uncertainty_map should be ignored."""
+    matcher = build_matcher_crowd(cfg)
+    dummy_outputs["uncertainty_map"] = torch.ones(2, 1, 16, 16)
+    criterion_no_unc = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={
+            "loss_ce": 1,
+            "loss_points": cfg.model.point_loss_coef,
+            "loss_count": cfg.model.count_loss_coef,
+        },
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points"],
+        use_uncertainty_weighting=False,
+    )
+    dummy_outputs_no_map = {
+        k: v for k, v in dummy_outputs.items() if k != "uncertainty_map"
+    }
+    losses_with_map = criterion_no_unc(dummy_outputs, dummy_targets)
+    losses_without_map = criterion_no_unc(dummy_outputs_no_map, dummy_targets)
+    assert torch.allclose(
+        losses_with_map["loss_points"], losses_without_map["loss_points"]
+    )
+
+
+def test_uncertainty_weighting_samples_xy_coordinates_correctly(cfg):
+    """Uncertainty lookup should use point coordinates in x,y order."""
+    matcher = build_matcher_crowd(cfg)
+    outputs = {
+        "pred_logits": torch.tensor([[[0.1, 0.9]]], dtype=torch.float32),
+        "pred_points": torch.tensor([[[3.0, 1.0]]], dtype=torch.float32),
+        "density_out": torch.zeros(1, 1, 4, 4, dtype=torch.float32),
+        "uncertainty_map": torch.zeros(1, 1, 4, 4, dtype=torch.float32),
+    }
+    outputs["uncertainty_map"][0, 0, 1, 3] = 1.0
+    targets = [
+        {
+            "labels": torch.ones(1, dtype=torch.long),
+            "point": torch.tensor([[3.0, 1.0]], dtype=torch.float32),
+            "image_id": torch.tensor([0], dtype=torch.long),
+        }
+    ]
+
+    criterion_base = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_points": 1},
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points"],
+        use_uncertainty_weighting=False,
+    )
+    criterion_weighted = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_points": 1},
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points"],
+        use_uncertainty_weighting=True,
+        uncertainty_boost=2.0,
+    )
+
+    base_loss = criterion_base(outputs, targets)["loss_points"]
+    weighted_loss = criterion_weighted(outputs, targets)["loss_points"]
+    assert torch.allclose(weighted_loss, base_loss * 3.0)

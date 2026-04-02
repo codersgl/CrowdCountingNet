@@ -93,6 +93,9 @@ def base_cfg():
                     "top_k": 512,
                     "hidden_dim": 128,
                 },
+                "use_uncertainty": False,
+                "uncertainty_scale": 6.0,
+                "uncertainty_boost": 2.0,
             },
             "optimizer": {
                 "name": "adam",

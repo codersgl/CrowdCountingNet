@@ -29,6 +29,14 @@ gcn_k_max: 8 # adaptive mode: maximum neighbours per node
 gcn_density_scale: 4.0 # adaptive DensityGCN: scale factor for density → k mapping
 gcn_sim_threshold: 0.5 # adaptive FeatureGCN: cosine similarity threshold
 
+# Uncertainty-Guided Adaptive GCN (disabled by default)
+# Computes pixel-wise uncertainty from the density head and uses it to:
+# 1) modulate per-node k in the graph builder (high uncertainty → more neighbours)
+# 2) weight the point regression loss (high uncertainty → higher loss weight)
+use_uncertainty: false
+uncertainty_scale: 6.0 # Graph builder: how much uncertainty boosts k
+uncertainty_boost: 2.0 # Loss weighting: max multiplier for high-uncertainty points
+
 moe:
   top_k: 3 # all experts active (soft routing); kept for API compat
   temperature_init: 1.0

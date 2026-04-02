@@ -37,6 +37,11 @@ use_uncertainty: false
 uncertainty_scale: 6.0 # Graph builder: how much uncertainty boosts k
 uncertainty_boost: 2.0 # Loss weighting: max multiplier for high-uncertainty points
 
+# Edge-Conditioned Anisotropic GCN (ECA-GCN)
+# Replaces isotropic GCNConv with edge-conditioned message passing: each edge's
+# similarity/distance is fed through an MLP to produce per-edge gating weights.
+gcn_aniso: false
+
 moe:
   top_k: 3 # all experts active (soft routing); kept for API compat
   temperature_init: 1.0

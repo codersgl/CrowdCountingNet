@@ -56,6 +56,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         subpix_refine_cfg=getattr(cfg.model, "subpix_refine", None),
         use_uncertainty=getattr(cfg.model, "use_uncertainty", False),
         uncertainty_scale=float(getattr(cfg.model, "uncertainty_scale", 6.0)),
+        gcn_aniso=getattr(cfg.model, "gcn_aniso", False),
     )
 
     if not training:

@@ -10,6 +10,8 @@ from crowdcount.models.gcn import (
     AdaptiveFeatureGraphBuilder,
     DensityGCNProcessor,
     DensityGraphBuilder,
+    ECAConv,
+    ECAGCNModel,
     FeatureGCNProcessor,
     FeatureGraphBuilder,
     GCNModel,
@@ -35,23 +37,32 @@ def small_density_map():
 
 def test_density_graph_builder(small_density_map):
     builder = DensityGraphBuilder(k=2)
-    edge_index, num_nodes_total, H, W = builder.build_batch_graph(small_density_map)
+    edge_index, edge_attr, num_nodes_total, H, W = builder.build_batch_graph(
+        small_density_map
+    )
     assert edge_index.shape[0] == 2
+    assert edge_attr.shape == (edge_index.shape[1], 1)
     assert num_nodes_total == 2 * 8 * 8
     assert H == 8 and W == 8
 
 
 def test_feature_graph_builder(small_feature_map):
     builder = FeatureGraphBuilder(k=2)
-    edge_index, num_nodes_total, H, W = builder.build_batch_graph(small_feature_map)
+    edge_index, edge_attr, num_nodes_total, H, W = builder.build_batch_graph(
+        small_feature_map
+    )
     assert edge_index.shape[0] == 2
+    assert edge_attr.shape == (edge_index.shape[1], 1)
     assert num_nodes_total == 2 * 8 * 8
 
 
 def test_adaptive_density_graph_builder(small_density_map):
     builder = AdaptiveDensityGraphBuilder(k_base=4, k_min=2, k_max=6, density_scale=2.0)
-    edge_index, num_nodes_total, H, W = builder.build_batch_graph(small_density_map)
+    edge_index, edge_attr, num_nodes_total, H, W = builder.build_batch_graph(
+        small_density_map
+    )
     assert edge_index.shape[0] == 2
+    assert edge_attr.shape == (edge_index.shape[1], 1)
     assert num_nodes_total == 2 * 8 * 8
     # Adaptive: edge count should be between k_min and k_max per node (+ self loops)
     num_edges_no_self = edge_index.shape[1] - num_nodes_total
@@ -63,8 +74,11 @@ def test_adaptive_density_graph_builder(small_density_map):
 
 def test_adaptive_feature_graph_builder(small_feature_map):
     builder = AdaptiveFeatureGraphBuilder(k_min=2, k_max=6, sim_threshold=0.5)
-    edge_index, num_nodes_total, H, W = builder.build_batch_graph(small_feature_map)
+    edge_index, edge_attr, num_nodes_total, H, W = builder.build_batch_graph(
+        small_feature_map
+    )
     assert edge_index.shape[0] == 2
+    assert edge_attr.shape == (edge_index.shape[1], 1)
     assert num_nodes_total == 2 * 8 * 8
     # At least k_min edges per node guaranteed
     num_edges_no_self = edge_index.shape[1] - num_nodes_total
@@ -76,8 +90,9 @@ def test_adaptive_density_graph_builder_uniform_density():
     """Uniform density should yield ~k_base neighbours per node."""
     density = torch.ones(1, 1, 4, 4) * 0.5
     builder = AdaptiveDensityGraphBuilder(k_base=3, k_min=2, k_max=6, density_scale=2.0)
-    edge_index, num_nodes_total, H, W = builder.build_batch_graph(density)
+    edge_index, edge_attr, num_nodes_total, H, W = builder.build_batch_graph(density)
     assert edge_index.shape[0] == 2
+    assert edge_attr.shape == (edge_index.shape[1], 1)
     assert num_nodes_total == 16
 
 
@@ -177,10 +192,11 @@ def test_uncertainty_adaptive_graph_builder(small_density_map):
     builder = UncertaintyAdaptiveDensityGraphBuilder(
         k_base=3, k_min=2, k_max=8, uncertainty_scale=6.0
     )
-    edge_index, num_nodes_total, H, W = builder.build_batch_graph(
+    edge_index, edge_attr, num_nodes_total, H, W = builder.build_batch_graph(
         small_density_map, uncertainty=unc
     )
     assert edge_index.shape[0] == 2
+    assert edge_attr.shape == (edge_index.shape[1], 1)
     assert num_nodes_total == 2 * 8 * 8
 
 
@@ -192,7 +208,7 @@ def test_uncertainty_builder_more_edges_for_high_uncertainty():
     builder = UncertaintyAdaptiveDensityGraphBuilder(
         k_base=2, k_min=2, k_max=6, uncertainty_scale=4.0
     )
-    edge_index, _, _, _ = builder.build_batch_graph(density, uncertainty=unc)
+    edge_index, _, _, _, _ = builder.build_batch_graph(density, uncertainty=unc)
     num_nodes = 4 * 4
     num_edges_no_self = edge_index.shape[1] - num_nodes
     assert num_edges_no_self > num_nodes * 2  # more than k_min=2 per node on average
@@ -203,10 +219,11 @@ def test_uncertainty_builder_fallback_without_uncertainty(small_density_map):
     builder = UncertaintyAdaptiveDensityGraphBuilder(
         k_base=3, k_min=2, k_max=6, density_scale=2.0
     )
-    edge_index, num_nodes_total, H, W = builder.build_batch_graph(
+    edge_index, edge_attr, num_nodes_total, H, W = builder.build_batch_graph(
         small_density_map, uncertainty=None
     )
     assert edge_index.shape[0] == 2
+    assert edge_attr.shape == (edge_index.shape[1], 1)
     assert num_nodes_total == 2 * 8 * 8
 
 
@@ -243,3 +260,89 @@ def test_density_gcn_processor_uncertainty_none_fallback(
     )
     out = proc(small_density_map, small_feature_map, uncertainty=None)
     assert out.shape == small_feature_map.shape
+
+
+# ---------------------------------------------------------------------------
+# ECA-GCN (Edge-Conditioned Anisotropic)
+# ---------------------------------------------------------------------------
+
+
+def test_eca_conv_forward():
+    conv = ECAConv(in_channels=16, out_channels=32)
+    x = torch.randn(10, 16)
+    edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long)
+    edge_attr = torch.rand(4, 1)
+    out = conv(x, edge_index, edge_attr)
+    assert out.shape == (10, 32)
+
+
+def test_eca_gcn_model_forward():
+    model = ECAGCNModel(in_channels=16, hidden_channels=32, out_channels=16)
+    x = torch.randn(10, 16)
+    edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long)
+    edge_attr = torch.rand(4, 1)
+    out = model(x, edge_index, edge_attr)
+    assert out.shape == (10, 16)
+
+
+def test_eca_gcn_model_residual():
+    """Output should differ from input but maintain shape (residual connection)."""
+    model = ECAGCNModel(in_channels=16, hidden_channels=32, out_channels=16).eval()
+    x = torch.randn(10, 16)
+    edge_index = torch.tensor([[0, 1, 2], [1, 2, 0]], dtype=torch.long)
+    edge_attr = torch.ones(3, 1)
+    out = model(x, edge_index, edge_attr)
+    assert out.shape == x.shape
+    assert not torch.allclose(out, x, atol=1e-4)
+
+
+def test_anisotropic_density_gcn_processor(small_feature_map, small_density_map):
+    proc = DensityGCNProcessor(
+        k=2, in_channels=256, hidden_channels=128, out_channels=256, anisotropic=True
+    )
+    out = proc(small_density_map, small_feature_map)
+    assert out.shape == small_feature_map.shape
+
+
+def test_anisotropic_feature_gcn_processor(small_feature_map):
+    proc = FeatureGCNProcessor(
+        k=2, in_channels=256, hidden_channels=128, out_channels=256, anisotropic=True
+    )
+    out = proc(small_feature_map)
+    assert out.shape == small_feature_map.shape
+
+
+def test_anisotropic_adaptive_density_gcn_processor(
+    small_feature_map, small_density_map
+):
+    proc = DensityGCNProcessor(
+        k=4,
+        in_channels=256,
+        hidden_channels=128,
+        out_channels=256,
+        adaptive=True,
+        k_min=2,
+        k_max=6,
+        anisotropic=True,
+    )
+    out = proc(small_density_map, small_feature_map)
+    assert out.shape == small_feature_map.shape
+
+
+def test_edge_attr_values_density_builder():
+    """Edge attr for density builder should be in (0, 1] range (exp(-dist))."""
+    density = torch.rand(1, 1, 4, 4)
+    builder = DensityGraphBuilder(k=2)
+    _, edge_attr, _, _, _ = builder.build_batch_graph(density)
+    assert (edge_attr > 0).all()
+    assert (edge_attr <= 1.0 + 1e-6).all()
+
+
+def test_edge_attr_values_feature_builder():
+    """Edge attr for feature builder should be cosine similarities."""
+    features = torch.randn(1, 16, 4, 4)
+    builder = FeatureGraphBuilder(k=2)
+    _, edge_attr, _, _, _ = builder.build_batch_graph(features)
+    # Self-loop attrs are 1.0; neighbour attrs are cosine sims in [-1, 1]
+    assert (edge_attr >= -1.0 - 1e-6).all()
+    assert (edge_attr <= 1.0 + 1e-6).all()

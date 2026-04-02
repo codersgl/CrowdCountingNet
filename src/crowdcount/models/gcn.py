@@ -7,7 +7,7 @@ Supports fixed-k, adaptive, uncertainty-guided, and super-node graph constructio
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, MessagePassing
 from torch_geometric.utils import add_self_loops
 
 
@@ -55,6 +55,10 @@ class DensityGraphBuilder:
         )
         tgt_nodes = sorted_indices
 
+        # Extract edge distances for selected neighbours
+        edge_dist = torch.gather(dist, 2, sorted_indices)  # [B, N, k]
+        edge_attr = torch.exp(-edge_dist).reshape(-1, 1)  # [B*N*k, 1]
+
         batch_offset = torch.arange(B, device=device).view(B, 1, 1) * num_nodes
         src_nodes = src_nodes + batch_offset
         tgt_nodes = tgt_nodes + batch_offset
@@ -65,7 +69,11 @@ class DensityGraphBuilder:
 
         num_nodes_total = B * num_nodes
         edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes_total)
-        return edge_index, num_nodes_total, H, W
+        # Append weight=1.0 for self-loop edges
+        num_self_loops = num_nodes_total
+        self_loop_attr = torch.ones(num_self_loops, 1, device=device)
+        edge_attr = torch.cat([edge_attr, self_loop_attr], dim=0)
+        return edge_index, edge_attr, num_nodes_total, H, W
 
 
 class AdaptiveDensityGraphBuilder:
@@ -118,6 +126,10 @@ class AdaptiveDensityGraphBuilder:
         range_idx = torch.arange(self.k_max, device=device).view(1, 1, -1)
         mask = range_idx < k_per_node.unsqueeze(2)  # [B, N, k_max]
 
+        # Extract edge distances for selected neighbours
+        sorted_dist = torch.gather(dist, 2, sorted_indices)  # [B, N, k_max]
+        edge_attr = torch.exp(-sorted_dist)[mask].unsqueeze(1)  # [E, 1]
+
         batch_offset = torch.arange(B, device=device).view(B, 1, 1) * num_nodes
         src = (
             torch.arange(num_nodes, device=device)
@@ -130,7 +142,10 @@ class AdaptiveDensityGraphBuilder:
         edge_index = torch.stack([src[mask], tgt[mask]], dim=0)
         num_nodes_total = B * num_nodes
         edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes_total)
-        return edge_index, num_nodes_total, H, W
+        # Append weight=1.0 for self-loop edges
+        self_loop_attr = torch.ones(num_nodes_total, 1, device=device)
+        edge_attr = torch.cat([edge_attr, self_loop_attr], dim=0)
+        return edge_index, edge_attr, num_nodes_total, H, W
 
 
 class UncertaintyAdaptiveDensityGraphBuilder:
@@ -194,6 +209,10 @@ class UncertaintyAdaptiveDensityGraphBuilder:
         range_idx = torch.arange(self.k_max, device=device).view(1, 1, -1)
         mask = range_idx < k_per_node.unsqueeze(2)  # [B, N, k_max]
 
+        # Extract edge distances for selected neighbours
+        sorted_dist = torch.gather(dist, 2, sorted_indices)  # [B, N, k_max]
+        edge_attr = torch.exp(-sorted_dist)[mask].unsqueeze(1)  # [E, 1]
+
         batch_offset = torch.arange(B, device=device).view(B, 1, 1) * num_nodes
         src = (
             torch.arange(num_nodes, device=device)
@@ -206,7 +225,10 @@ class UncertaintyAdaptiveDensityGraphBuilder:
         edge_index = torch.stack([src[mask], tgt[mask]], dim=0)
         num_nodes_total = B * num_nodes
         edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes_total)
-        return edge_index, num_nodes_total, H, W
+        # Append weight=1.0 for self-loop edges
+        self_loop_attr = torch.ones(num_nodes_total, 1, device=device)
+        edge_attr = torch.cat([edge_attr, self_loop_attr], dim=0)
+        return edge_index, edge_attr, num_nodes_total, H, W
 
 
 class FeatureGraphBuilder:
@@ -224,8 +246,12 @@ class FeatureGraphBuilder:
         norm_features = F.normalize(flat_features, p=2, dim=-1)
         sim = torch.matmul(norm_features, norm_features.transpose(-1, -2))
 
-        _, sorted_indices = torch.topk(sim, k=self.k + 1, dim=2, largest=True)
+        top_values, sorted_indices = torch.topk(sim, k=self.k + 1, dim=2, largest=True)
+        top_values = top_values[:, :, 1:]  # [B, N, k]
         sorted_indices = sorted_indices[:, :, 1:]
+
+        # Edge attr: cosine similarity of selected neighbours
+        edge_attr = top_values.reshape(-1, 1)  # [B*N*k, 1]
 
         src_nodes = (
             torch.arange(num_nodes, device=device)
@@ -244,7 +270,10 @@ class FeatureGraphBuilder:
 
         num_nodes_total = B * num_nodes
         edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes_total)
-        return edge_index, num_nodes_total, H, W
+        # Append weight=1.0 for self-loop edges
+        self_loop_attr = torch.ones(num_nodes_total, 1, device=device)
+        edge_attr = torch.cat([edge_attr, self_loop_attr], dim=0)
+        return edge_index, edge_attr, num_nodes_total, H, W
 
 
 class AdaptiveFeatureGraphBuilder:
@@ -289,6 +318,9 @@ class AdaptiveFeatureGraphBuilder:
         min_mask = range_idx < self.k_min  # always keep first k_min
         mask = threshold_mask | min_mask  # [B, N, k_max]
 
+        # Edge attr: cosine similarity of selected neighbours
+        edge_attr = top_values[mask].unsqueeze(1)  # [E, 1]
+
         batch_offset = torch.arange(B, device=device).view(B, 1, 1) * num_nodes
         src = (
             torch.arange(num_nodes, device=device)
@@ -301,7 +333,82 @@ class AdaptiveFeatureGraphBuilder:
         edge_index = torch.stack([src[mask], tgt[mask]], dim=0)
         num_nodes_total = B * num_nodes
         edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes_total)
-        return edge_index, num_nodes_total, H, W
+        # Append weight=1.0 for self-loop edges
+        self_loop_attr = torch.ones(num_nodes_total, 1, device=device)
+        edge_attr = torch.cat([edge_attr, self_loop_attr], dim=0)
+        return edge_index, edge_attr, num_nodes_total, H, W
+
+
+class ECAConv(MessagePassing):
+    """Edge-Conditioned Anisotropic Graph Convolution.
+
+    Extends standard GCN by making message weights edge-dependent:
+      m_{j→i} = (edge_gate_{ij}) * (W_v · x_j)
+    where edge_gate is produced by an MLP over the edge attribute (similarity/distance).
+    """
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__(aggr="add")
+        self.lin = nn.Linear(in_channels, out_channels, bias=False)
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(1, out_channels),
+            nn.SiLU(),
+            nn.Linear(out_channels, out_channels),
+            nn.Sigmoid(),
+        )
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+
+    def forward(
+        self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor
+    ) -> torch.Tensor:
+        # x: [N, in_channels], edge_attr: [E, 1]
+        x = self.lin(x)
+        edge_gate = self.edge_mlp(edge_attr)  # [E, out_channels]
+        out = self.propagate(edge_index, x=x, edge_gate=edge_gate)
+        return out + self.bias
+
+    def message(self, x_j: torch.Tensor, edge_gate: torch.Tensor) -> torch.Tensor:
+        return edge_gate * x_j
+
+
+class ECAGCNModel(nn.Module):
+    """Two-layer ECA-GCN with LayerNorm, residual connections, and lower dropout."""
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        hidden_channels: int = 512,
+        out_channels: int = 256,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.conv1 = ECAConv(in_channels, hidden_channels)
+        self.conv2 = ECAConv(hidden_channels, out_channels)
+        self.norm1 = nn.LayerNorm(hidden_channels)
+        self.norm2 = nn.LayerNorm(out_channels)
+        self.dropout = dropout
+        # Residual projection if dims mismatch
+        self.res_proj = (
+            nn.Linear(in_channels, out_channels, bias=False)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+
+    def forward(
+        self, x: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor
+    ) -> torch.Tensor:
+        residual = x
+        h = self.conv1(x, edge_index, edge_attr)
+        h = self.norm1(h)
+        h = F.gelu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        h = self.conv2(h, edge_index, edge_attr)
+        h = self.norm2(h)
+        h = F.gelu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        return h + self.res_proj(residual)
 
 
 class GCNModel(nn.Module):
@@ -338,9 +445,11 @@ class DensityGCNProcessor(nn.Module):
         density_scale: float = 4.0,
         use_uncertainty: bool = False,
         uncertainty_scale: float = 6.0,
+        anisotropic: bool = False,
     ):
         super().__init__()
         self._use_uncertainty = use_uncertainty
+        self._anisotropic = anisotropic
         if use_uncertainty and adaptive:
             self.graph_builder = UncertaintyAdaptiveDensityGraphBuilder(
                 k_base=k,
@@ -355,7 +464,10 @@ class DensityGCNProcessor(nn.Module):
             )
         else:
             self.graph_builder = DensityGraphBuilder(k)
-        self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
+        if anisotropic:
+            self.gcn = ECAGCNModel(in_channels, hidden_channels, out_channels)
+        else:
+            self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
 
     def forward(
         self,
@@ -367,15 +479,20 @@ class DensityGCNProcessor(nn.Module):
         if self._use_uncertainty and isinstance(
             self.graph_builder, UncertaintyAdaptiveDensityGraphBuilder
         ):
-            edge_index, _, H, W = self.graph_builder.build_batch_graph(
+            edge_index, edge_attr, _, H, W = self.graph_builder.build_batch_graph(
                 density_maps, uncertainty=uncertainty
             )
         else:
-            edge_index, _, H, W = self.graph_builder.build_batch_graph(density_maps)
+            edge_index, edge_attr, _, H, W = self.graph_builder.build_batch_graph(
+                density_maps
+            )
         node_features = (
             feature_maps.permute(0, 2, 3, 1).contiguous().view(-1, in_channels)
         )
-        out = self.gcn(node_features, edge_index)
+        if self._anisotropic:
+            out = self.gcn(node_features, edge_index, edge_attr)
+        else:
+            out = self.gcn(node_features, edge_index)
         return out.view(B, H, W, in_channels).permute(0, 3, 1, 2).contiguous()
 
 
@@ -390,21 +507,31 @@ class FeatureGCNProcessor(nn.Module):
         k_min: int = 2,
         k_max: int = 8,
         sim_threshold: float = 0.5,
+        anisotropic: bool = False,
     ):
         super().__init__()
+        self._anisotropic = anisotropic
         if adaptive:
             self.graph_builder = AdaptiveFeatureGraphBuilder(
                 k_min=k_min, k_max=k_max, sim_threshold=sim_threshold
             )
         else:
             self.graph_builder = FeatureGraphBuilder(k)
-        self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
+        if anisotropic:
+            self.gcn = ECAGCNModel(in_channels, hidden_channels, out_channels)
+        else:
+            self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
 
     def forward(self, feature_maps: torch.Tensor) -> torch.Tensor:
         B, C, H, W = feature_maps.shape
-        edge_index, _, H, W = self.graph_builder.build_batch_graph(feature_maps)
+        edge_index, edge_attr, _, H, W = self.graph_builder.build_batch_graph(
+            feature_maps
+        )
         node_features = feature_maps.permute(0, 2, 3, 1).contiguous().view(-1, C)
-        out = self.gcn(node_features, edge_index)
+        if self._anisotropic:
+            out = self.gcn(node_features, edge_index, edge_attr)
+        else:
+            out = self.gcn(node_features, edge_index)
         return out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
 

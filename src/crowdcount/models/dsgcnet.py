@@ -111,6 +111,7 @@ class DSGCnet(nn.Module):
         subpix_refine_cfg: DictConfig | None = None,
         use_uncertainty: bool = False,
         uncertainty_scale: float = 6.0,
+        gcn_aniso: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
@@ -230,6 +231,7 @@ class DSGCnet(nn.Module):
                     density_scale=gcn_density_scale,
                     use_uncertainty=use_uncertainty,
                     uncertainty_scale=uncertainty_scale,
+                    anisotropic=gcn_aniso,
                 )
                 self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(
                     k=gcn_k,
@@ -237,6 +239,7 @@ class DSGCnet(nn.Module):
                     k_min=gcn_k_min,
                     k_max=gcn_k_max,
                     sim_threshold=gcn_sim_threshold,
+                    anisotropic=gcn_aniso,
                 )
                 self.alpha: nn.Parameter | None = nn.Parameter(
                     torch.ones(3, dtype=torch.float32)

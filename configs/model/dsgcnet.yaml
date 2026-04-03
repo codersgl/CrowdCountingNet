@@ -17,8 +17,9 @@ use_msaa: false
 msaa_in_channels: 1280
 msaa_reduction: 4
 
-# Feature fusion branch selection: gcn | esca_moe | gcn_moe
+# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe
 # gcn_moe: GCN dual-stream + LightMoE post-refinement (recommended)
+# graph_attn_moe: 2-expert MoE (local conv + graph-biased attention)
 fusion_mode: gcn
 
 # Adaptive GCN graph construction (only used when fusion_mode: gcn)
@@ -51,6 +52,29 @@ moe:
   lambda_balance: 0.01
   grid_stride: 4
   use_density_hint: true
+
+# Graph-Aware MoE (only used when fusion_mode: graph_attn_moe)
+graph_attn_moe:
+  # Router
+  grid_stride: 4 # coarse routing patch size
+  router_detach_density: true # detach density_out for router input
+  lambda_balance: 0.01 # expert balance loss weight
+
+  # GraphAttentionExpert
+  num_heads: 4 # multi-head self-attention heads
+  use_density_bias: true # use density similarity as attention bias
+  density_bias_scale: 1.0 # learnable init scale for density bias
+  attn_dropout: 0.1
+
+  # LocalExpert
+  local_kernels: [1, 3, 5] # depthwise conv kernel sizes
+  local_expansion: 4 # channel expansion factor
+  local_use_density_gate: true # density-conditioned receptive field gating
+
+  # Ablation switches (all false by default)
+  disable_graph_bias: false # disable graph bias → plain self-attention
+  disable_local_expert: false # disable local expert → global only
+  disable_global_expert: false # disable global expert → local only
 
 use_dino_inject: false
 dino_inject_variant: dinov2_b

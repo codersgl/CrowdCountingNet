@@ -648,3 +648,84 @@ def test_cross_stream_mode_does_not_create_external_gm() -> None:
     )
     assert model.cross_stream_gcn is not None
     assert model.gm is None
+
+
+# ---------------------------------------------------------------------------
+# graph_attn_moe fusion mode
+# ---------------------------------------------------------------------------
+
+
+def test_graph_attn_moe_forward() -> None:
+    """DSGCnet with fusion_mode='graph_attn_moe' should produce expected keys."""
+    backbone = TinyVGGBackbone()
+    gam_cfg = OmegaConf.create(
+        {
+            "num_heads": 4,
+            "use_density_bias": True,
+            "density_bias_scale": 1.0,
+            "attn_dropout": 0.0,
+            "local_kernels": [1, 3],
+            "local_expansion": 2,
+            "local_use_density_gate": True,
+            "grid_stride": 4,
+            "lambda_balance": 0.01,
+            "router_detach_density": True,
+            "disable_graph_bias": False,
+            "disable_local_expert": False,
+            "disable_global_expert": False,
+        }
+    )
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        fusion_mode="graph_attn_moe",
+        graph_attn_moe_cfg=gam_cfg,
+    ).eval()
+    assert model.graph_attn_moe is not None
+    assert model.alpha is None
+    assert model.density_gcn is None
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_points"].shape[0] == 2
+    assert out["density_out"].shape[0] == 2
+    assert "moe_weights" in out
+    # Routing weights must sum to 1 along expert dim
+    w = out["moe_weights"]
+    assert torch.allclose(
+        w.sum(dim=1), torch.ones(2, w.shape[2], w.shape[3]), atol=1e-5
+    )
+
+
+def test_graph_attn_moe_train_mode_aux_loss() -> None:
+    """In training mode, graph_attn_moe should produce aux losses."""
+    backbone = TinyVGGBackbone()
+    gam_cfg = OmegaConf.create(
+        {
+            "num_heads": 4,
+            "use_density_bias": True,
+            "density_bias_scale": 1.0,
+            "attn_dropout": 0.0,
+            "local_kernels": [1, 3],
+            "local_expansion": 2,
+            "local_use_density_gate": True,
+            "grid_stride": 4,
+            "lambda_balance": 0.01,
+            "router_detach_density": True,
+            "disable_graph_bias": False,
+            "disable_local_expert": False,
+            "disable_global_expert": False,
+        }
+    )
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        fusion_mode="graph_attn_moe",
+        graph_attn_moe_cfg=gam_cfg,
+    ).train()
+    out = model(torch.zeros(2, 3, 128, 128))
+    assert "moe_aux_losses" in out
+    assert "moe_aux_total" in out
+    assert out["moe_aux_total"] is not None

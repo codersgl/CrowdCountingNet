@@ -32,6 +32,7 @@ from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
 from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
 from crowdcount.plugins.moe import ESCA, MoE, LightMoE
+from crowdcount.plugins.graph_moe import GraphAwareMoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
 
@@ -87,6 +88,7 @@ class DSGCnet(nn.Module):
         msaa_in_channels: int = 1280,
         msaa_reduction: int = 4,
         moe_cfg: DictConfig | None = None,
+        graph_attn_moe_cfg: DictConfig | None = None,
         use_depth: bool = False,
         depth_cfg: DictConfig | None = None,
         use_depth_geo: bool = False,
@@ -121,6 +123,7 @@ class DSGCnet(nn.Module):
         self.fusion_mode = fusion_mode
         self.use_moe = fusion_mode == "esca_moe"
         self.use_gcn_moe = fusion_mode == "gcn_moe"
+        self.use_graph_attn_moe = fusion_mode == "graph_attn_moe"
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
         self.use_freq_head = use_freq_head
@@ -129,9 +132,9 @@ class DSGCnet(nn.Module):
         self._gcn_mode = gcn_mode
         self.use_uncertainty = use_uncertainty
 
-        if self.fusion_mode not in {"gcn", "esca_moe", "gcn_moe"}:
+        if self.fusion_mode not in {"gcn", "esca_moe", "gcn_moe", "graph_attn_moe"}:
             raise ValueError(
-                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', or 'gcn_moe'"
+                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', or 'graph_attn_moe'"
             )
 
         density_cfg = (
@@ -210,6 +213,55 @@ class DSGCnet(nn.Module):
             self.feature_gcn = None
             self.alpha = None
             self.gm = None
+            self.graph_attn_moe = None
+        elif self.use_graph_attn_moe:
+            _gam = graph_attn_moe_cfg
+            self.graph_attn_moe: GraphAwareMoE | None = GraphAwareMoE(
+                input_dim=256,
+                num_heads=int(getattr(_gam, "num_heads", 4)) if _gam else 4,
+                use_density_bias=bool(getattr(_gam, "use_density_bias", True))
+                if _gam
+                else True,
+                density_bias_scale=float(getattr(_gam, "density_bias_scale", 1.0))
+                if _gam
+                else 1.0,
+                attn_dropout=float(getattr(_gam, "attn_dropout", 0.1)) if _gam else 0.1,
+                local_kernels=tuple(getattr(_gam, "local_kernels", [1, 3, 5]))
+                if _gam
+                else (1, 3, 5),
+                local_expansion=int(getattr(_gam, "local_expansion", 4)) if _gam else 4,
+                local_use_density_gate=bool(
+                    getattr(_gam, "local_use_density_gate", True)
+                )
+                if _gam
+                else True,
+                grid_stride=int(getattr(_gam, "grid_stride", 4)) if _gam else 4,
+                lambda_balance=float(getattr(_gam, "lambda_balance", 0.01))
+                if _gam
+                else 0.01,
+                router_detach_density=bool(getattr(_gam, "router_detach_density", True))
+                if _gam
+                else True,
+                disable_graph_bias=bool(getattr(_gam, "disable_graph_bias", False))
+                if _gam
+                else False,
+                disable_local_expert=bool(getattr(_gam, "disable_local_expert", False))
+                if _gam
+                else False,
+                disable_global_expert=bool(
+                    getattr(_gam, "disable_global_expert", False)
+                )
+                if _gam
+                else False,
+            )
+            self.esca = None
+            self.moe = None
+            self.density_gcn = None
+            self.feature_gcn = None
+            self.alpha = None
+            self.gm = None
+            self.supernode_gcn = None
+            self.cross_stream_gcn = None
         else:
             if gcn_mode == "supernode":
                 self.supernode_gcn: SuperNodeGCNProcessor | None = (
@@ -277,6 +329,7 @@ class DSGCnet(nn.Module):
                 self.gm = None
             self.esca = None
             self.moe = None
+            self.graph_attn_moe = None
 
         # LightMoE post-GCN refinement (only for gcn_moe mode)
         if self.use_gcn_moe:
@@ -613,6 +666,14 @@ class DSGCnet(nn.Module):
             output_dict["moe_aux_losses"] = moe_aux_losses
             output_dict["moe_aux_total"] = moe_aux_losses.get("total_aux")
             output_dict["moe_weights"] = moe_weights
+        elif self.use_graph_attn_moe:
+            assert self.graph_attn_moe is not None
+            feature_fl, gam_aux_losses, gam_weights = self.graph_attn_moe(
+                features_pa, density, training=self.training
+            )
+            output_dict["moe_aux_losses"] = gam_aux_losses
+            output_dict["moe_aux_total"] = gam_aux_losses.get("total_aux")
+            output_dict["moe_weights"] = gam_weights
         else:
             if self._gcn_mode == "supernode":
                 assert self.supernode_gcn is not None

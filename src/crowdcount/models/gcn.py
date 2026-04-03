@@ -535,6 +535,206 @@ class FeatureGCNProcessor(nn.Module):
         return out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
 
+class CrossStreamGate(nn.Module):
+    """Learnable gate controlling cross-stream information injection.
+
+    Given hidden features from two streams, produces a per-node gate in [0, 1]
+    that scales the injected signal.  Bias is initialised to a negative value
+    so the gate starts near zero — the model begins as independent dual-stream
+    and gradually learns to open cross-stream pathways.
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(channels * 2, channels),
+            nn.SiLU(),
+            nn.Linear(channels, channels),
+        )
+        # Initialise last layer bias to -2 so sigmoid(-2) ≈ 0.12
+        nn.init.constant_(self.net[-1].bias, -2.0)
+
+    def forward(self, h_self: torch.Tensor, h_other: torch.Tensor) -> torch.Tensor:
+        """Return gate values in [0, 1] with shape [N, C]."""
+        return torch.sigmoid(self.net(torch.cat([h_self, h_other], dim=-1)))
+
+
+class CrossStreamGCNModel(nn.Module):
+    """Two-layer interleaved dual-stream GCN with cross-stream gating.
+
+    Each stream has its own graph topology (density-guided vs feature-guided)
+    and its own GCNConv weights.  After each layer, a CrossStreamGate injects
+    information from the other stream, enabling cross-stream interaction
+    *during* message passing rather than only after.
+
+    Forward pass:
+        Layer 1: independent GCN propagation → cross-stream gate injection
+        Layer 2: independent GCN propagation → cross-stream gate injection
+        Output:  mean of two streams + input residual
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        hidden_channels: int = 512,
+        out_channels: int = 256,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        # Density stream convolutions
+        self.d_conv1 = GCNConv(in_channels, hidden_channels)
+        self.d_conv2 = GCNConv(hidden_channels, out_channels)
+        # Feature stream convolutions
+        self.f_conv1 = GCNConv(in_channels, hidden_channels)
+        self.f_conv2 = GCNConv(hidden_channels, out_channels)
+
+        # Cross-stream gates (one per layer)
+        self.gate_d1 = CrossStreamGate(hidden_channels)  # inject feature→density
+        self.gate_f1 = CrossStreamGate(hidden_channels)  # inject density→feature
+        self.gate_d2 = CrossStreamGate(out_channels)
+        self.gate_f2 = CrossStreamGate(out_channels)
+
+        # Normalisation
+        self.norm_d1 = nn.LayerNorm(hidden_channels)
+        self.norm_f1 = nn.LayerNorm(hidden_channels)
+        self.norm_d2 = nn.LayerNorm(out_channels)
+        self.norm_f2 = nn.LayerNorm(out_channels)
+
+        self.dropout = dropout
+        self.res_proj = (
+            nn.Linear(in_channels, out_channels, bias=False)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        density_edge_index: torch.Tensor,
+        feature_edge_index: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = x
+
+        # --- Layer 1: propagate on respective graphs ---
+        d_h = self.d_conv1(x, density_edge_index)
+        d_h = self.norm_d1(d_h)
+        d_h = F.gelu(d_h)
+        d_h = F.dropout(d_h, p=self.dropout, training=self.training)
+
+        f_h = self.f_conv1(x, feature_edge_index)
+        f_h = self.norm_f1(f_h)
+        f_h = F.gelu(f_h)
+        f_h = F.dropout(f_h, p=self.dropout, training=self.training)
+
+        # Cross-stream injection after layer 1 — use pre-injection snapshots
+        # so both streams see each other's unmodified state (symmetric exchange)
+        d_h_pre, f_h_pre = d_h, f_h
+        d_h = d_h_pre + self.gate_d1(d_h_pre, f_h_pre) * f_h_pre
+        f_h = f_h_pre + self.gate_f1(f_h_pre, d_h_pre) * d_h_pre
+
+        # --- Layer 2: propagate on respective graphs ---
+        d_h = self.d_conv2(d_h, density_edge_index)
+        d_h = self.norm_d2(d_h)
+        d_h = F.gelu(d_h)
+        d_h = F.dropout(d_h, p=self.dropout, training=self.training)
+
+        f_h = self.f_conv2(f_h, feature_edge_index)
+        f_h = self.norm_f2(f_h)
+        f_h = F.gelu(f_h)
+        f_h = F.dropout(f_h, p=self.dropout, training=self.training)
+
+        # Cross-stream injection after layer 2 — use pre-injection snapshots
+        d_h_pre, f_h_pre = d_h, f_h
+        d_h = d_h_pre + self.gate_d2(d_h_pre, f_h_pre) * f_h_pre
+        f_h = f_h_pre + self.gate_f2(f_h_pre, d_h_pre) * d_h_pre
+
+        # Merge: mean of two streams + residual
+        return (d_h + f_h) * 0.5 + self.res_proj(residual)
+
+
+class CrossStreamGCNProcessor(nn.Module):
+    """Unified dual-stream processor with cross-stream interleaved GCN.
+
+    Replaces independent DensityGCNProcessor + FeatureGCNProcessor + external
+    alpha/gate fusion with a single module that builds both graphs and runs
+    CrossStreamGCNModel for in-process cross-stream interaction.
+    """
+
+    def __init__(
+        self,
+        k: int = 4,
+        in_channels: int = 256,
+        hidden_channels: int = 512,
+        out_channels: int = 256,
+        adaptive: bool = False,
+        k_min: int = 2,
+        k_max: int = 8,
+        density_scale: float = 4.0,
+        sim_threshold: float = 0.5,
+        use_uncertainty: bool = False,
+        uncertainty_scale: float = 6.0,
+    ) -> None:
+        super().__init__()
+
+        # Density graph builder
+        if use_uncertainty and adaptive:
+            self.density_builder = UncertaintyAdaptiveDensityGraphBuilder(
+                k_base=k,
+                k_min=k_min,
+                k_max=k_max,
+                density_scale=density_scale,
+                uncertainty_scale=uncertainty_scale,
+            )
+        elif adaptive:
+            self.density_builder = AdaptiveDensityGraphBuilder(
+                k_base=k, k_min=k_min, k_max=k_max, density_scale=density_scale
+            )
+        else:
+            self.density_builder = DensityGraphBuilder(k)
+
+        # Feature graph builder
+        if adaptive:
+            self.feature_builder = AdaptiveFeatureGraphBuilder(
+                k_min=k_min, k_max=k_max, sim_threshold=sim_threshold
+            )
+        else:
+            self.feature_builder = FeatureGraphBuilder(k)
+
+        self.gcn = CrossStreamGCNModel(in_channels, hidden_channels, out_channels)
+        # Only flag uncertainty if the builder actually supports it
+        self._use_uncertainty = isinstance(
+            self.density_builder, UncertaintyAdaptiveDensityGraphBuilder
+        )
+
+    def forward(
+        self,
+        density_maps: torch.Tensor,
+        feature_maps: torch.Tensor,
+        uncertainty: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, C, H, W = feature_maps.shape
+
+        # Build density graph
+        if self._use_uncertainty and isinstance(
+            self.density_builder, UncertaintyAdaptiveDensityGraphBuilder
+        ):
+            d_edge_index, _, _, _, _ = self.density_builder.build_batch_graph(
+                density_maps, uncertainty=uncertainty
+            )
+        else:
+            d_edge_index, _, _, _, _ = self.density_builder.build_batch_graph(
+                density_maps
+            )
+
+        # Build feature graph
+        f_edge_index, _, _, _, _ = self.feature_builder.build_batch_graph(feature_maps)
+
+        # Flatten to node features and run interleaved GCN
+        node_features = feature_maps.permute(0, 2, 3, 1).contiguous().view(-1, C)
+        out = self.gcn(node_features, d_edge_index, f_edge_index)
+        return out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+
+
 class SuperNodeGCNProcessor(nn.Module):
     """Super-Node GCN: global scene reasoning via learnable prototypes.
 

@@ -7,6 +7,7 @@ from omegaconf import DictConfig
 
 from crowdcount.models.anchor import AnchorPoints
 from crowdcount.models.gcn import (
+    CrossStreamGCNProcessor,
     DensityGCNProcessor,
     FeatureGCNProcessor,
     SuperNodeGCNProcessor,
@@ -218,11 +219,30 @@ class DSGCnet(nn.Module):
                         num_heads=gcn_supernode_heads,
                     )
                 )
+                self.cross_stream_gcn = None
+                self.density_gcn = None
+                self.feature_gcn = None
+                self.alpha = None
+            elif gcn_mode == "cross_stream":
+                self.cross_stream_gcn: CrossStreamGCNProcessor | None = (
+                    CrossStreamGCNProcessor(
+                        k=gcn_k,
+                        adaptive=gcn_adaptive,
+                        k_min=gcn_k_min,
+                        k_max=gcn_k_max,
+                        density_scale=gcn_density_scale,
+                        sim_threshold=gcn_sim_threshold,
+                        use_uncertainty=use_uncertainty,
+                        uncertainty_scale=uncertainty_scale,
+                    )
+                )
+                self.supernode_gcn = None
                 self.density_gcn = None
                 self.feature_gcn = None
                 self.alpha = None
             else:
                 self.supernode_gcn = None
+                self.cross_stream_gcn = None
                 self.density_gcn: DensityGCNProcessor | None = DensityGCNProcessor(
                     k=gcn_k,
                     adaptive=gcn_adaptive,
@@ -244,7 +264,7 @@ class DSGCnet(nn.Module):
                 self.alpha: nn.Parameter | None = nn.Parameter(
                     torch.ones(3, dtype=torch.float32)
                 )
-            if use_gm:
+            if use_gm and gcn_mode not in {"supernode", "cross_stream"}:
                 if gm_spatial:
                     self.gm: SpatialGateMechanism | GateMechanism | None = (
                         SpatialGateMechanism(input_dim=gm_input_dim)
@@ -597,6 +617,11 @@ class DSGCnet(nn.Module):
             if self._gcn_mode == "supernode":
                 assert self.supernode_gcn is not None
                 feature_fl = self.supernode_gcn(features_pa, density)
+            elif self._gcn_mode == "cross_stream":
+                assert self.cross_stream_gcn is not None
+                feature_fl = self.cross_stream_gcn(
+                    density, features_pa, uncertainty=uncertainty
+                )
             else:
                 assert self.density_gcn is not None
                 assert self.feature_gcn is not None

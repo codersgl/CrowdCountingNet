@@ -97,7 +97,7 @@ refine:
 # Super-Node GCN mode (alternative to dual-stream GCN; disabled by default)
 # When gcn_mode is "supernode", replaces DensityGCN + FeatureGCN with a single
 # Gather→Process→Scatter super-node GCN that runs in O(NM) instead of O(N²).
-gcn_mode: fixed # fixed | supernode
+gcn_mode: fixed # fixed | supernode | cross_stream
 gcn_num_supernodes: 8 # number of learnable prototype super-nodes
 gcn_supernode_heads: 4 # multi-head attention heads in gather/scatter
 

@@ -620,3 +620,31 @@ def test_uncertainty_forward() -> None:
     # other outputs still present
     assert out["pred_logits"].shape[0] == 2
     assert out["pred_points"].shape[0] == 2
+
+
+def test_cross_stream_mode_forward() -> None:
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        gcn_mode="cross_stream",
+    ).eval()
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_points"].shape[0] == 2
+    assert out["density_out"].shape[0] == 2
+
+
+def test_cross_stream_mode_does_not_create_external_gm() -> None:
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        gcn_mode="cross_stream",
+        use_gm=True,
+    )
+    assert model.cross_stream_gcn is not None
+    assert model.gm is None

@@ -8,6 +8,9 @@ import torch
 from crowdcount.models.gcn import (
     AdaptiveDensityGraphBuilder,
     AdaptiveFeatureGraphBuilder,
+    CrossStreamGate,
+    CrossStreamGCNModel,
+    CrossStreamGCNProcessor,
     DensityGCNProcessor,
     DensityGraphBuilder,
     ECAConv,
@@ -346,3 +349,34 @@ def test_edge_attr_values_feature_builder():
     # Self-loop attrs are 1.0; neighbour attrs are cosine sims in [-1, 1]
     assert (edge_attr >= -1.0 - 1e-6).all()
     assert (edge_attr <= 1.0 + 1e-6).all()
+
+
+def test_cross_stream_gate_forward():
+    gate = CrossStreamGate(channels=16)
+    h_self = torch.randn(10, 16)
+    h_other = torch.randn(10, 16)
+    out = gate(h_self, h_other)
+    assert out.shape == (10, 16)
+    assert (out >= 0.0).all()
+    assert (out <= 1.0).all()
+    assert out.mean() < 0.25
+
+
+def test_cross_stream_gcn_model_forward():
+    model = CrossStreamGCNModel(in_channels=16, hidden_channels=32, out_channels=16)
+    x = torch.randn(10, 16)
+    density_edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long)
+    feature_edge_index = torch.tensor([[0, 2, 4, 6], [2, 4, 6, 8]], dtype=torch.long)
+    out = model(x, density_edge_index, feature_edge_index)
+    assert out.shape == (10, 16)
+
+
+def test_cross_stream_gcn_processor_output_shape(small_feature_map, small_density_map):
+    proc = CrossStreamGCNProcessor(
+        k=2,
+        in_channels=256,
+        hidden_channels=128,
+        out_channels=256,
+    )
+    out = proc(small_density_map, small_feature_map)
+    assert out.shape == small_feature_map.shape

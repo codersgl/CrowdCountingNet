@@ -7,6 +7,7 @@ set_cost_point: 0.05
 point_loss_coef: 0.0002
 eos_coef: 0.5
 count_loss_coef: 0.0 # Global counting L1 loss weight; set >0 to enable (recommended: 0.001~0.01)
+consistency_loss_coef: 0.0 # Density-point consistency loss weight; set >0 to enable (recommended: 0.001~0.01)
 use_gm: false
 gm_input_dim: 256
 gm_hidden_dim: 128

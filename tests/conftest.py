@@ -96,6 +96,7 @@ def base_cfg():
                 "use_uncertainty": False,
                 "uncertainty_scale": 6.0,
                 "uncertainty_boost": 2.0,
+                "consistency_loss_coef": 0.0,
             },
             "optimizer": {
                 "name": "adam",

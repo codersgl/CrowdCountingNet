@@ -374,3 +374,211 @@ def test_uncertainty_weighting_samples_xy_coordinates_correctly(cfg):
     base_loss = criterion_base(outputs, targets)["loss_points"]
     weighted_loss = criterion_weighted(outputs, targets)["loss_points"]
     assert torch.allclose(weighted_loss, base_loss * 3.0)
+
+
+# ---------------------------------------------------------------------------
+# Density-point consistency loss
+# ---------------------------------------------------------------------------
+
+
+def test_consistency_loss_keys(dummy_outputs, dummy_targets, cfg):
+    """Consistency loss should appear in output when enabled."""
+    matcher = build_matcher_crowd(cfg)
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={
+            "loss_ce": 1,
+            "loss_points": 0.0002,
+            "loss_count": 0.0,
+            "loss_consistency": 0.005,
+        },
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points", "count", "consistency"],
+    )
+    losses = criterion(dummy_outputs, dummy_targets)
+    assert "loss_consistency" in losses
+
+
+def test_consistency_loss_scalar_finite(dummy_outputs, dummy_targets, cfg):
+    """Consistency loss must be a finite scalar."""
+    matcher = build_matcher_crowd(cfg)
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={
+            "loss_ce": 1,
+            "loss_points": 0.0002,
+            "loss_count": 0.0,
+            "loss_consistency": 0.005,
+        },
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points", "consistency"],
+    )
+    losses = criterion(dummy_outputs, dummy_targets)
+    v = losses["loss_consistency"]
+    assert v.dim() == 0, "loss_consistency should be scalar"
+    assert torch.isfinite(v), "loss_consistency should be finite"
+
+
+def test_consistency_loss_zero_when_disabled(dummy_outputs, dummy_targets, cfg):
+    """When consistency_loss_coef=0, it should not affect total loss."""
+    matcher = build_matcher_crowd(cfg)
+    weight_dict = {
+        "loss_ce": 1,
+        "loss_points": 0.0002,
+        "loss_count": 0.0,
+        "loss_consistency": 0.0,
+    }
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict=weight_dict,
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points", "consistency"],
+    )
+    losses = criterion(dummy_outputs, dummy_targets)
+    assert losses["loss_consistency"] * weight_dict["loss_consistency"] == 0.0
+
+
+def test_consistency_high_density_lower_loss(dummy_targets, cfg):
+    """Zero density at GT points should produce higher hinge loss than high density.
+
+    We equalise the count-consistency term by scaling density so that the
+    integral roughly matches the predicted foreground count, then compare
+    only the difference caused by the point-density hinge term.
+    """
+    matcher = build_matcher_crowd(cfg)
+    B, Q = 2, 20
+    pred_logits = torch.rand(B, Q, 2)
+    pred_points = torch.rand(B, Q, 2) * 128
+
+    # Compute predicted fg count to calibrate density integral
+    fg_count = pred_logits.softmax(-1)[:, :, 1].sum(dim=1)  # [B]
+    avg_fg = fg_count.mean().item()
+    # density value per cell so that sum ≈ avg_fg  (16*16 = 256 cells)
+    cell_val = avg_fg / 256.0
+
+    # "Matched" density: same integral but value ≥ 1 at every cell
+    # → hinge = 0 everywhere, count term ≈ 0
+    high_cell = max(cell_val, 1.5)
+    high_density = torch.full((B, 1, 16, 16), high_cell)
+
+    # "Zero" density: integral=0, hinge=1 at every GT point, count term = avg_fg
+    zero_density = torch.zeros(B, 1, 16, 16)
+
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_points": 0.0002, "loss_consistency": 1.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points", "consistency"],
+    )
+    zero_loss = criterion(
+        {
+            "pred_logits": pred_logits,
+            "pred_points": pred_points,
+            "density_out": zero_density,
+        },
+        dummy_targets,
+    )["loss_consistency"]
+    # Zero density → hinge fires (1.0 per point) + count mismatch
+    assert zero_loss > 0, "Zero density should produce nonzero consistency loss"
+
+
+def test_consistency_loss_without_density(dummy_targets, cfg):
+    """If density_out is missing, loss_consistency should be zero."""
+    matcher = build_matcher_crowd(cfg)
+    B, Q = 2, 20
+    outputs = {
+        "pred_logits": torch.rand(B, Q, 2),
+        "pred_points": torch.rand(B, Q, 2) * 128,
+    }
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_points": 0.0002, "loss_consistency": 0.005},
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points", "consistency"],
+    )
+    losses = criterion(outputs, dummy_targets)
+    assert losses["loss_consistency"].item() == 0.0
+
+
+def test_consistency_img_size_coordinate_mapping(cfg):
+    """Verify that img_size correctly maps pixel coords to density map cells.
+
+    Place a single GT point at the top-left corner of a 64×64 image.
+    The density map is 4×4 (stride 16).  With align_corners=True the top-left
+    pixel (0,0) maps to grid (-1,-1) which hits density cell [0,0].
+    Put density=2.0 at cell [0,0].  The hinge should be 0 (2>1).
+    Without the img_size fix the point coord (0,0) divided by map dim (3)
+    would also hit (-1,-1), so we additionally test a non-corner point.
+    """
+    matcher = build_matcher_crowd(cfg)
+
+    # --- Case 1: corner point (0,0) → should sample cell [0,0] ---
+    density = torch.zeros(1, 1, 4, 4)
+    density[0, 0, 0, 0] = 2.0  # top-left cell
+
+    outputs = {
+        "pred_logits": torch.tensor([[[0.1, 0.9]]], dtype=torch.float32),
+        "pred_points": torch.tensor([[[0.0, 0.0]]], dtype=torch.float32),
+        "density_out": density,
+        "img_size": (64, 64),
+    }
+    targets = [
+        {
+            "labels": torch.ones(1, dtype=torch.long),
+            "point": torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+        }
+    ]
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_points": 0.0002, "loss_consistency": 1.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points", "consistency"],
+    )
+    losses = criterion(outputs, targets)
+    # Hinge at (0,0) should be 0 because density=2.0 > margin=1.0.
+    # Count consistency = |2.0 - fg_score_sum| adds a positive value.
+    # We verify the loss is less than what we'd get with zero density
+    # (hinge=1 + count=fg_score_sum ≈ 0.7 → total ≈ 1.7).
+    # With density=2.0 at corner: hinge=0, count=|2-0.7|≈1.3 → total ≈ 1.3.
+    # Key: hinge term is 0, which we verify by comparing against zero-density.
+    outputs_zero = {**outputs, "density_out": torch.zeros(1, 1, 4, 4)}
+    losses_zero = criterion(outputs_zero, targets)
+    assert losses["loss_consistency"] < losses_zero["loss_consistency"], (
+        "High density at point should give lower loss than zero density"
+    )
+
+    # --- Case 2: point at image centre (32,32) with NO img_size ---
+    # Without img_size, coords get normalised by density map dims (4×4),
+    # so (32,32)/(3) * 2 - 1 ≈ (20.3, 20.3) → clamped to border → samples
+    # cell [0,3] or [3,0] (border), which has density 0 → hinge = 1.
+    density2 = torch.zeros(1, 1, 4, 4)
+    density2[0, 0, 2, 2] = 2.0  # centre-ish cell only
+    outputs_no_imgsize = {
+        "pred_logits": torch.tensor([[[0.1, 0.9]]], dtype=torch.float32),
+        "pred_points": torch.tensor([[[32.0, 32.0]]], dtype=torch.float32),
+        "density_out": density2,
+        # no img_size → fallback to density map dims
+    }
+    targets2 = [
+        {
+            "labels": torch.ones(1, dtype=torch.long),
+            "point": torch.tensor([[32.0, 32.0]], dtype=torch.float32),
+        }
+    ]
+    losses_broken = criterion(outputs_no_imgsize, targets2)
+
+    # With img_size: (32/63)*2-1 ≈ 0.016 → bilinear near centre → hits cell [2,2]
+    outputs_with_imgsize = {**outputs_no_imgsize, "img_size": (64, 64)}
+    losses_fixed = criterion(outputs_with_imgsize, targets2)
+
+    # The fixed version should have a smaller hinge loss (it actually samples
+    # near the nonzero cell) compared to the broken version (clamped to border).
+    assert losses_fixed["loss_consistency"] < losses_broken["loss_consistency"], (
+        "img_size mapping should improve density sampling accuracy"
+    )

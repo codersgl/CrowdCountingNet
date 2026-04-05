@@ -643,6 +643,7 @@ class DSGCnet(nn.Module):
             "pred_points": None,
             "density_out": density,
             "uncertainty_map": uncertainty,
+            "img_size": (samples.shape[-2], samples.shape[-1]),
             "moe_aux_losses": None,
             "moe_aux_total": None,
             "moe_weights": None,

@@ -729,3 +729,53 @@ def test_graph_attn_moe_train_mode_aux_loss() -> None:
     assert "moe_aux_losses" in out
     assert "moe_aux_total" in out
     assert out["moe_aux_total"] is not None
+
+
+# ---------------------------------------------------------------------------
+# graph_attn_moe local-first mode
+# ---------------------------------------------------------------------------
+
+
+def test_graph_attn_moe_local_first_forward() -> None:
+    """DSGCnet with local-first graph_attn_moe should produce expected keys."""
+    backbone = TinyVGGBackbone()
+    gam_cfg = OmegaConf.create(
+        {
+            "num_heads": 4,
+            "use_density_bias": True,
+            "density_bias_scale": 1.0,
+            "attn_dropout": 0.0,
+            "local_kernels": [1, 3],
+            "local_expansion": 2,
+            "local_use_density_gate": True,
+            "local_window_size": 4,
+            "local_prior": 1.0,
+            "grid_stride": 4,
+            "lambda_balance": 0.01,
+            "router_detach_density": True,
+            "disable_graph_bias": False,
+            "disable_local_expert": False,
+            "disable_global_expert": False,
+        }
+    )
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        fusion_mode="graph_attn_moe",
+        graph_attn_moe_cfg=gam_cfg,
+    ).eval()
+    assert model.graph_attn_moe is not None
+    assert model.graph_attn_moe.local_expert is not None
+    assert model.graph_attn_moe.local_expert.window_size == 4
+    assert model.graph_attn_moe.router is not None
+    assert model.graph_attn_moe.router.local_prior == 1.0
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_points"].shape[0] == 2
+    assert out["density_out"].shape[0] == 2
+    w = out["moe_weights"]
+    assert torch.allclose(
+        w.sum(dim=1), torch.ones(2, w.shape[2], w.shape[3]), atol=1e-5
+    )

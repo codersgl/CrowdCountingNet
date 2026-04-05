@@ -11,6 +11,8 @@ from crowdcount.plugins.graph_moe import (
     GraphAwareMoE,
     GraphMoEBalanceLoss,
     LocalExpert,
+    _window_partition,
+    _window_unpartition,
 )
 
 B, C, H, W = 2, 64, 8, 8
@@ -253,3 +255,156 @@ class TestGraphAwareMoE:
         loss = feat.sum() + aux["total_aux"]
         loss.backward()
         assert x.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# Window partition helpers
+# ---------------------------------------------------------------------------
+
+
+class TestWindowPartition:
+    def test_round_trip_exact(self) -> None:
+        x = torch.randn(B, C, H, W)
+        wins, orig, padded = _window_partition(x, window_size=4)
+        restored = _window_unpartition(wins, B, orig, padded, 4)
+        assert torch.allclose(restored, x)
+
+    def test_round_trip_with_padding(self) -> None:
+        """Non-divisible spatial dims require padding; unpartition crops."""
+        x = torch.randn(B, C, 7, 7)
+        wins, orig, padded = _window_partition(x, window_size=4)
+        assert orig == (7, 7)
+        assert padded == (8, 8)
+        restored = _window_unpartition(wins, B, orig, padded, 4)
+        assert restored.shape == (B, C, 7, 7)
+        assert torch.allclose(restored, x)
+
+
+# ---------------------------------------------------------------------------
+# Local-first enhancements
+# ---------------------------------------------------------------------------
+
+
+class TestLocalExpertWindowPartition:
+    def test_shape_with_window(self) -> None:
+        expert = LocalExpert(input_dim=C, expansion=2, window_size=4).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        with torch.no_grad():
+            out = expert(x, density)
+        assert out.shape == (B, C, H, W)
+
+    def test_shape_non_divisible(self) -> None:
+        """Window partition handles non-divisible spatial dims."""
+        expert = LocalExpert(input_dim=C, expansion=2, window_size=4).eval()
+        x = torch.randn(B, C, 7, 7)
+        density = torch.rand(B, 1, 7, 7)
+        with torch.no_grad():
+            out = expert(x, density)
+        assert out.shape == (B, C, 7, 7)
+
+    def test_gradient_flows(self) -> None:
+        expert = LocalExpert(input_dim=C, expansion=2, window_size=4).train()
+        x = torch.randn(B, C, H, W, requires_grad=True)
+        density = torch.rand(B, 1, H, W)
+        out = expert(x, density)
+        out.sum().backward()
+        assert x.grad is not None
+
+
+class TestCoarseDensityRouterLocalPrior:
+    def test_neutral_prior(self) -> None:
+        router = CoarseDensityRouter(input_dim=C, num_experts=2, local_prior=0.0)
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        w = router(x, density)
+        assert w.shape == (B, 2, H, W)
+
+    def test_positive_prior_favours_local(self) -> None:
+        """With strong local_prior, expert 0 should get majority weight."""
+        router = CoarseDensityRouter(
+            input_dim=C, num_experts=2, grid_stride=4, local_prior=5.0
+        ).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        with torch.no_grad():
+            w = router(x, density)
+        # Local expert (index 0) mean weight should be > 0.8
+        assert w[:, 0].mean().item() > 0.8
+
+    def test_weights_still_sum_to_one(self) -> None:
+        router = CoarseDensityRouter(input_dim=C, num_experts=2, local_prior=2.0).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        with torch.no_grad():
+            w = router(x, density)
+        assert torch.allclose(w.sum(dim=1), torch.ones(B, H, W), atol=1e-5)
+
+
+class TestGraphAwareMoELocalFirst:
+    def test_local_first_forward_shape(self) -> None:
+        moe = GraphAwareMoE(
+            input_dim=C,
+            num_heads=4,
+            local_expansion=2,
+            local_window_size=4,
+            local_prior=1.0,
+        ).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        with torch.no_grad():
+            feat, aux, weights = moe(x, density, training=False)
+        assert feat.shape == (B, C, H, W)
+        assert weights.shape == (B, 2, H, W)
+
+    def test_local_first_train_aux_loss(self) -> None:
+        moe = GraphAwareMoE(
+            input_dim=C,
+            num_heads=4,
+            local_expansion=2,
+            local_window_size=4,
+            local_prior=1.0,
+        ).train()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        feat, aux, weights = moe(x, density, training=True)
+        assert "total_aux" in aux
+
+    def test_local_first_gradient_flows(self) -> None:
+        moe = GraphAwareMoE(
+            input_dim=C,
+            num_heads=4,
+            local_expansion=2,
+            local_window_size=4,
+            local_prior=1.0,
+        ).train()
+        x = torch.randn(B, C, H, W, requires_grad=True)
+        density = torch.rand(B, 1, H, W)
+        feat, aux, _ = moe(x, density, training=True)
+        loss = feat.sum() + aux["total_aux"]
+        loss.backward()
+        assert x.grad is not None
+
+    def test_backward_compat_defaults(self) -> None:
+        """Default params (window_size=0, local_prior=0) match original."""
+        moe = GraphAwareMoE(input_dim=C, num_heads=4, local_expansion=2)
+        assert moe.local_expert is not None
+        assert moe.local_expert.window_size == 0
+        assert moe.router is not None
+        assert moe.router.local_prior == 0.0
+
+    def test_ablation_still_works_with_local_first(self) -> None:
+        """disable_global should still work when local-first is on."""
+        moe = GraphAwareMoE(
+            input_dim=C,
+            num_heads=4,
+            local_expansion=2,
+            local_window_size=4,
+            disable_global_expert=True,
+        ).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        with torch.no_grad():
+            feat, aux, weights = moe(x, density, training=False)
+        assert feat.shape == (B, C, H, W)
+        assert aux == {}

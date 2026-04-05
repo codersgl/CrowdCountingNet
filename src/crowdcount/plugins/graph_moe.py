@@ -36,6 +36,52 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
+# Window partition helpers (local-first enhancement)
+# ---------------------------------------------------------------------------
+
+
+def _window_partition(
+    x: torch.Tensor, window_size: int
+) -> tuple[torch.Tensor, tuple[int, int], tuple[int, int]]:
+    """Partition [B, C, H, W] into non-overlapping windows.
+
+    Returns:
+        windows: [B * nH * nW, C, ws, ws]
+        orig_hw: (H, W) before padding.
+        padded_hw: (Hp, Wp) after padding.
+    """
+    B, C, H, W = x.shape
+    pad_h = (window_size - H % window_size) % window_size
+    pad_w = (window_size - W % window_size) % window_size
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, (0, pad_w, 0, pad_h))
+    Hp, Wp = H + pad_h, W + pad_w
+    nH, nW = Hp // window_size, Wp // window_size
+    x = x.view(B, C, nH, window_size, nW, window_size)
+    x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
+    return x.view(B * nH * nW, C, window_size, window_size), (H, W), (Hp, Wp)
+
+
+def _window_unpartition(
+    windows: torch.Tensor,
+    batch_size: int,
+    orig_hw: tuple[int, int],
+    padded_hw: tuple[int, int],
+    window_size: int,
+) -> torch.Tensor:
+    """Reverse of :func:`_window_partition`."""
+    Hp, Wp = padded_hw
+    H, W = orig_hw
+    C = windows.shape[1]
+    nH, nW = Hp // window_size, Wp // window_size
+    x = windows.view(batch_size, nH, nW, C, window_size, window_size)
+    x = x.permute(0, 3, 1, 4, 2, 5).contiguous().view(batch_size, C, Hp, Wp)
+    if Hp > H or Wp > W:
+        x = x[:, :, :H, :W]
+    return x
+
+
+# ---------------------------------------------------------------------------
 # Local Expert
 # ---------------------------------------------------------------------------
 
@@ -53,6 +99,9 @@ class LocalExpert(nn.Module):
         kernel_sizes: Depthwise kernel sizes for the parallel branches.
         expansion: Channel expansion factor for the internal representation.
         use_density_gate: If True, density map modulates branch mixing.
+        window_size: If >0, partition features into non-overlapping windows
+            of this size before processing.  Forces strictly local receptive
+            fields and local-only density gating.  0 disables (default).
     """
 
     def __init__(
@@ -61,10 +110,12 @@ class LocalExpert(nn.Module):
         kernel_sizes: tuple[int, ...] = (1, 3, 5),
         expansion: int = 4,
         use_density_gate: bool = True,
+        window_size: int = 0,
     ) -> None:
         super().__init__()
         ex_ch = input_dim * expansion
         self.use_density_gate = use_density_gate
+        self.window_size = window_size
 
         self.expand = nn.Sequential(
             nn.Conv2d(input_dim, ex_ch, 1, bias=False),
@@ -100,6 +151,24 @@ class LocalExpert(nn.Module):
         else:
             self.density_gate = None
 
+    def _forward_core(
+        self, x: torch.Tensor, density: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Core multi-scale conv + density gate (no residual)."""
+        expanded = self.expand(x)
+        branch_outputs = torch.stack(
+            [branch(expanded) for branch in self.branches], dim=1
+        )  # [B, num_branches, ex_ch, H, W]
+
+        if self.density_gate is not None and density is not None:
+            gate = self.density_gate(density)  # [B, num_branches, H, W]
+            gate = F.softmax(gate, dim=1).unsqueeze(2)  # [B, num_branches, 1, H, W]
+            fused = (branch_outputs * gate).sum(dim=1)  # [B, ex_ch, H, W]
+        else:
+            fused = branch_outputs.mean(dim=1)
+
+        return self.project(fused)
+
     def forward(
         self, x: torch.Tensor, density: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -111,26 +180,27 @@ class LocalExpert(nn.Module):
         Returns:
             [B, C, H, W] locally-enhanced features with residual.
         """
-        expanded = self.expand(x)
+        # Align density spatial size once, before any partitioning
+        if density is not None and density.shape[-2:] != x.shape[-2:]:
+            density = F.interpolate(
+                density, size=x.shape[-2:], mode="bilinear", align_corners=False
+            )
 
-        # Compute all branch outputs
-        branch_outputs = torch.stack(
-            [branch(expanded) for branch in self.branches], dim=1
-        )  # [B, num_branches, ex_ch, H, W]
+        if self.window_size > 0:
+            B = x.shape[0]
+            x_win, orig_hw, padded_hw = _window_partition(x, self.window_size)
+            d_win = (
+                _window_partition(density, self.window_size)[0]
+                if density is not None
+                else None
+            )
+            enhanced = self._forward_core(x_win, d_win)
+            enhanced = _window_unpartition(
+                enhanced, B, orig_hw, padded_hw, self.window_size
+            )
+            return enhanced + x
 
-        if self.density_gate is not None and density is not None:
-            if density.shape[-2:] != x.shape[-2:]:
-                density = F.interpolate(
-                    density, size=x.shape[-2:], mode="bilinear", align_corners=False
-                )
-            gate = self.density_gate(density)  # [B, num_branches, H, W]
-            gate = F.softmax(gate, dim=1).unsqueeze(2)  # [B, num_branches, 1, H, W]
-            fused = (branch_outputs * gate).sum(dim=1)  # [B, ex_ch, H, W]
-        else:
-            # Equal weighting fallback
-            fused = branch_outputs.mean(dim=1)
-
-        return self.project(fused) + x  # residual
+        return self._forward_core(x, density) + x  # residual
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +366,9 @@ class CoarseDensityRouter(nn.Module):
         input_dim: Feature channel count.
         num_experts: Number of experts to route (default 2).
         grid_stride: Spatial stride for coarse routing patches.
+        local_prior: Additive logit bias for the local expert (index 0).
+            Positive values make the router favour local processing by default.
+            0.0 means neutral (original behaviour).
     """
 
     def __init__(
@@ -303,10 +376,12 @@ class CoarseDensityRouter(nn.Module):
         input_dim: int = 256,
         num_experts: int = 2,
         grid_stride: int = 4,
+        local_prior: float = 0.0,
     ) -> None:
         super().__init__()
         self.grid_stride = grid_stride
         self.num_experts = num_experts
+        self.local_prior = local_prior
         # +1 for density channel
         in_ch = input_dim + 1
         self.score_net = nn.Sequential(
@@ -341,6 +416,12 @@ class CoarseDensityRouter(nn.Module):
             )
         else:
             scores = self.score_net(inp)
+
+        # Local-first bias: add prior to local expert (index 0) before softmax
+        if self.local_prior != 0.0:
+            bias = scores.new_zeros(1, self.num_experts, 1, 1)
+            bias[0, 0, 0, 0] = self.local_prior
+            scores = scores + bias
 
         return F.softmax(scores, dim=1)  # [B, num_experts, H, W]
 
@@ -401,7 +482,14 @@ class GraphAwareMoE(nn.Module):
         local_kernels: Kernel sizes for LocalExpert branches.
         local_expansion: Channel expansion factor for LocalExpert.
         local_use_density_gate: Density-gated RF selection in LocalExpert.
+        local_window_size: Window partition size for LocalExpert.  0=disabled
+            (default).  Positive values confine convolutions and density
+            gating to non-overlapping windows, enforcing local-first bias.
         grid_stride: Coarse routing patch stride.
+        local_prior: Additive logit bias toward the local expert in the
+            router.  0.0=neutral (default).  Positive values (e.g. 1.0) make
+            the router favour local processing unless density evidence
+            overrides.
         lambda_balance: Expert balance loss weight.
         router_detach_density: Whether to detach density for router input.
         disable_graph_bias: Ablation: disable graph bias in attention.
@@ -421,8 +509,10 @@ class GraphAwareMoE(nn.Module):
         local_kernels: tuple[int, ...] = (1, 3, 5),
         local_expansion: int = 4,
         local_use_density_gate: bool = True,
+        local_window_size: int = 0,
         # Router
         grid_stride: int = 4,
+        local_prior: float = 0.0,
         lambda_balance: float = 0.01,
         router_detach_density: bool = True,
         # Ablation switches
@@ -449,6 +539,7 @@ class GraphAwareMoE(nn.Module):
                 kernel_sizes=local_kernels,
                 expansion=local_expansion,
                 use_density_gate=local_use_density_gate,
+                window_size=local_window_size,
             )
         )
 
@@ -472,6 +563,7 @@ class GraphAwareMoE(nn.Module):
                 input_dim=input_dim,
                 num_experts=2,
                 grid_stride=grid_stride,
+                local_prior=local_prior,
             )
         else:
             self.router = None

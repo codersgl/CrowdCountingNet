@@ -235,7 +235,11 @@ class DSGCnet(nn.Module):
                 )
                 if _gam
                 else True,
+                local_window_size=int(getattr(_gam, "local_window_size", 0))
+                if _gam
+                else 0,
                 grid_stride=int(getattr(_gam, "grid_stride", 4)) if _gam else 4,
+                local_prior=float(getattr(_gam, "local_prior", 0.0)) if _gam else 0.0,
                 lambda_balance=float(getattr(_gam, "lambda_balance", 0.01))
                 if _gam
                 else 0.01,

@@ -71,6 +71,10 @@ graph_attn_moe:
   local_expansion: 4 # channel expansion factor
   local_use_density_gate: true # density-conditioned receptive field gating
 
+  # Local-first enhancements (all disabled/neutral by default)
+  local_window_size: 0 # 0=disabled; >0 partitions LocalExpert into windows of this size
+  local_prior: 0.0 # router logit bias toward local expert; 0=neutral, >0=local-first
+
   # Ablation switches (all false by default)
   disable_graph_bias: false # disable graph bias → plain self-attention
   disable_local_expert: false # disable local expert → global only

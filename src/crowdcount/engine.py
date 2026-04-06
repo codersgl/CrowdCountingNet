@@ -82,6 +82,12 @@ def train_one_epoch(
         if model_moe_cfg is not None
         else 0.9999
     )
+    fg_loss_weight = (
+        float(getattr(cfg, "fg_loss_weight", 0.1)) if cfg is not None else 0.1
+    )
+    fg_pos_weight = (
+        float(getattr(cfg, "fg_pos_weight", 5.0)) if cfg is not None else 5.0
+    )
     use_depth = bool(
         getattr(getattr(cfg, "model", None), "use_depth", False)
         if cfg is not None
@@ -213,7 +219,23 @@ def train_one_epoch(
         if moe_aux_total is not None:
             moe_aux_component = moe_aux_weight * moe_aux_total
 
-        loss_sum = losses + density_loss + moe_aux_component
+        # Foreground suppression branch loss
+        fg_loss = torch.tensor(0.0, device=samples.device)
+        fg_logits = outputs.get("fg_logits")
+        if fg_logits is not None:
+            fg_gt = F.adaptive_max_pool2d(
+                (gt_dmap > 0).float(), output_size=fg_logits.shape[-2:]
+            )
+            fg_loss = (
+                F.binary_cross_entropy_with_logits(
+                    fg_logits,
+                    fg_gt,
+                    pos_weight=torch.tensor(fg_pos_weight, device=samples.device),
+                )
+                * fg_loss_weight
+            )
+
+        loss_sum = losses + density_loss + moe_aux_component + fg_loss
 
         loss_dict_reduced = reduce_dict(loss_dict)
         loss_dict_reduced_unscaled = {
@@ -245,6 +267,9 @@ def train_one_epoch(
         if max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
+
+        if fg_logits is not None:
+            metric_logger.update(fg_loss=fg_loss.item())
 
         update_temperature = getattr(model, "update_moe_temperature", None)
         if callable(update_temperature):

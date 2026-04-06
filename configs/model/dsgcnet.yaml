@@ -159,3 +159,10 @@ use_subpix_refine: false
 subpix_refine:
   top_k: 512 # number of high-confidence points to refine
   hidden_dim: 128 # MLP hidden dimension
+
+# Foreground Suppression Branch (disabled by default)
+# Pixel-level foreground gating with residual pass-through to suppress background.
+# Supervised by binarised GT density maps (no extra annotation needed).
+use_fg_branch: false
+fg_branch_base: 0.5 # minimum feature pass-through ratio
+fg_branch_scale: 0.5 # max additional boost from foreground probability

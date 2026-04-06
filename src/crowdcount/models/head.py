@@ -8,6 +8,7 @@ Contains:
   - PointRefineModule:      iterative coordinate refinement via feature re-sampling
   - FreqDecoupledRouter:    frequency-domain Laplacian decomposition for head routing
   - SubPixelRefineModule:   dense-region sub-pixel refinement via high-res feature sampling
+  - ForegroundSuppressionBranch: pixel-level foreground gating with residual pass-through
 """
 
 import torch
@@ -506,3 +507,47 @@ class PointRefineModule(nn.Module):
             intermediates.append(points)
 
         return points, intermediates
+
+
+class ForegroundSuppressionBranch(nn.Module):
+    """Lightweight pixel-level foreground probability branch.
+
+    Produces a spatial foreground mask supervised by binarised GT density maps.
+    Used with residual gating so that even when fg_prob is low, a base fraction
+    of the feature is preserved (avoids recall collapse in early training).
+
+    Args:
+        in_channels: Input feature channels (default 256).
+        hidden_channels: Intermediate conv channels (default 64).
+        base: Minimum feature pass-through ratio (default 0.5).
+        scale: Maximum additional boost from fg_prob (default 0.5).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        hidden_channels: int = 64,
+        base: float = 0.5,
+        scale: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.base = base
+        self.scale = scale
+        self.conv1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)
+        self.bn = nn.BatchNorm2d(hidden_channels)
+        self.act = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (gated_feature, fg_logits, fg_prob).
+
+        - gated_feature: x * (base + scale * fg_prob)  [B, C, H, W]
+        - fg_logits:     raw logits before sigmoid       [B, 1, H, W]
+        - fg_prob:       sigmoid(fg_logits)              [B, 1, H, W]
+        """
+        fg_logits = self.conv2(self.act(self.bn(self.conv1(x))))
+        fg_prob = fg_logits.sigmoid()
+        gated = x * (self.base + self.scale * fg_prob)
+        return gated, fg_logits, fg_prob

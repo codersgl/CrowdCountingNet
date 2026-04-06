@@ -17,6 +17,7 @@ from crowdcount.models.head import (
     ClassificationModel,
     DensityAttentionMask,
     Density_pred,
+    ForegroundSuppressionBranch,
     FreqDecoupledRouter,
     PointRefineModule,
     RegressionModel,
@@ -117,6 +118,9 @@ class DSGCnet(nn.Module):
         use_uncertainty: bool = False,
         uncertainty_scale: float = 6.0,
         gcn_aniso: bool = False,
+        use_fg_branch: bool = False,
+        fg_branch_base: float = 0.5,
+        fg_branch_scale: float = 0.5,
     ):
         super().__init__()
         self.backbone = backbone
@@ -610,6 +614,17 @@ class DSGCnet(nn.Module):
         else:
             self.subpix_refine = None
 
+        # Foreground Suppression Branch (optional, disabled by default)
+        self.fg_branch: ForegroundSuppressionBranch | None = (
+            ForegroundSuppressionBranch(
+                in_channels=256,
+                base=fg_branch_base,
+                scale=fg_branch_scale,
+            )
+            if use_fg_branch
+            else None
+        )
+
     def supports_moe(self) -> bool:
         return (
             (self.use_moe and self.moe is not None)
@@ -803,6 +818,12 @@ class DSGCnet(nn.Module):
                 feature_fl,
                 density if self._semc_use_density_hint else None,
             )
+
+        # Foreground suppression: residual-gated pixel-level FG prior
+        if self.fg_branch is not None:
+            feature_fl, fg_logits, fg_prob = self.fg_branch(feature_fl)
+            output_dict["fg_logits"] = fg_logits
+            output_dict["fg_prob"] = fg_prob
 
         shared_feat = self.pred_trunk(feature_fl)
 

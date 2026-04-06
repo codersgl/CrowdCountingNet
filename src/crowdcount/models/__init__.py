@@ -59,6 +59,9 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_uncertainty=getattr(cfg.model, "use_uncertainty", False),
         uncertainty_scale=float(getattr(cfg.model, "uncertainty_scale", 6.0)),
         gcn_aniso=getattr(cfg.model, "gcn_aniso", False),
+        use_fg_branch=getattr(cfg.model, "use_fg_branch", False),
+        fg_branch_base=float(getattr(cfg.model, "fg_branch_base", 0.5)),
+        fg_branch_scale=float(getattr(cfg.model, "fg_branch_scale", 0.5)),
     )
 
     if not training:

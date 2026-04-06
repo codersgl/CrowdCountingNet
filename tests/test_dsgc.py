@@ -14,6 +14,7 @@ from omegaconf import OmegaConf
 from crowdcount.models.dsgcnet import DSGCnet
 from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
+from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
@@ -111,6 +112,42 @@ def test_alpha_absent_in_moe_mode() -> None:
     cfg = OmegaConf.create({"top_k": 2})
     model = DSGCnet(backbone, row=2, line=2, fusion_mode="esca_moe", moe_cfg=cfg)
     assert model.alpha is None
+
+
+def test_mamba_moe_mode_forward() -> None:
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create(
+        {
+            "d_state": 8,
+            "d_conv": 3,
+            "expand": 1.0,
+            "num_experts": 4,
+            "top_k": 2,
+            "lr_space": "exp",
+            "num_blocks": 1,
+            "mlp_hidden": 64,
+            "drop_path": 0.0,
+            "lambda_balance": 0.01,
+            "use_density_hint": False,
+        }
+    )
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        fusion_mode="mamba_moe",
+        mamba_moe_cfg=cfg,
+    ).eval()
+    assert model.alpha is None
+    assert isinstance(model.mamba_moe, MambaMoEFusion)
+
+    with torch.no_grad():
+        out = model(torch.zeros(1, 3, 128, 128))
+
+    assert out["pred_logits"].shape[0] == 1
+    assert out["pred_points"].shape[0] == 1
+    assert out["moe_weights"] is not None
+    assert out["moe_aux_total"] is not None
 
 
 def test_gate_mechanism_initialized_when_enabled() -> None:

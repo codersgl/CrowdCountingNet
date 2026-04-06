@@ -31,6 +31,7 @@ from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
 from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
+from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.graph_moe import GraphAwareMoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
@@ -89,6 +90,7 @@ class DSGCnet(nn.Module):
         msaa_reduction: int = 4,
         moe_cfg: DictConfig | None = None,
         graph_attn_moe_cfg: DictConfig | None = None,
+        mamba_moe_cfg: DictConfig | None = None,
         use_depth: bool = False,
         depth_cfg: DictConfig | None = None,
         use_depth_geo: bool = False,
@@ -124,6 +126,7 @@ class DSGCnet(nn.Module):
         self.use_moe = fusion_mode == "esca_moe"
         self.use_gcn_moe = fusion_mode == "gcn_moe"
         self.use_graph_attn_moe = fusion_mode == "graph_attn_moe"
+        self.use_mamba_moe = fusion_mode == "mamba_moe"
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
         self.use_freq_head = use_freq_head
@@ -132,9 +135,15 @@ class DSGCnet(nn.Module):
         self._gcn_mode = gcn_mode
         self.use_uncertainty = use_uncertainty
 
-        if self.fusion_mode not in {"gcn", "esca_moe", "gcn_moe", "graph_attn_moe"}:
+        if self.fusion_mode not in {
+            "gcn",
+            "esca_moe",
+            "gcn_moe",
+            "graph_attn_moe",
+            "mamba_moe",
+        }:
             raise ValueError(
-                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', or 'graph_attn_moe'"
+                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', 'graph_attn_moe', or 'mamba_moe'"
             )
 
         density_cfg = (
@@ -214,6 +223,7 @@ class DSGCnet(nn.Module):
             self.alpha = None
             self.gm = None
             self.graph_attn_moe = None
+            self.mamba_moe = None
         elif self.use_graph_attn_moe:
             _gam = graph_attn_moe_cfg
             self.graph_attn_moe: GraphAwareMoE | None = GraphAwareMoE(
@@ -264,6 +274,37 @@ class DSGCnet(nn.Module):
             self.feature_gcn = None
             self.alpha = None
             self.gm = None
+            self.supernode_gcn = None
+            self.cross_stream_gcn = None
+            self.mamba_moe = None
+        elif self.use_mamba_moe:
+            _mmm = mamba_moe_cfg
+            self.mamba_moe: MambaMoEFusion | None = MambaMoEFusion(
+                input_dim=256,
+                d_state=int(getattr(_mmm, "d_state", 16)) if _mmm else 16,
+                d_conv=int(getattr(_mmm, "d_conv", 3)) if _mmm else 3,
+                expand=float(getattr(_mmm, "expand", 2.0)) if _mmm else 2.0,
+                num_experts=int(getattr(_mmm, "num_experts", 4)) if _mmm else 4,
+                top_k=int(getattr(_mmm, "top_k", 2)) if _mmm else 2,
+                lr_space=str(getattr(_mmm, "lr_space", "exp")) if _mmm else "exp",
+                num_blocks=int(getattr(_mmm, "num_blocks", 1)) if _mmm else 1,
+                mlp_hidden=int(getattr(_mmm, "mlp_hidden", 256)) if _mmm else 256,
+                drop_path=float(getattr(_mmm, "drop_path", 0.1)) if _mmm else 0.1,
+                lambda_balance=float(getattr(_mmm, "lambda_balance", 0.01))
+                if _mmm
+                else 0.01,
+                use_density_hint=bool(getattr(_mmm, "use_density_hint", False))
+                if _mmm
+                else False,
+                d_spectral=int(getattr(_mmm, "d_spectral", 256)) if _mmm else 256,
+            )
+            self.esca = None
+            self.moe = None
+            self.density_gcn = None
+            self.feature_gcn = None
+            self.alpha = None
+            self.gm = None
+            self.graph_attn_moe = None
             self.supernode_gcn = None
             self.cross_stream_gcn = None
         else:
@@ -334,6 +375,7 @@ class DSGCnet(nn.Module):
             self.esca = None
             self.moe = None
             self.graph_attn_moe = None
+            self.mamba_moe = None
 
         # LightMoE post-GCN refinement (only for gcn_moe mode)
         if self.use_gcn_moe:
@@ -569,11 +611,20 @@ class DSGCnet(nn.Module):
             self.subpix_refine = None
 
     def supports_moe(self) -> bool:
-        return (self.use_moe and self.moe is not None) or self.light_moe is not None
+        return (
+            (self.use_moe and self.moe is not None)
+            or (self.use_mamba_moe and self.mamba_moe is not None)
+            or self.light_moe is not None
+        )
 
     def get_moe_gating_parameters(self) -> list[nn.Parameter]:
         if self.light_moe is not None:
             return list(self.light_moe.router.parameters())
+        if self.mamba_moe is not None:
+            params: list[nn.Parameter] = []
+            for momeb in self.mamba_moe.blocks:
+                params.extend(momeb.block.spatial_moe.router.parameters())  # type: ignore[union-attr]
+            return params
         if self.moe is None:
             return []
         return list(self.moe.context_encoder.parameters()) + list(
@@ -679,6 +730,14 @@ class DSGCnet(nn.Module):
             output_dict["moe_aux_losses"] = gam_aux_losses
             output_dict["moe_aux_total"] = gam_aux_losses.get("total_aux")
             output_dict["moe_weights"] = gam_weights
+        elif self.use_mamba_moe:
+            assert self.mamba_moe is not None
+            feature_fl, mamba_aux_losses, mamba_weights = self.mamba_moe(
+                features_pa, density.detach(), training=self.training
+            )
+            output_dict["moe_aux_losses"] = mamba_aux_losses
+            output_dict["moe_aux_total"] = mamba_aux_losses.get("total_aux")
+            output_dict["moe_weights"] = mamba_weights
         else:
             if self._gcn_mode == "supernode":
                 assert self.supernode_gcn is not None

@@ -18,9 +18,10 @@ use_msaa: false
 msaa_in_channels: 1280
 msaa_reduction: 4
 
-# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe
+# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe | mamba_moe
 # gcn_moe: GCN dual-stream + LightMoE post-refinement (recommended)
 # graph_attn_moe: 2-expert MoE (local conv + graph-biased attention)
+# mamba_moe: routed directional Mamba experts + shared channel scan
 fusion_mode: gcn
 
 # Adaptive GCN graph construction (only used when fusion_mode: gcn)
@@ -80,6 +81,21 @@ graph_attn_moe:
   disable_graph_bias: false # disable graph bias → plain self-attention
   disable_local_expert: false # disable local expert → global only
   disable_global_expert: false # disable global expert → local only
+
+# MambaMoE fusion (only used when fusion_mode: mamba_moe)
+mamba_moe:
+  d_state: 16
+  d_conv: 3
+  expand: 2.0
+  num_experts: 4
+  top_k: 2
+  lr_space: exp
+  num_blocks: 1
+  mlp_hidden: 256
+  drop_path: 0.1
+  lambda_balance: 0.01
+  use_density_hint: false
+  d_spectral: 256
 
 use_dino_inject: false
 dino_inject_variant: dinov2_b

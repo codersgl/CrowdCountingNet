@@ -28,6 +28,7 @@ dependencies = [
     "ninja>=1.13.0",
     "mamba-ssm",
     "xformers>=0.0.35",
+    "pypdf>=6.9.2",
 ]
 
 [project.optional-dependencies]

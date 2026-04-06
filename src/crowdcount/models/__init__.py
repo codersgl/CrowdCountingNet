@@ -32,6 +32,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         msaa_reduction=getattr(cfg.model, "msaa_reduction", 4),
         moe_cfg=getattr(cfg.model, "moe", None),
         graph_attn_moe_cfg=getattr(cfg.model, "graph_attn_moe", None),
+        mamba_moe_cfg=getattr(cfg.model, "mamba_moe", None),
         use_depth=getattr(cfg.model, "use_depth", False),
         depth_cfg=getattr(cfg.model, "depth", None),
         use_depth_geo=getattr(cfg.model, "use_depth_geo", False),

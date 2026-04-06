@@ -49,6 +49,7 @@ def build_dataset(cfg: DictConfig):
         train=True,
         transform=transform,
         patch=cfg.data.patch,
+        patch_size=int(cfg.data.get("patch_size", 128)),
         flip=cfg.data.flip,
         use_depth=needs_depth,
         depth_cfg=depth_cfg,

@@ -28,6 +28,7 @@ class SHHA(Dataset):
         transform=None,
         train: bool = False,
         patch: bool = False,
+        patch_size: int = 128,
         flip: bool = False,
         use_depth: bool = False,
         depth_cfg=None,
@@ -35,6 +36,11 @@ class SHHA(Dataset):
         self.root_path = data_root
         self.gt_density = "gt_density_maps"
         self.use_depth = use_depth
+        if patch_size <= 0 or patch_size % 8 != 0:
+            raise ValueError(
+                f"patch_size must be a positive multiple of 8, got {patch_size}"
+            )
+        self.patch_size = patch_size
         split = "train" if train else "test"
 
         if train:
@@ -130,7 +136,8 @@ class SHHA(Dataset):
             scale_range = [0.7, 1.3]
             min_size = min(img.shape[1:])
             scale = random.uniform(*scale_range)
-            if scale * min_size > 128:
+            min_crop = self.patch_size if self.patch else 128
+            if scale * min_size > min_crop:
                 img = torch.nn.functional.interpolate(
                     img.unsqueeze(0),
                     scale_factor=scale,
@@ -162,7 +169,9 @@ class SHHA(Dataset):
                 img_with_density = torch.cat((img, gt_dmap1), dim=0)
 
         if self.train and self.patch:
-            img_with_density, point = _random_crop(img_with_density, point)
+            img_with_density, point = _random_crop(
+                img_with_density, point, crop_size=self.patch_size
+            )
             for i in range(len(point)):
                 point[i] = torch.Tensor(point[i])
 
@@ -217,12 +226,18 @@ class SHHA(Dataset):
             target[i]["labels"] = torch.ones([point[i].shape[0]]).long()
 
         if self.train:
+            stride = 8  # PA-FPN output stride
+            density_target_h = density.shape[-2] // stride
+            density_target_w = density.shape[-1] // stride
             density_images = torch.zeros(
-                (density.shape[0], 1, 16, 16), dtype=density.dtype
+                (density.shape[0], 1, density_target_h, density_target_w),
+                dtype=density.dtype,
             )
             for i in range(density.shape[0]):
                 density_img = density[i, 0, :, :]
-                resized_img = density_img.reshape([16, 8, 16, 8]).sum(axis=(1, 3))
+                resized_img = density_img.reshape(
+                    [density_target_h, stride, density_target_w, stride]
+                ).sum(axis=(1, 3))
                 density_images[i, 0, :, :] = resized_img
             if self.use_depth:
                 return img, target, density_images, depth
@@ -248,9 +263,9 @@ def _load_data(img_gt_path, train: bool):
     return img, points
 
 
-def _random_crop(img, den, num_patch: int = 4):
-    half_h = 128
-    half_w = 128
+def _random_crop(img, den, num_patch: int = 4, crop_size: int = 128):
+    half_h = crop_size
+    half_w = crop_size
     result_img = np.zeros([num_patch, img.shape[0], half_h, half_w])
     result_den = []
     for i in range(num_patch):

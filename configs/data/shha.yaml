@@ -2,4 +2,5 @@ dataset: SHHA
 data_root: "data/shanghaitech/part_A_final" # override: data.data_root=/path/to/sha
 batch_size: 8
 patch: true
+patch_size: 128 # spatial size of each random crop (must be divisible by 8)
 flip: true

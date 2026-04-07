@@ -48,58 +48,6 @@ class DensityAttentionMask(nn.Module):
         return torch.sigmoid(self.proj(density))
 
 
-class MultiScaleDensityAttention(nn.Module):
-    """Fuse multi-scale density predictions into a single spatial attention mask.
-
-    When multi-scale density supervision is enabled, block3/4/5 density heads
-    produce predictions at different resolutions.  This module resizes them to a
-    common resolution (block4, i.e. H/16×W/16) and learns a lightweight
-    aggregation that produces a [B, 1, H/16, W/16] attention mask in [0, 1].
-
-    Parameters
-    ----------
-    hidden_channels : int
-        Intermediate channel count for the fusion convolutions (default 8).
-    """
-
-    def __init__(self, hidden_channels: int = 8) -> None:
-        super().__init__()
-        # 3 input channels: one per scale (block3, block4, block5)
-        self.fuse = nn.Sequential(
-            nn.Conv2d(3, hidden_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, 1, kernel_size=1),
-        )
-
-    def forward(
-        self,
-        density_block3: torch.Tensor,
-        density_block4: torch.Tensor,
-        density_block5: torch.Tensor,
-    ) -> torch.Tensor:
-        """Produce attention mask at block4 resolution.
-
-        Args:
-            density_block3: [B, 1, H/8, W/8]
-            density_block4: [B, 1, H/16, W/16]
-            density_block5: [B, 1, H/32, W/32]
-
-        Returns:
-            Attention mask [B, 1, H/16, W/16] in [0, 1].
-        """
-        target_size = density_block4.shape[-2:]
-        d3 = F.interpolate(
-            density_block3, size=target_size, mode="bilinear", align_corners=False
-        )
-        d5 = F.interpolate(
-            density_block5, size=target_size, mode="bilinear", align_corners=False
-        )
-        # [B, 3, H/16, W/16]
-        concat = torch.cat([d3, density_block4, d5], dim=1)
-        return torch.sigmoid(self.fuse(concat))
-
-
 class SharedPredictionTrunk(nn.Module):
     """Shared 2-layer conv feature extractor for regression and classification heads.
 

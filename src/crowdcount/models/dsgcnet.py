@@ -17,7 +17,6 @@ from crowdcount.models.head import (
     ClassificationModel,
     DensityAttentionMask,
     Density_pred,
-    MultiScaleDensityAttention,
     ForegroundSuppressionBranch,
     FreqDecoupledRouter,
     PointRefineModule,
@@ -175,15 +174,11 @@ class DSGCnet(nn.Module):
         else:
             self.pa = Decoder_SPD_PAFPN(256, 512, 512, use_dcn=use_dcn)
         self.density_pred = Density_pred()
-        # Density attention: use multi-scale variant when both density_attention
-        # and multi-scale density are enabled; otherwise fall back to single-scale.
-        self.density_attention: MultiScaleDensityAttention | DensityAttentionMask | None
-        if use_density_attention and self.use_multi_scale_density:
-            self.density_attention = MultiScaleDensityAttention()
-        elif use_density_attention:
-            self.density_attention = DensityAttentionMask(mode=density_attention_mode)
-        else:
-            self.density_attention = None
+        self.density_attention: DensityAttentionMask | None = (
+            DensityAttentionMask(mode=density_attention_mode)
+            if use_density_attention
+            else None
+        )
 
         # Multi-scale density prediction (optional)
         if self.use_multi_scale_density:
@@ -813,18 +808,9 @@ class DSGCnet(nn.Module):
 
         # SEMC post-GCN enhancement (optional, disabled by default)
         if self.density_attention is not None:
-            if self.use_multi_scale_density and isinstance(
-                self.density_attention, MultiScaleDensityAttention
-            ):
-                attention_mask = self.density_attention(
-                    output_dict["density_block3"].detach(),
-                    output_dict["density_block4"].detach(),
-                    output_dict["density_block5"].detach(),
-                ).to(feature_fl.dtype)
-            else:
-                attention_mask = self.density_attention(density.detach()).to(
-                    feature_fl.dtype
-                )
+            attention_mask = self.density_attention(density.detach()).to(
+                feature_fl.dtype
+            )
             feature_fl = feature_fl * attention_mask
 
         if self.semc_enhancer is not None and not self.use_moe:

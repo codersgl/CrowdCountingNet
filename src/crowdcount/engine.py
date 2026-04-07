@@ -129,6 +129,12 @@ def train_one_epoch(
 
         et_dmap = outputs["density_out"]
 
+        # Crop predicted density map to GT size (padding from collation may
+        # make the prediction spatially larger than the un-padded GT).
+        if et_dmap.shape[-2:] != gt_dmap.shape[-2:]:
+            gt_h, gt_w = gt_dmap.shape[-2:]
+            et_dmap = et_dmap[:, :, :gt_h, :gt_w]
+
         # Compute density loss (single or multi-scale)
         if use_multi_scale_density and all(
             k in outputs for k in ["density_block3", "density_block4", "density_block5"]

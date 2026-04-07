@@ -88,6 +88,11 @@ def train_one_epoch(
     fg_pos_weight = (
         float(getattr(cfg, "fg_pos_weight", 5.0)) if cfg is not None else 5.0
     )
+    cross_scale_weight = (
+        float(getattr(cfg, "density_cross_scale_weight", 0.001))
+        if cfg is not None
+        else 0.001
+    )
     use_depth = bool(
         getattr(getattr(cfg, "model", None), "use_depth", False)
         if cfg is not None
@@ -225,6 +230,30 @@ def train_one_epoch(
         if moe_aux_total is not None:
             moe_aux_component = moe_aux_weight * moe_aux_total
 
+        # Cross-scale density consistency loss
+        cross_scale_loss = torch.tensor(0.0, device=samples.device)
+        if use_multi_scale_density and all(
+            k in outputs for k in ["density_block3", "density_block4", "density_block5"]
+        ):
+            db3 = outputs["density_block3"]
+            db4 = outputs["density_block4"]
+            db5 = outputs["density_block5"]
+            target_size = db4.shape[-2:]
+            db3_resized = F.interpolate(
+                db3, size=target_size, mode="bilinear", align_corners=False
+            )
+            db5_resized = F.interpolate(
+                db5, size=target_size, mode="bilinear", align_corners=False
+            )
+            # Spatial consistency
+            spatial_consist = F.l1_loss(db3_resized, db4) + F.l1_loss(db5_resized, db4)
+            # Count consistency (density integral should match across scales)
+            count_consist = F.l1_loss(
+                db3.sum(dim=[1, 2, 3]), db4.sum(dim=[1, 2, 3])
+            ) + F.l1_loss(db5.sum(dim=[1, 2, 3]), db4.sum(dim=[1, 2, 3]))
+            cross_scale_loss = cross_scale_weight * (spatial_consist + count_consist)
+            metric_logger.update(cross_scale_loss=cross_scale_loss.item())
+
         # Foreground suppression branch loss
         fg_loss = torch.tensor(0.0, device=samples.device)
         fg_logits = outputs.get("fg_logits")
@@ -241,7 +270,9 @@ def train_one_epoch(
                 * fg_loss_weight
             )
 
-        loss_sum = losses + density_loss + moe_aux_component + fg_loss
+        loss_sum = (
+            losses + density_loss + moe_aux_component + fg_loss + cross_scale_loss
+        )
 
         loss_dict_reduced = reduce_dict(loss_dict)
         loss_dict_reduced_unscaled = {

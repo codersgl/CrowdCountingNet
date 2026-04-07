@@ -48,6 +48,9 @@ density_multi_scale:
     block3: 0.5 # Weight for H/8 density loss
     block4: 1.0 # Weight for H/16 density loss (original scale)
     block5: 0.5 # Weight for H/32 density loss
+
+# Cross-scale density consistency (only used when density_multi_scale.enabled: true)
+density_cross_scale_weight: 0.001
     original: 1.0 # Weight for original PA-FPN density loss
 
 hydra:

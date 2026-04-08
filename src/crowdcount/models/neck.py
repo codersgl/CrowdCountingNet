@@ -1,5 +1,7 @@
 """Feature fusion neck for DSGCNet: SPD + PA-FPN."""
 
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 from torchvision.ops import DeformConv2d
@@ -97,8 +99,20 @@ class Decoder_SPD_PAFPN(nn.Module):
         C5_size: int,
         feature_size: int = 256,
         use_dcn: bool = False,
+        fpn_attention: bool = False,
     ):
         super().__init__()
+        self.fpn_attention = fpn_attention
+
+        # Lazy import to avoid circular deps
+        if fpn_attention:
+            from crowdcount.plugins.msaa import FPNAttentionGate, FPNSpatialAttention
+
+            self.td_gate_p5 = FPNAttentionGate(feature_size)
+            self.td_gate_p4 = FPNAttentionGate(feature_size)
+            self.bu_gate_p4 = FPNAttentionGate(feature_size)
+            self.bu_gate_p5 = FPNAttentionGate(feature_size)
+            self.final_spatial = FPNSpatialAttention()
         # Top-down pathway: C5 → P5
         self.P5_1 = nn.Sequential(
             nn.Conv2d(C5_size, feature_size, kernel_size=1, stride=1, padding=0),
@@ -151,20 +165,38 @@ class Decoder_SPD_PAFPN(nn.Module):
         P5_upsampled_x = self.P5_upsampled(P5_x)
         P5_x = self.P5_2(P5_x)
 
-        P4_x = self.P4_1(C4) + P5_upsampled_x
+        P4_lateral = self.P4_1(C4)
+        if self.fpn_attention:
+            P4_x = self.td_gate_p5(P4_lateral, P5_upsampled_x)
+        else:
+            P4_x = P4_lateral + P5_upsampled_x
         P4_upsampled_x = self.P4_upsampled(P4_x)
         P4_x = self.P4_2(P4_x)
 
-        P3_x = self.P3_1(C3) + P4_upsampled_x
+        P3_lateral = self.P3_1(C3)
+        if self.fpn_attention:
+            P3_x = self.td_gate_p4(P3_lateral, P4_upsampled_x)
+        else:
+            P3_x = P3_lateral + P4_upsampled_x
         P3_x = self.P3_2(P3_x)
 
         # Bottom-up
-        P3_x = self.P3_downsampled(P3_x)
-        P4_x = P4_x + P3_x
+        P3_down = self.P3_downsampled(P3_x)
+        if self.fpn_attention:
+            P4_x = self.bu_gate_p4(P4_x, P3_down)
+        else:
+            P4_x = P4_x + P3_down
         P4_x = self.P4_2_bu(P4_x)
-        P5_x = P5_x + self.P4_downsampled(P4_x)
+        P4_down = self.P4_downsampled(P4_x)
+        if self.fpn_attention:
+            P5_x = self.bu_gate_p5(P5_x, P4_down)
+        else:
+            P5_x = P5_x + P4_down
         P5_x = self.P5_2_bu(P5_x)
         P5_x = self.P5_upsampled(P5_x)
 
-        fuse = torch.cat([P3_x, P4_x, P5_x], 1)
-        return self.fusion(fuse)
+        fuse = torch.cat([P3_down, P4_x, P5_x], 1)
+        out = self.fusion(fuse)
+        if self.fpn_attention:
+            out = self.final_spatial(out)
+        return out

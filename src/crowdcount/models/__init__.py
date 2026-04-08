@@ -30,6 +30,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_msaa=getattr(cfg.model, "use_msaa", False),
         msaa_in_channels=getattr(cfg.model, "msaa_in_channels", 1280),
         msaa_reduction=getattr(cfg.model, "msaa_reduction", 4),
+        msaa_variant=getattr(cfg.model, "msaa_variant", "legacy"),
         moe_cfg=getattr(cfg.model, "moe", None),
         graph_attn_moe_cfg=getattr(cfg.model, "graph_attn_moe", None),
         mamba_moe_cfg=getattr(cfg.model, "mamba_moe", None),
@@ -62,6 +63,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_fg_branch=getattr(cfg.model, "use_fg_branch", False),
         fg_branch_base=float(getattr(cfg.model, "fg_branch_base", 0.5)),
         fg_branch_scale=float(getattr(cfg.model, "fg_branch_scale", 0.5)),
+        fpn_attention=getattr(cfg.model, "fpn_attention", False),
     )
 
     if not training:

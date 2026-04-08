@@ -35,7 +35,7 @@ from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.graph_moe import GraphAwareMoE
-from crowdcount.plugins.msaa import MsaaAdaptiveLayer
+from crowdcount.plugins.msaa import MSAAGate, MSAALite, MsaaAdaptiveLayer
 
 
 class _DepthEncoder(nn.Module):
@@ -89,6 +89,7 @@ class DSGCnet(nn.Module):
         use_msaa: bool = False,
         msaa_in_channels: int = 1280,
         msaa_reduction: int = 4,
+        msaa_variant: str = "legacy",
         moe_cfg: DictConfig | None = None,
         graph_attn_moe_cfg: DictConfig | None = None,
         mamba_moe_cfg: DictConfig | None = None,
@@ -121,6 +122,7 @@ class DSGCnet(nn.Module):
         use_fg_branch: bool = False,
         fg_branch_base: float = 0.5,
         fg_branch_scale: float = 0.5,
+        fpn_attention: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
@@ -169,10 +171,14 @@ class DSGCnet(nn.Module):
         )
 
         self.anchor_points = AnchorPoints(pyramid_levels=[3], row=row, line=line)
-        if use_msaa:
-            self.pa = Decoder_SPD_PAFPN(1280, 1280, 1280, use_dcn=use_dcn)
+        if use_msaa and msaa_variant == "legacy":
+            self.pa = Decoder_SPD_PAFPN(
+                1280, 1280, 1280, use_dcn=use_dcn, fpn_attention=fpn_attention
+            )
         else:
-            self.pa = Decoder_SPD_PAFPN(256, 512, 512, use_dcn=use_dcn)
+            self.pa = Decoder_SPD_PAFPN(
+                256, 512, 512, use_dcn=use_dcn, fpn_attention=fpn_attention
+            )
         self.density_pred = Density_pred()
         self.density_attention: DensityAttentionMask | None = (
             DensityAttentionMask(mode=density_attention_mode)
@@ -407,7 +413,20 @@ class DSGCnet(nn.Module):
 
         self.msaa: MsaaAdaptiveLayer | None = (
             MsaaAdaptiveLayer(in_channels=msaa_in_channels, reduction=msaa_reduction)
-            if use_msaa
+            if use_msaa and msaa_variant == "legacy"
+            else None
+        )
+
+        # MSAALite: lightweight post-PA-FPN attention (Phase 1)
+        self.msaa_lite: MSAALite | None = (
+            MSAALite(in_channels=256) if use_msaa and msaa_variant == "lite" else None
+        )
+
+        # MSAAGate: attention-based GCN stream fusion (Phase 3)
+        # Replaces GateMechanism when msaa_variant == "msaa_gate"
+        self.msaa_gate: MSAAGate | None = (
+            MSAAGate(in_channels=256, num_streams=3)
+            if use_msaa and msaa_variant == "msaa_gate"
             else None
         )
 
@@ -690,6 +709,10 @@ class DSGCnet(nn.Module):
 
         features_pa = self.pa([c3, c4, c5])  # [batch_size, 256, 16, 16]
 
+        # Phase 1: MSAALite post-PA-FPN attention refinement
+        if self.msaa_lite is not None:
+            features_pa = self.msaa_lite(features_pa)
+
         # DINOv2 semantic injection: bounded gate (tanh) starts at 0
         if self.dino_injector is not None and self.dino_gate is not None:
             dino_feat = self.dino_injector(samples, target_size=features_pa.shape[-2:])
@@ -769,7 +792,12 @@ class DSGCnet(nn.Module):
                     density, features_pa, uncertainty=uncertainty
                 )
                 feature_gcn_feature = self.feature_gcn(features_pa)
-                if self.gm is not None:
+                if self.msaa_gate is not None:
+                    # Phase 3: MSAAGate multi-scale attention fusion
+                    feature_fl = self.msaa_gate(
+                        features_pa, density_gcn_feature, feature_gcn_feature
+                    )
+                elif self.gm is not None:
                     gate_weight = self.gm(features_pa)
                     if gate_weight.dim() == 4:
                         # SpatialGateMechanism: [B, 3, H, W]

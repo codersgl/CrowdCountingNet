@@ -229,38 +229,44 @@ class MSCABlock(nn.Module):
         feat_h = w_val * x_h
         feat_v = (1.0 - w_val) * x_v
 
-        # ---- Cross-attention: Q from one branch queries KV from other ----
-        # feat_h → Q_h, K_h, V_h
+        # ---- Axis-wise cross-attention (memory-efficient) ----
+        # Horizontal branch: each ROW attends independently along width
+        #   Q from horizontal, K/V from vertical  → attn shape [B*heads*H, W, W]
+        # Vertical branch: each COLUMN attends independently along height
+        #   Q from vertical, K/V from horizontal → attn shape [B*heads*W, H, H]
         qkv_h = self.to_qkv_h(feat_h)
         q_h, k_h, v_h = qkv_h.chunk(3, dim=1)
-        # feat_v → Q_v, K_v, V_v
         qkv_v = self.to_qkv_v(feat_v)
         q_v, k_v, v_v = qkv_v.chunk(3, dim=1)
 
-        # Reshape to multi-head: [B, heads, N, head_dim]
         head_dim = c // self.num_heads
-        n = h * w
-
-        def _to_heads(t: torch.Tensor) -> torch.Tensor:
-            return rearrange(t, "b (head d) h w -> b head (h w) d", head=self.num_heads)
-
-        q_h_, k_h_, v_h_ = _to_heads(q_h), _to_heads(k_h), _to_heads(v_h)
-        q_v_, k_v_, v_v_ = _to_heads(q_v), _to_heads(k_v), _to_heads(v_v)
-
         scale = head_dim**-0.5
 
-        # Branch 1: Q_h queries K_v, V_v (horizontal queries vertical)
-        attn_1 = (q_h_ @ k_v_.transpose(-2, -1)) * scale
+        # Branch 1 (row-wise): Q_h queries K_v, V_v along width
+        # Reshape to [B, heads, H, W, d] then merge B*heads*H → attention over W
+        q_h_ = rearrange(q_h, "b (head d) h w -> (b head h) w d", head=self.num_heads)
+        k_v_ = rearrange(k_v, "b (head d) h w -> (b head h) w d", head=self.num_heads)
+        v_v_ = rearrange(v_v, "b (head d) h w -> (b head h) w d", head=self.num_heads)
+
+        attn_1 = (q_h_ @ k_v_.transpose(-2, -1)) * scale  # [B*heads*H, W, W]
         attn_1 = attn_1.softmax(dim=-1)
-        out_1 = attn_1 @ v_v_
-        out_1 = rearrange(out_1, "b head (h w) d -> b (head d) h w", h=h, w=w)
+        out_1 = attn_1 @ v_v_  # [B*heads*H, W, d]
+        out_1 = rearrange(
+            out_1, "(b head h) w d -> b (head d) h w", b=b, head=self.num_heads, h=h
+        )
         out_1 = self.proj_out_1(out_1)
 
-        # Branch 2: Q_v queries K_h, V_h (vertical queries horizontal)
-        attn_2 = (q_v_ @ k_h_.transpose(-2, -1)) * scale
+        # Branch 2 (column-wise): Q_v queries K_h, V_h along height
+        q_v_ = rearrange(q_v, "b (head d) h w -> (b head w) h d", head=self.num_heads)
+        k_h_ = rearrange(k_h, "b (head d) h w -> (b head w) h d", head=self.num_heads)
+        v_h_ = rearrange(v_h, "b (head d) h w -> (b head w) h d", head=self.num_heads)
+
+        attn_2 = (q_v_ @ k_h_.transpose(-2, -1)) * scale  # [B*heads*W, H, H]
         attn_2 = attn_2.softmax(dim=-1)
-        out_2 = attn_2 @ v_h_
-        out_2 = rearrange(out_2, "b head (h w) d -> b (head d) h w", h=h, w=w)
+        out_2 = attn_2 @ v_h_  # [B*heads*W, H, d]
+        out_2 = rearrange(
+            out_2, "(b head w) h d -> b (head d) h w", b=b, head=self.num_heads, w=w
+        )
         out_2 = self.proj_out_2(out_2)
 
         # ---- Fusion: out_1 + out_2 + density injection ----

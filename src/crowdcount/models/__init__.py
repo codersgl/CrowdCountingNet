@@ -64,6 +64,8 @@ def build_model(cfg: DictConfig, training: bool = False):
         fg_branch_base=float(getattr(cfg.model, "fg_branch_base", 0.5)),
         fg_branch_scale=float(getattr(cfg.model, "fg_branch_scale", 0.5)),
         fpn_attention=getattr(cfg.model, "fpn_attention", False),
+        use_msca_decoder=getattr(cfg.model, "use_msca_decoder", False),
+        msca_num_heads=int(getattr(cfg.model, "msca_num_heads", 8)),
     )
 
     if not training:

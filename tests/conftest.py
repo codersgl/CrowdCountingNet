@@ -97,6 +97,8 @@ def base_cfg():
                 "uncertainty_scale": 6.0,
                 "uncertainty_boost": 2.0,
                 "consistency_loss_coef": 0.0,
+                "use_msca_decoder": False,
+                "msca_num_heads": 8,
             },
             "optimizer": {
                 "name": "adam",

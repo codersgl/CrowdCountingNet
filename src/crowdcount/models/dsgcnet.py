@@ -36,6 +36,7 @@ from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.graph_moe import GraphAwareMoE
 from crowdcount.plugins.msaa import MSAAGate, MSAALite, MsaaAdaptiveLayer
+from crowdcount.plugins.MSCA import MSCADecoder
 
 
 class _DepthEncoder(nn.Module):
@@ -123,6 +124,8 @@ class DSGCnet(nn.Module):
         fg_branch_base: float = 0.5,
         fg_branch_scale: float = 0.5,
         fpn_attention: bool = False,
+        use_msca_decoder: bool = False,
+        msca_num_heads: int = 8,
     ):
         super().__init__()
         self.backbone = backbone
@@ -140,6 +143,7 @@ class DSGCnet(nn.Module):
         self.use_subpix_refine = use_subpix_refine
         self._gcn_mode = gcn_mode
         self.use_uncertainty = use_uncertainty
+        self.use_msca_decoder = use_msca_decoder
 
         if self.fusion_mode not in {
             "gcn",
@@ -171,15 +175,28 @@ class DSGCnet(nn.Module):
         )
 
         self.anchor_points = AnchorPoints(pyramid_levels=[3], row=row, line=line)
-        if use_msaa and msaa_variant == "legacy":
-            self.pa = Decoder_SPD_PAFPN(
-                1280, 1280, 1280, use_dcn=use_dcn, fpn_attention=fpn_attention
+        if use_msca_decoder:
+            # MSCADecoder replaces PA-FPN + Density_pred + GCN in one module
+            self.msca_decoder: MSCADecoder | None = MSCADecoder(
+                C3_size=256,
+                C4_size=512,
+                C5_size=512,
+                feature_size=256,
+                num_heads=msca_num_heads,
             )
+            self.pa = None  # type: ignore[assignment]
+            self.density_pred = None  # type: ignore[assignment]
         else:
-            self.pa = Decoder_SPD_PAFPN(
-                256, 512, 512, use_dcn=use_dcn, fpn_attention=fpn_attention
-            )
-        self.density_pred = Density_pred()
+            self.msca_decoder = None
+            if use_msaa and msaa_variant == "legacy":
+                self.pa = Decoder_SPD_PAFPN(
+                    1280, 1280, 1280, use_dcn=use_dcn, fpn_attention=fpn_attention
+                )
+            else:
+                self.pa = Decoder_SPD_PAFPN(
+                    256, 512, 512, use_dcn=use_dcn, fpn_attention=fpn_attention
+                )
+            self.density_pred = Density_pred()
         self.density_attention: DensityAttentionMask | None = (
             DensityAttentionMask(mode=density_attention_mode)
             if use_density_attention
@@ -707,19 +724,28 @@ class DSGCnet(nn.Module):
             c4 = self.geo_attn_c4(c4, depth_map)  # type: ignore[misc]
             c5 = self.geo_attn_c5(c5, depth_map)  # type: ignore[misc]
 
-        features_pa = self.pa([c3, c4, c5])  # [batch_size, 256, 16, 16]
+        # --- MSCADecoder path: replaces PA-FPN + Density_pred + GCN ----
+        if self.use_msca_decoder:
+            assert self.msca_decoder is not None
+            feature_fl, density = self.msca_decoder([c3, c4, c5])
+            features_pa = feature_fl  # alias for downstream consumers
+        else:
+            features_pa = self.pa([c3, c4, c5])  # [batch_size, 256, 16, 16]
 
-        # Phase 1: MSAALite post-PA-FPN attention refinement
-        if self.msaa_lite is not None:
-            features_pa = self.msaa_lite(features_pa)
+            # Phase 1: MSAALite post-PA-FPN attention refinement
+            if self.msaa_lite is not None:
+                features_pa = self.msaa_lite(features_pa)
 
-        # DINOv2 semantic injection: bounded gate (tanh) starts at 0
-        if self.dino_injector is not None and self.dino_gate is not None:
-            dino_feat = self.dino_injector(samples, target_size=features_pa.shape[-2:])
-            features_pa = features_pa + self.dino_gate.tanh() * dino_feat
+            # DINOv2 semantic injection: bounded gate (tanh) starts at 0
+            if self.dino_injector is not None and self.dino_gate is not None:
+                dino_feat = self.dino_injector(
+                    samples, target_size=features_pa.shape[-2:]
+                )
+                features_pa = features_pa + self.dino_gate.tanh() * dino_feat
+
+            density = self.density_pred(features_pa)
 
         batch_size = features_list[0].shape[0]
-        density = self.density_pred(features_pa)
 
         # Uncertainty map from density prediction (detach to avoid gradient leak)
         uncertainty = (
@@ -751,7 +777,10 @@ class DSGCnet(nn.Module):
                 }
             )
 
-        if self.use_moe:
+        # MSCADecoder already produced feature_fl; skip GCN/MoE fusion
+        if self.use_msca_decoder:
+            pass
+        elif self.use_moe:
             assert self.esca is not None and self.moe is not None
             esca_feature = self.esca(features_pa)
             feature_fl, moe_aux_losses, moe_weights = self.moe(

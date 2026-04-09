@@ -66,6 +66,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         fpn_attention=getattr(cfg.model, "fpn_attention", False),
         use_msca_decoder=getattr(cfg.model, "use_msca_decoder", False),
         msca_num_heads=int(getattr(cfg.model, "msca_num_heads", 8)),
+        msca_num_blocks=int(getattr(cfg.model, "msca_num_blocks", 2)),
     )
 
     if not training:

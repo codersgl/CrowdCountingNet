@@ -99,6 +99,7 @@ def base_cfg():
                 "consistency_loss_coef": 0.0,
                 "use_msca_decoder": False,
                 "msca_num_heads": 8,
+                "msca_num_blocks": 2,
             },
             "optimizer": {
                 "name": "adam",

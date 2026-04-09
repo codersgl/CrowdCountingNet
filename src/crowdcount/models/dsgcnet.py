@@ -126,6 +126,7 @@ class DSGCnet(nn.Module):
         fpn_attention: bool = False,
         use_msca_decoder: bool = False,
         msca_num_heads: int = 8,
+        msca_num_blocks: int = 2,
     ):
         super().__init__()
         self.backbone = backbone
@@ -183,6 +184,7 @@ class DSGCnet(nn.Module):
                 C5_size=512,
                 feature_size=256,
                 num_heads=msca_num_heads,
+                num_blocks=msca_num_blocks,
             )
             self.pa = None  # type: ignore[assignment]
             self.density_pred = None  # type: ignore[assignment]

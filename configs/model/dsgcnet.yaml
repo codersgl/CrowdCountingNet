@@ -157,7 +157,7 @@ freq_head_kernel: 3 # AvgPool kernel size for low-pass filter
 # Decoupled Head (disabled by default)
 # Replaces the shared prediction trunk with two independent trunks so that
 # classification and regression tasks learn completely separate features.
-use_decoupled_head: false
+use_decoupled_head: true
 
 # Sub-Pixel Refinement (disabled by default)
 # For top-K high-confidence points, bilinear-samples from C3 (stride 8) features

@@ -169,6 +169,17 @@ class SHHA(Dataset):
                 img_with_density = torch.cat((img, gt_dmap1), dim=0)
 
         if self.train and self.patch:
+            # Ensure image is large enough for cropping
+            h, w = img_with_density.shape[-2:]
+            if h < self.patch_size or w < self.patch_size:
+                scale_up = max(self.patch_size / h, self.patch_size / w)
+                img_with_density = torch.nn.functional.interpolate(
+                    img_with_density.unsqueeze(0),
+                    scale_factor=scale_up,
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+                point *= scale_up
             img_with_density, point = _random_crop(
                 img_with_density, point, crop_size=self.patch_size
             )

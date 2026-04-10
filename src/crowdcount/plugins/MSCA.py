@@ -194,18 +194,24 @@ class MSCABlock(nn.Module):
         self.proj_v = nn.Conv2d(dim * 3, dim, 1)
 
         # ---- Learnable weight W for branch balancing ----
-        # W applied to horizontal, (1-W) applied to vertical
         self.W = nn.Parameter(torch.tensor(0.5))
 
         # ---- QKV projections for cross-attention ----
-        # Horizontal branch → V_h, K_h (used by vertical query)
-        # Vertical branch → V_v, K_v (used by horizontal query)
         self.to_qkv_h = nn.Conv2d(dim, dim * 3, 1, bias=False)
         self.to_qkv_v = nn.Conv2d(dim, dim * 3, 1, bias=False)
 
         # Output projections
         self.proj_out_1 = nn.Conv2d(dim, dim, 1)
         self.proj_out_2 = nn.Conv2d(dim, dim, 1)
+
+        # ---- Density injection: channel-wise modulation ----
+        # Maps density_prob [B,1,H,W] → per-channel scale [B,C,H,W]
+        self.density_gate = nn.Sequential(
+            nn.Conv2d(1, dim // 4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim // 4, dim, 1),
+            nn.Sigmoid(),
+        )
 
     def forward(self, x: torch.Tensor, density_prob: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
@@ -269,8 +275,10 @@ class MSCABlock(nn.Module):
         )
         out_2 = self.proj_out_2(out_2)
 
-        # ---- Fusion: out_1 + out_2 + density injection ----
-        out = out_1 + out_2 + density_prob
+        # ---- Fusion: residual + attention + density modulation ----
+        attn_out = out_1 + out_2
+        density_scale = self.density_gate(density_prob)  # [B, C, H, W]
+        out = x + attn_out * density_scale
 
         return out
 

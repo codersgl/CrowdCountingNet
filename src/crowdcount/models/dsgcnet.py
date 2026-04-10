@@ -753,7 +753,7 @@ class DSGCnet(nn.Module):
             c4 = self.geo_attn_c4(c4, depth_map)  # type: ignore[misc]
             c5 = self.geo_attn_c5(c5, depth_map)  # type: ignore[misc]
 
-        # --- MSCADecoder path: replaces PA-FPN + Density_pred + GCN ----
+        # --- MSCADecoder path: replaces PA-FPN + Density_pred, GCN runs downstream ---
         if self.use_msca_decoder:
             assert self.msca_decoder is not None
             feature_fl, density = self.msca_decoder([c3, c4, c5])
@@ -806,10 +806,8 @@ class DSGCnet(nn.Module):
                 }
             )
 
-        # MSCADecoder already produced feature_fl; skip GCN/MoE fusion
-        if self.use_msca_decoder:
-            pass
-        elif self.use_moe:
+        # MSCADecoder produced features_pa + density; GCN still runs below
+        if self.use_moe:
             assert self.esca is not None and self.moe is not None
             esca_feature = self.esca(features_pa)
             feature_fl, moe_aux_losses, moe_weights = self.moe(

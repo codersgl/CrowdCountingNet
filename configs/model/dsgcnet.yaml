@@ -175,8 +175,8 @@ fg_branch_base: 0.5 # minimum feature pass-through ratio
 fg_branch_scale: 0.5 # max additional boost from foreground probability
 
 # MSCADecoder: Multi-axis Strip Cross-Attention decoder (disabled by default)
-# When enabled, replaces PA-FPN (neck) + Density_pred + GCN fusion entirely
-# with a single attention-based decoder module.
+# When enabled, replaces PA-FPN (neck) + Density_pred with MSCA-based decoder.
+# GCN fusion still runs downstream on the MSCADecoder output.
 use_msca_decoder: false
 msca_num_heads: 8 # number of attention heads in MSCABlock
 msca_num_blocks: 2 # number of stacked MSCA blocks (×N)

@@ -894,3 +894,29 @@ def test_msca_neck_disabled_by_default() -> None:
     backbone = TinyVGGBackbone()
     model = DSGCnet(backbone, row=2, line=2)
     assert not model.use_msca_neck
+
+
+# --------------- MSCADecoder + GCN serial pipeline --------------- #
+
+
+def test_msca_decoder_with_gcn_forward() -> None:
+    """MSCADecoder should feed into GCN and produce valid outputs."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2, use_msca_decoder=True)
+    model.eval()
+    x = torch.randn(2, 3, 128, 128)
+    with torch.no_grad():
+        out = model(x)
+    assert out["pred_logits"] is not None
+    assert out["pred_points"] is not None
+    assert out["density_out"] is not None
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_points"].shape[0] == 2
+
+
+def test_msca_decoder_preserves_gcn() -> None:
+    """When use_msca_decoder=True, GCN modules should still be instantiated."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2, use_msca_decoder=True)
+    assert model.density_gcn is not None
+    assert model.feature_gcn is not None

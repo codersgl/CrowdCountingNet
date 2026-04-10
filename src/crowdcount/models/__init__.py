@@ -67,6 +67,8 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_msca_decoder=getattr(cfg.model, "use_msca_decoder", False),
         msca_num_heads=int(getattr(cfg.model, "msca_num_heads", 8)),
         msca_num_blocks=int(getattr(cfg.model, "msca_num_blocks", 2)),
+        use_decoupled_head=getattr(cfg.model, "use_decoupled_head", False),
+        use_msca_neck=getattr(cfg.model, "use_msca_neck", False),
     )
 
     if not training:

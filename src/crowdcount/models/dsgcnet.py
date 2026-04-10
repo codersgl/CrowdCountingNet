@@ -15,6 +15,7 @@ from crowdcount.models.gcn import (
 )
 from crowdcount.models.head import (
     ClassificationModel,
+    DecoupledPredictionHead,
     DensityAttentionMask,
     Density_pred,
     ForegroundSuppressionBranch,
@@ -36,7 +37,7 @@ from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.graph_moe import GraphAwareMoE
 from crowdcount.plugins.msaa import MSAAGate, MSAALite, MsaaAdaptiveLayer
-from crowdcount.plugins.MSCA import MSCADecoder
+from crowdcount.plugins.MSCA import MSCADecoder, MSCANeck
 
 
 class _DepthEncoder(nn.Module):
@@ -127,6 +128,8 @@ class DSGCnet(nn.Module):
         use_msca_decoder: bool = False,
         msca_num_heads: int = 8,
         msca_num_blocks: int = 2,
+        use_decoupled_head: bool = False,
+        use_msca_neck: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
@@ -145,6 +148,14 @@ class DSGCnet(nn.Module):
         self._gcn_mode = gcn_mode
         self.use_uncertainty = use_uncertainty
         self.use_msca_decoder = use_msca_decoder
+        self.use_decoupled_head = use_decoupled_head
+        self.use_msca_neck = use_msca_neck
+
+        if use_msca_neck and use_msca_decoder:
+            raise ValueError(
+                "use_msca_neck and use_msca_decoder are mutually exclusive; "
+                "enable only one."
+            )
 
         if self.fusion_mode not in {
             "gcn",
@@ -165,7 +176,11 @@ class DSGCnet(nn.Module):
         )
         num_anchor_points = row * line
 
-        self.pred_trunk = SharedPredictionTrunk(in_channels=256, feature_size=256)
+        self.pred_trunk: SharedPredictionTrunk | DecoupledPredictionHead = (
+            DecoupledPredictionHead(in_channels=256, feature_size=256)
+            if use_decoupled_head
+            else SharedPredictionTrunk(in_channels=256, feature_size=256)
+        )
         self.regression = RegressionModel(
             num_features_in=256, num_anchor_points=num_anchor_points
         )
@@ -188,6 +203,18 @@ class DSGCnet(nn.Module):
             )
             self.pa = None  # type: ignore[assignment]
             self.density_pred = None  # type: ignore[assignment]
+        elif use_msca_neck:
+            # MSCANeck replaces PA-FPN only; density_pred + GCN still active
+            self.msca_decoder = None
+            self.pa = MSCANeck(
+                C3_size=256,
+                C4_size=512,
+                C5_size=512,
+                feature_size=256,
+                num_heads=msca_num_heads,
+                num_blocks=msca_num_blocks,
+            )
+            self.density_pred = Density_pred()
         else:
             self.msca_decoder = None
             if use_msaa and msaa_variant == "legacy":
@@ -884,16 +911,22 @@ class DSGCnet(nn.Module):
             output_dict["fg_logits"] = fg_logits
             output_dict["fg_prob"] = fg_prob
 
-        shared_feat = self.pred_trunk(feature_fl)
-
-        # Frequency-decoupled head routing (optional)
-        if self.freq_router is not None:
-            _f_low, f_high, f_full = self.freq_router(shared_feat)
-            regression = self.regression(f_high) * 100
-            classification = self.classification(f_full)
+        if self.use_decoupled_head:
+            cls_feat, reg_feat = self.pred_trunk(feature_fl)
+            if self.freq_router is not None:
+                _f_low, reg_feat, _ = self.freq_router(reg_feat)
+            regression = self.regression(reg_feat) * 100
+            classification = self.classification(cls_feat)
         else:
-            regression = self.regression(shared_feat) * 100
-            classification = self.classification(shared_feat)
+            shared_feat = self.pred_trunk(feature_fl)
+            # Frequency-decoupled head routing (optional)
+            if self.freq_router is not None:
+                _f_low, f_high, f_full = self.freq_router(shared_feat)
+                regression = self.regression(f_high) * 100
+                classification = self.classification(f_full)
+            else:
+                regression = self.regression(shared_feat) * 100
+                classification = self.classification(shared_feat)
         anchor_points = self.anchor_points(samples).repeat(batch_size, 1, 1)
         output_coord = regression + anchor_points
         output_class = classification

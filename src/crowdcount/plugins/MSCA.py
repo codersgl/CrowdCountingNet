@@ -171,13 +171,21 @@ class MSCABlock(nn.Module):
     with its own LayerNorm.  Parallel conv outputs are **concatenated** then
     projected via 1×1 conv.  A learnable scalar W balances the two branches.
     Cross-attention is applied between branches, and density info is injected
-    via element-wise addition.
+    via element-wise addition when ``use_density=True``.
+
+    Args:
+        dim: Feature channel dimension.
+        num_heads: Number of attention heads.
+        use_density: If True (default), create density_gate and require
+            ``density_prob`` in forward.  If False, skip density modulation
+            (suitable for neck usage where density is not yet computed).
     """
 
-    def __init__(self, dim: int, num_heads: int = 8):
+    def __init__(self, dim: int, num_heads: int = 8, use_density: bool = True):
         super().__init__()
         self.num_heads = num_heads
         self.dim = dim
+        self.use_density = use_density
 
         # ---- Horizontal branch ----
         self.norm_h = LayerNorm4d(dim, bias=True)
@@ -206,14 +214,20 @@ class MSCABlock(nn.Module):
 
         # ---- Density injection: channel-wise modulation ----
         # Maps density_prob [B,1,H,W] → per-channel scale [B,C,H,W]
-        self.density_gate = nn.Sequential(
-            nn.Conv2d(1, dim // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim // 4, dim, 1),
-            nn.Sigmoid(),
+        self.density_gate: nn.Sequential | None = (
+            nn.Sequential(
+                nn.Conv2d(1, dim // 4, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim // 4, dim, 1),
+                nn.Sigmoid(),
+            )
+            if use_density
+            else None
         )
 
-    def forward(self, x: torch.Tensor, density_prob: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, density_prob: torch.Tensor | None = None
+    ) -> torch.Tensor:
         b, c, h, w = x.shape
 
         # ---- Horizontal strip convolutions ----
@@ -275,10 +289,15 @@ class MSCABlock(nn.Module):
         )
         out_2 = self.proj_out_2(out_2)
 
-        # ---- Fusion: residual + attention + density modulation ----
+        # ---- Fusion: residual + attention ± density modulation ----
         attn_out = out_1 + out_2
-        density_scale = self.density_gate(density_prob)  # [B, C, H, W]
-        out = x + attn_out * density_scale
+        if self.use_density and self.density_gate is not None:
+            assert density_prob is not None, (
+                "density_prob required when use_density=True"
+            )
+            density_scale = self.density_gate(density_prob)  # [B, C, H, W]
+            attn_out = attn_out * density_scale
+        out = x + attn_out
 
         return out
 
@@ -430,3 +449,124 @@ class MSCADecoder(nn.Module):
             f_out = block(f_out, density_prob)
 
         return f_out, density
+
+
+# ---------------------------------------------------------------------------
+# MSCANeck — pure neck module (drop-in replacement for PA-FPN)
+# ---------------------------------------------------------------------------
+
+
+class MSCANeck(nn.Module):
+    """Multi-axis Strip Cross-Attention Neck.
+
+    A pure feature-fusion neck that can replace :class:`Decoder_SPD_PAFPN`.
+    Unlike :class:`MSCADecoder`, this module does **not** include a density
+    prediction branch and does **not** bypass downstream GCN/MoE modules.
+
+    Architecture::
+
+        c3 (downsample) ─┐
+        c4 (identity)   ─┤→ ChannelAttentionFusion → N × MSCABlock → features_pa
+        c5 (upsample)   ─┘
+
+    Interface contract (identical to Decoder_SPD_PAFPN)::
+
+        neck = MSCANeck(C3_size=256, C4_size=512, C5_size=512)
+        features_pa = neck([c3, c4, c5])   # [B, 256, H/8, W/8]
+
+    Parameters
+    ----------
+    C3_size, C4_size, C5_size : int
+        Channel counts of backbone features.
+    feature_size : int
+        Unified output channel dimension (default 256).
+    num_heads : int
+        Attention heads per MSCABlock (default 8).
+    num_blocks : int
+        Number of stacked MSCABlocks (default 2).
+    attn_reduction : int
+        Reduction ratio in ChannelAttentionFusion MLP (default 16).
+    """
+
+    def __init__(
+        self,
+        C3_size: int = 256,
+        C4_size: int = 512,
+        C5_size: int = 512,
+        feature_size: int = 256,
+        num_heads: int = 8,
+        num_blocks: int = 2,
+        attn_reduction: int = 16,
+    ):
+        super().__init__()
+        self.feature_size = feature_size
+
+        # Lateral 1×1 convolutions to unify channel count
+        self.lateral_c3 = ConvBNReLU(C3_size, feature_size, 1)
+        self.lateral_c4 = ConvBNReLU(C4_size, feature_size, 1)
+        self.lateral_c5 = ConvBNReLU(C5_size, feature_size, 1)
+
+        # c3 at H/4 → downsample to H/8 (c4 resolution)
+        self.downsample_c3 = nn.Sequential(
+            nn.Conv2d(feature_size, feature_size, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(feature_size),
+            nn.ReLU(inplace=True),
+        )
+
+        # Channel attention weighted fusion
+        self.channel_attn = ChannelAttentionFusion(
+            feature_size, reduction=attn_reduction
+        )
+
+        # Post-fusion refinement conv
+        self.refine_conv = ConvBNReLU(feature_size, feature_size, 3, padding=1)
+
+        # N × MSCABlock without density conditioning
+        self.msca_blocks = nn.ModuleList(
+            [
+                MSCABlock(feature_size, num_heads, use_density=False)
+                for _ in range(num_blocks)
+            ]
+        )
+
+    def forward(self, inputs: list[torch.Tensor]) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        inputs : list[Tensor]
+            ``[c3, c4, c5]`` multi-scale backbone features.
+
+        Returns
+        -------
+        Tensor
+            ``[B, feature_size, H/8, W/8]`` — same interface as PA-FPN.
+        """
+        c3, c4, c5 = inputs
+        target_size = c4.shape[-2:]
+
+        # Lateral projections
+        c3_lat = self.lateral_c3(c3)
+        c4_lat = self.lateral_c4(c4)
+        c5_lat = self.lateral_c5(c5)
+
+        # Multi-scale alignment to c4 resolution
+        f_top = F.interpolate(
+            c5_lat, size=target_size, mode="bilinear", align_corners=False
+        )
+        f_mid = c4_lat
+        f_bot = self.downsample_c3(c3_lat)
+        if f_bot.shape[-2:] != target_size:
+            f_bot = F.interpolate(
+                f_bot, size=target_size, mode="bilinear", align_corners=False
+            )
+
+        # Channel attention weighted fusion
+        f_fused = self.channel_attn(f_top, f_mid, f_bot)
+
+        # Post-fusion refinement + MSCA blocks
+        f_out = self.refine_conv(f_fused)
+        for block in self.msca_blocks:
+            f_out = block(f_out)
+
+        return f_out

@@ -816,3 +816,81 @@ def test_graph_attn_moe_local_first_forward() -> None:
     assert torch.allclose(
         w.sum(dim=1), torch.ones(2, w.shape[2], w.shape[3]), atol=1e-5
     )
+
+
+# ---------------------------------------------------------------------------
+# Decoupled Head
+# ---------------------------------------------------------------------------
+
+
+def test_decoupled_head_forward() -> None:
+    """use_decoupled_head=True must produce valid outputs with correct shapes."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2, use_decoupled_head=True).eval()
+    assert model.use_decoupled_head
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_logits"].shape[2] == 2
+    assert out["pred_points"].shape[0] == 2
+    assert out["pred_points"].shape[2] == 2
+    assert out["pred_logits"].shape[1] == out["pred_points"].shape[1]
+
+
+def test_decoupled_head_with_freq_router() -> None:
+    """use_decoupled_head + use_freq_head should work together."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(
+        backbone, row=2, line=2, use_decoupled_head=True, use_freq_head=True
+    ).eval()
+    with torch.no_grad():
+        out = model(torch.zeros(1, 3, 128, 128))
+    assert out["pred_logits"].shape[0] == 1
+    assert out["pred_points"].shape[0] == 1
+
+
+def test_decoupled_head_disabled_by_default() -> None:
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2)
+    assert not model.use_decoupled_head
+
+
+# ---------------------------------------------------------------------------
+# MSCANeck (pure neck, preserves GCN downstream)
+# ---------------------------------------------------------------------------
+
+
+def test_msca_neck_forward() -> None:
+    """use_msca_neck=True must produce valid outputs with correct shapes."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2, use_msca_neck=True).eval()
+    assert model.use_msca_neck
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_logits"].shape[2] == 2
+    assert out["pred_points"].shape[0] == 2
+    assert out["pred_points"].shape[2] == 2
+    assert out["density_out"].shape == (2, 1, 16, 16)
+
+
+def test_msca_neck_preserves_gcn() -> None:
+    """MSCANeck must NOT bypass GCN — density_gcn + feature_gcn should exist."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2, use_msca_neck=True)
+    assert model.density_gcn is not None
+    assert model.feature_gcn is not None
+    assert model.density_pred is not None
+    assert model.msca_decoder is None
+
+
+def test_msca_neck_and_decoder_mutually_exclusive() -> None:
+    backbone = TinyVGGBackbone()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        DSGCnet(backbone, row=2, line=2, use_msca_neck=True, use_msca_decoder=True)
+
+
+def test_msca_neck_disabled_by_default() -> None:
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2)
+    assert not model.use_msca_neck

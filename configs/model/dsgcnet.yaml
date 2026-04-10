@@ -154,6 +154,11 @@ gcn_supernode_heads: 4 # multi-head attention heads in gather/scatter
 use_freq_head: false
 freq_head_kernel: 3 # AvgPool kernel size for low-pass filter
 
+# Decoupled Head (disabled by default)
+# Replaces the shared prediction trunk with two independent trunks so that
+# classification and regression tasks learn completely separate features.
+use_decoupled_head: false
+
 # Sub-Pixel Refinement (disabled by default)
 # For top-K high-confidence points, bilinear-samples from C3 (stride 8) features
 # and predicts residual offset, improving localisation in dense regions.
@@ -175,3 +180,8 @@ fg_branch_scale: 0.5 # max additional boost from foreground probability
 use_msca_decoder: false
 msca_num_heads: 8 # number of attention heads in MSCABlock
 msca_num_blocks: 2 # number of stacked MSCA blocks (×N)
+
+# MSCANeck: Multi-axis Strip Cross-Attention as neck only (disabled by default)
+# Replaces PA-FPN with MSCA-based fusion but preserves Density_pred + GCN downstream.
+# Mutually exclusive with use_msca_decoder.
+use_msca_neck: false

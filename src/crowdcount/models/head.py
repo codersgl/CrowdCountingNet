@@ -3,6 +3,7 @@
 Contains:
   - Density_pred:           density map regression head
   - SharedPredictionTrunk:  shared 2-layer conv trunk for regression & classification
+  - DecoupledPredictionHead: independent trunks for classification & regression (decoupled)
   - RegressionModel:        point regression projection (used after SharedPredictionTrunk)
   - ClassificationModel:    point classification projection (used after SharedPredictionTrunk)
   - PointRefineModule:      iterative coordinate refinement via feature re-sampling
@@ -68,6 +69,26 @@ class SharedPredictionTrunk(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.act1(self.conv1(x))
         return self.act2(self.conv2(out))
+
+
+class DecoupledPredictionHead(nn.Module):
+    """Fully decoupled prediction head with independent trunks for each task.
+
+    Instead of sharing a single :class:`SharedPredictionTrunk` between the
+    classification and regression branches, this module maintains two
+    independent trunks so that each task learns its own feature representation.
+
+    Input:  [B, in_channels, H, W]
+    Output: (cls_feat, reg_feat) — each [B, feature_size, H, W]
+    """
+
+    def __init__(self, in_channels: int = 256, feature_size: int = 256) -> None:
+        super().__init__()
+        self.cls_trunk = SharedPredictionTrunk(in_channels, feature_size)
+        self.reg_trunk = SharedPredictionTrunk(in_channels, feature_size)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.cls_trunk(x), self.reg_trunk(x)
 
 
 class Density_pred(nn.Module):

@@ -7,6 +7,7 @@ import torch
 
 from crowdcount.models.head import (
     ClassificationModel,
+    DecoupledPredictionHead,
     DensityAttentionMask,
     Density_pred,
     RegressionModel,
@@ -135,3 +136,36 @@ def test_ssim_loss_positive_for_different_maps():
     target = torch.ones(2, 1, 16, 16)
     loss = criterion(pred, target)
     assert loss > 0
+
+
+# ---------------------------------------------------------------------------
+# DecoupledPredictionHead
+# ---------------------------------------------------------------------------
+
+
+def test_decoupled_head_output_shapes(feature_map):
+    head = DecoupledPredictionHead(in_channels=256, feature_size=256)
+    cls_feat, reg_feat = head(feature_map)
+    assert cls_feat.shape == feature_map.shape
+    assert reg_feat.shape == feature_map.shape
+
+
+def test_decoupled_head_trunks_are_independent():
+    """cls_trunk and reg_trunk must have distinct (unshared) parameters."""
+    head = DecoupledPredictionHead()
+    cls_ids = {id(p) for p in head.cls_trunk.parameters()}
+    reg_ids = {id(p) for p in head.reg_trunk.parameters()}
+    assert cls_ids.isdisjoint(reg_ids)
+
+
+def test_decoupled_head_end_to_end(feature_map):
+    """DecoupledPredictionHead → separate heads produce correct shapes."""
+    head = DecoupledPredictionHead()
+    reg = RegressionModel(num_features_in=256, num_anchor_points=4)
+    cls = ClassificationModel(num_features_in=256, num_anchor_points=4, num_classes=2)
+    cls_feat, reg_feat = head(feature_map)
+    reg_out = reg(reg_feat)
+    cls_out = cls(cls_feat)
+    B, H, W = feature_map.shape[0], feature_map.shape[2], feature_map.shape[3]
+    assert reg_out.shape == (B, H * W * 4, 2)
+    assert cls_out.shape == (B, H * W * 4, 2)

@@ -20,6 +20,10 @@ msaa_reduction: 4
 msaa_variant: legacy # legacy | lite | msaa_gate
 fpn_attention: false # Phase 2: inject attention gates inside PA-FPN
 
+# RCCFormer-style neck: replace PA-FPN with MFFM + DEAB/ASAM density head
+use_rccformer_neck: false
+rccformer_deab_blocks: 2 # Number of DEAB blocks in density prediction branch
+
 # Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe | mamba_moe
 # gcn_moe: GCN dual-stream + LightMoE post-refinement (recommended)
 # graph_attn_moe: 2-expert MoE (local conv + graph-biased attention)

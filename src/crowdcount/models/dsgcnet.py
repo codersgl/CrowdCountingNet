@@ -38,6 +38,7 @@ from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.graph_moe import GraphAwareMoE
 from crowdcount.plugins.msaa import MSAAGate, MSAALite, MsaaAdaptiveLayer
 from crowdcount.plugins.MSCA import MSCADecoder, MSCANeck
+from crowdcount.plugins.rccformer import DensityPredDEAB, MFFMNeck
 
 
 class _DepthEncoder(nn.Module):
@@ -130,6 +131,8 @@ class DSGCnet(nn.Module):
         msca_num_blocks: int = 2,
         use_decoupled_head: bool = False,
         use_msca_neck: bool = False,
+        use_rccformer_neck: bool = False,
+        rccformer_deab_blocks: int = 2,
     ):
         super().__init__()
         self.backbone = backbone
@@ -150,6 +153,7 @@ class DSGCnet(nn.Module):
         self.use_msca_decoder = use_msca_decoder
         self.use_decoupled_head = use_decoupled_head
         self.use_msca_neck = use_msca_neck
+        self.use_rccformer_neck = use_rccformer_neck
 
         if use_msca_neck and use_msca_decoder:
             raise ValueError(
@@ -191,7 +195,20 @@ class DSGCnet(nn.Module):
         )
 
         self.anchor_points = AnchorPoints(pyramid_levels=[3], row=row, line=line)
-        if use_msca_decoder:
+        if use_rccformer_neck:
+            # RCCFormer MFFM neck + DEAB/ASAM density head
+            self.msca_decoder = None
+            self.pa = MFFMNeck(
+                C3_size=256,
+                C4_size=512,
+                C5_size=512,
+                dim=256,
+            )
+            self.density_pred = DensityPredDEAB(
+                dim=256,
+                num_deab=rccformer_deab_blocks,
+            )
+        elif use_msca_decoder:
             # MSCADecoder replaces PA-FPN + Density_pred + GCN in one module
             self.msca_decoder: MSCADecoder | None = MSCADecoder(
                 C3_size=256,

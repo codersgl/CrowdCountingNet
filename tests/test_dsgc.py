@@ -920,3 +920,37 @@ def test_msca_decoder_preserves_gcn() -> None:
     model = DSGCnet(backbone, row=2, line=2, use_msca_decoder=True)
     assert model.density_gcn is not None
     assert model.feature_gcn is not None
+
+
+# ---------------------------------------------------------------------------
+# RCCFormer MFFM neck + DEAB/ASAM density head
+# ---------------------------------------------------------------------------
+
+
+def test_rccformer_neck_forward() -> None:
+    """MFFMNeck + DensityPredDEAB forward pass produces correct shapes."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(backbone, row=2, line=2, use_rccformer_neck=True)
+    model.eval()
+    x = torch.randn(2, 3, 128, 128)
+    with torch.no_grad():
+        out = model(x)
+    assert out["pred_logits"] is not None
+    assert out["pred_points"] is not None
+    assert out["density_out"] is not None
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_points"].shape[0] == 2
+    # density_out: [B, 1, H/8, W/8]
+    assert out["density_out"].shape == (2, 1, 16, 16)
+
+
+def test_rccformer_neck_deab_blocks_configurable() -> None:
+    """rccformer_deab_blocks parameter controls the number of DEAB blocks."""
+    from crowdcount.plugins.rccformer import DensityPredDEAB
+
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(
+        backbone, row=2, line=2, use_rccformer_neck=True, rccformer_deab_blocks=3
+    )
+    assert isinstance(model.density_pred, DensityPredDEAB)
+    assert len(model.density_pred.deab_blocks) == 3

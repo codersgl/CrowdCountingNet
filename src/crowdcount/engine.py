@@ -244,13 +244,17 @@ def train_one_epoch(
         loss_sum = losses + density_loss + moe_aux_component + fg_loss
 
         loss_dict_reduced = reduce_dict(loss_dict)
+        # Only log losses whose weight is non-zero (or have no weight entry)
+        active_keys = {
+            k for k in loss_dict_reduced if k not in weight_dict or weight_dict[k]
+        }
         loss_dict_reduced_unscaled = {
-            f"{k}_unscaled": v for k, v in loss_dict_reduced.items()
+            f"{k}_unscaled": v for k, v in loss_dict_reduced.items() if k in active_keys
         }
         loss_dict_reduced_scaled = {
             k: v * weight_dict[k]
             for k, v in loss_dict_reduced.items()
-            if k in weight_dict
+            if k in weight_dict and k in active_keys
         }
         losses_reduced_scaled = sum(
             loss_dict_reduced_scaled.values(),
@@ -333,6 +337,7 @@ def evaluate_crowd_no_overlap(
     device: torch.device,
     vis_dir: Optional[str] = None,
     use_depth: bool = False,
+    cfg=None,
 ) -> tuple[float, float, float, float]:
     """Evaluate on validation set (no overlap).
 
@@ -368,17 +373,41 @@ def evaluate_crowd_no_overlap(
         )
         outputs_scores = outputs_scores[0]
         gt_cnt = targets[0]["point"].shape[0]
-        threshold = 0.5
 
-        predict_cnt = int((outputs_scores > threshold).sum())
+        # Compute density map integral first (needed by density_guided)
+        et_dmap = outputs["density_out"]
+        et_dmap_sum = float(torch.sum(et_dmap).item())
+
+        # Parse counting config
+        eval_cfg = getattr(cfg, "eval_counting", None) if cfg is not None else None
+        counting_method = (
+            str(getattr(eval_cfg, "method", "threshold")) if eval_cfg else "threshold"
+        )
+
+        if counting_method == "density_guided":
+            min_score = float(getattr(eval_cfg, "min_score", 0.3))
+            density_cnt = max(1, round(et_dmap_sum))
+            # Filter by minimum confidence
+            valid_mask = outputs_scores > min_score
+            num_valid = int(valid_mask.sum().item())
+            if num_valid > 0 and density_cnt <= num_valid:
+                # Take top-k scores where k = density_cnt
+                _, topk_indices = outputs_scores[valid_mask].topk(
+                    min(density_cnt, num_valid)
+                )
+                predict_cnt = len(topk_indices)
+            else:
+                # All valid points count (density overestimates or equals)
+                predict_cnt = num_valid
+        else:
+            threshold = float(getattr(eval_cfg, "threshold", 0.5)) if eval_cfg else 0.5
+            predict_cnt = int((outputs_scores > threshold).sum())
 
         mae = abs(predict_cnt - gt_cnt)
         mse = (predict_cnt - gt_cnt) ** 2
         maes.append(float(mae))
         mses.append(float(mse))
 
-        et_dmap = outputs["density_out"]
-        et_dmap_sum = int(torch.sum(et_dmap))
         density_mae = abs(et_dmap_sum - gt_cnt)
         density_mse = (et_dmap_sum - gt_cnt) ** 2
         density_maes.append(float(density_mae))

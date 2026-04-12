@@ -302,6 +302,7 @@ class Trainer:
                     self.data_loader_val,
                     self.device,
                     use_depth=self._needs_depth,
+                    cfg=self.cfg,
                 )
                 t2 = time.time()
 

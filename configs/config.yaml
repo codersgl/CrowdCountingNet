@@ -59,6 +59,12 @@ density_multi_scale:
     block5: 0.5 # Weight for H/32 density loss
     original: 1.0 # Weight for original PA-FPN density loss
 
+# Evaluation counting method
+eval_counting:
+  method: "threshold" # "threshold" (fixed score cutoff) | "density_guided" (top-k from density integral)
+  threshold: 0.5 # Score cutoff used when method="threshold"
+  min_score: 0.3 # Minimum confidence filter for density_guided (ignore anchors below this)
+
 hydra:
   run:
     dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}

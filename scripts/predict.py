@@ -40,6 +40,9 @@ def main(cfg: DictConfig) -> None:
     root_dir = predict_cfg.get("predict", {}).get("root_dir", "./sha_a/test")
     output_dir = predict_cfg.get("predict", {}).get("output_dir", "./pred_result")
     threshold = predict_cfg.get("predict", {}).get("threshold", 0.5)
+    eval_counting = predict_cfg.get("eval_counting", {})
+    counting_method = eval_counting.get("method", "threshold")
+    min_score = eval_counting.get("min_score", 0.3)
     gpu_id = cfg.gpu_id
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -101,9 +104,25 @@ def main(cfg: DictConfig) -> None:
             :, :, 1
         ][0]
         outputs_points = outputs["pred_points"][0]
-        valid_mask = outputs_scores > threshold
-        points = outputs_points[valid_mask].detach().cpu().numpy().tolist()
-        predict_cnt = int(valid_mask.sum().item())
+
+        if counting_method == "density_guided":
+            et_dmap = outputs["density_out"]
+            density_cnt = max(1, round(float(torch.sum(et_dmap).item())))
+            valid_mask = outputs_scores > min_score
+            num_valid = int(valid_mask.sum().item())
+            if num_valid > 0 and density_cnt <= num_valid:
+                valid_scores = outputs_scores[valid_mask]
+                _, topk_indices = valid_scores.topk(min(density_cnt, num_valid))
+                valid_points_all = outputs_points[valid_mask]
+                points = valid_points_all[topk_indices].detach().cpu().numpy().tolist()
+                predict_cnt = len(topk_indices)
+            else:
+                points = outputs_points[valid_mask].detach().cpu().numpy().tolist()
+                predict_cnt = num_valid
+        else:
+            valid_mask = outputs_scores > threshold
+            points = outputs_points[valid_mask].detach().cpu().numpy().tolist()
+            predict_cnt = int(valid_mask.sum().item())
 
         img_to_draw = cv2.cvtColor(np.array(img_raw), cv2.COLOR_RGB2BGR)
         for p in points:

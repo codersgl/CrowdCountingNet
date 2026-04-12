@@ -25,6 +25,15 @@ tensorboard_dir: runs/dsgc
 
 density_loss_weight: 0.01 # Global scale factor applied to all density map losses
 
+# DM-Count style density loss (RCCFormer §3.3): L_C + λ1·L_OT + λ2·L_TV
+# When enabled, replaces the default MSE density loss with distribution-matching.
+density_dmcount:
+  enabled: false
+  lambda_count: 1.0 # Counting loss weight
+  lambda_ot: 0.1 # Optimal Transport (Wasserstein) loss weight
+  lambda_tv: 0.01 # Total Variation regularisation weight
+  count_loss_type: "l1" # "l1" or "mse"
+
 density_ssim:
   enabled: false # Add SSIM structure loss on the main density map
   weight: 0.005 # Relative weight of SSIM loss before adding into den_loss

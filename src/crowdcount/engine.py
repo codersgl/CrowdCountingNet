@@ -288,6 +288,10 @@ def train_one_epoch(
             **loss_dict_reduced_scaled,
             **loss_dict_reduced_unscaled,
         )
+        # Log DM-Count sub-components when available
+        _dm_components = getattr(density_criterion, "last_components", None)
+        if _dm_components:
+            metric_logger.update(**_dm_components)
         if use_density_ssim:
             metric_logger.update(den_ssim=density_ssim_loss.item())
 

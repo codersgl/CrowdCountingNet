@@ -61,7 +61,21 @@ class Trainer:
         criterion.to(self.device)
         self.model = model
         self.criterion = criterion
-        self.density_criterion = nn.MSELoss(reduction="sum").to(self.device)
+
+        # Density criterion: DM-Count or MSE
+        dmcount_cfg = getattr(cfg, "density_dmcount", None)
+        if bool(getattr(dmcount_cfg, "enabled", False)):
+            from crowdcount.plugins.dm_count_loss import DMCountLoss
+
+            self.density_criterion: nn.Module = DMCountLoss(
+                lambda_count=float(getattr(dmcount_cfg, "lambda_count", 1.0)),
+                lambda_ot=float(getattr(dmcount_cfg, "lambda_ot", 0.1)),
+                lambda_tv=float(getattr(dmcount_cfg, "lambda_tv", 0.01)),
+                count_loss_type=str(getattr(dmcount_cfg, "count_loss_type", "l1")),
+            ).to(self.device)
+            logger.info("Using DM-Count density loss (L_C + λ1·L_OT + λ2·L_TV)")
+        else:
+            self.density_criterion = nn.MSELoss(reduction="sum").to(self.device)
         density_ssim_cfg = getattr(cfg, "density_ssim", None)
         if bool(getattr(density_ssim_cfg, "enabled", False)):
             self.ssim_criterion: nn.Module | None = SSIMLoss(

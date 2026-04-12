@@ -30,6 +30,7 @@ def train_one_epoch(
     max_norm: float = 0,
     cfg=None,
     ssim_criterion: nn.Module | None = None,
+    uncertainty_weighter: nn.Module | None = None,
 ) -> dict:
     """Train for one epoch.
 
@@ -118,14 +119,29 @@ def train_one_epoch(
             outputs = model(samples)
         loss_dict = criterion(outputs, targets)
         weight_dict = cast(dict[str, torch.Tensor | float], criterion.weight_dict)
-        losses = sum(
-            (
-                loss_dict[k] * weight_dict[k]
-                for k in loss_dict.keys()
-                if k in weight_dict
-            ),
-            torch.tensor(0.0, device=samples.device),
-        )
+
+        # When uncertainty weighter is active, CE and regression losses are
+        # weighted by learned σ parameters instead of fixed weight_dict values.
+        if uncertainty_weighter is not None:
+            # Sum only auxiliary losses (count, consistency, refine) with fixed weights
+            _uw_keys = {"loss_ce", "loss_points"}
+            losses = sum(
+                (
+                    loss_dict[k] * weight_dict[k]
+                    for k in loss_dict.keys()
+                    if k in weight_dict and k not in _uw_keys
+                ),
+                torch.tensor(0.0, device=samples.device),
+            )
+        else:
+            losses = sum(
+                (
+                    loss_dict[k] * weight_dict[k]
+                    for k in loss_dict.keys()
+                    if k in weight_dict
+                ),
+                torch.tensor(0.0, device=samples.device),
+            )
 
         et_dmap = outputs["density_out"]
 
@@ -208,11 +224,12 @@ def train_one_epoch(
             )
         else:
             # Single-scale density prediction (original behavior)
-            density_loss = (
-                density_criterion(et_dmap, gt_dmap)
-                / gt_dmap.shape[0]
-                * density_loss_weight
-            )
+            density_loss_raw = density_criterion(et_dmap, gt_dmap) / gt_dmap.shape[0]
+            if uncertainty_weighter is not None:
+                # UW will apply its own learned weight; skip fixed scale
+                density_loss = density_loss_raw
+            else:
+                density_loss = density_loss_raw * density_loss_weight
 
         density_ssim_loss = torch.tensor(0.0, device=samples.device)
         if use_density_ssim:
@@ -241,7 +258,18 @@ def train_one_epoch(
                 * fg_loss_weight
             )
 
-        loss_sum = losses + density_loss + moe_aux_component + fg_loss
+        if uncertainty_weighter is not None:
+            # Learned weighting for the three main branches
+            loss_ce_raw = loss_dict.get(
+                "loss_ce", torch.tensor(0.0, device=samples.device)
+            )
+            loss_reg_raw = loss_dict.get(
+                "loss_points", torch.tensor(0.0, device=samples.device)
+            )
+            uw_loss = uncertainty_weighter(density_loss, loss_ce_raw, loss_reg_raw)
+            loss_sum = uw_loss + losses + moe_aux_component + fg_loss
+        else:
+            loss_sum = losses + density_loss + moe_aux_component + fg_loss
 
         loss_dict_reduced = reduce_dict(loss_dict)
         # Only log losses whose weight is non-zero (or have no weight entry)

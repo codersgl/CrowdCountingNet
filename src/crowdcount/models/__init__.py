@@ -8,6 +8,7 @@ from crowdcount.models.backbone import build_backbone
 from crowdcount.models.criterion import SetCriterion_Crowd
 from crowdcount.models.dsgcnet import DSGCnet
 from crowdcount.models.matcher import build_matcher_crowd
+from crowdcount.models.uncertainty_loss import UncertaintyWeighter
 
 
 def build_model(cfg: DictConfig, training: bool = False):
@@ -108,7 +109,18 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_uncertainty_weighting=getattr(cfg.model, "use_uncertainty", False),
         uncertainty_boost=float(getattr(cfg.model, "uncertainty_boost", 2.0)),
     )
-    return model, criterion
+
+    # Uncertainty weighting (Kendall et al. 2018)
+    uw_cfg = getattr(cfg, "uncertainty_weighting", None)
+    uncertainty_weighter: UncertaintyWeighter | None = None
+    if uw_cfg is not None and bool(getattr(uw_cfg, "enabled", False)):
+        uncertainty_weighter = UncertaintyWeighter(
+            init_log_var_den=float(getattr(uw_cfg, "init_log_var_den", 3.91)),
+            init_log_var_ce=float(getattr(uw_cfg, "init_log_var_ce", -0.693)),
+            init_log_var_reg=float(getattr(uw_cfg, "init_log_var_reg", 8.52)),
+        )
+
+    return model, criterion, uncertainty_weighter
 
 
-__all__ = ["build_model", "DSGCnet", "SetCriterion_Crowd"]
+__all__ = ["build_model", "DSGCnet", "SetCriterion_Crowd", "UncertaintyWeighter"]

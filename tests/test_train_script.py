@@ -78,7 +78,7 @@ def test_model_build_from_cfg(base_cfg):
         lambda pretrained=False, **kw: vgg_module.vgg16_bn(pretrained=False),
     ):
         try:
-            model, criterion = build_model(base_cfg, training=True)
+            model, criterion, _ = build_model(base_cfg, training=True)
             assert hasattr(model, "forward")
             assert hasattr(criterion, "forward")
         except Exception:

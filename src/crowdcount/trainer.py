@@ -54,13 +54,15 @@ class Trainer:
         setup_logger(log_dir=str(hydra_output), log_file="train.log")
 
         # Model
-        model, criterion = cast(
-            tuple[nn.Module, nn.Module], build_model(cfg, training=True)
-        )
+        _build_result = build_model(cfg, training=True)
+        model, criterion, uncertainty_weighter = _build_result
         model.to(self.device)
         criterion.to(self.device)
         self.model = model
         self.criterion = criterion
+        self.uncertainty_weighter = uncertainty_weighter
+        if self.uncertainty_weighter is not None:
+            self.uncertainty_weighter.to(self.device)
 
         # Density criterion: DM-Count or MSE
         dmcount_cfg = getattr(cfg, "density_dmcount", None)
@@ -109,6 +111,15 @@ class Trainer:
             {"params": non_backbone_params},
             {"params": backbone_params, "lr": cfg.optimizer.lr_backbone},
         ]
+        if self.uncertainty_weighter is not None:
+            uw_cfg = getattr(cfg, "uncertainty_weighting", None)
+            uw_lr_scale = float(getattr(uw_cfg, "lr_scale", 1.0)) if uw_cfg else 1.0
+            param_dicts.append(
+                {
+                    "params": list(self.uncertainty_weighter.parameters()),
+                    "lr": cfg.optimizer.lr * uw_lr_scale,
+                }
+            )
         _opt_name = cfg.optimizer.get("name", "adam").lower()
         if _opt_name == "adamw":
             self.optimizer = torch.optim.AdamW(
@@ -175,6 +186,12 @@ class Trainer:
                 self._resume_mae_history = ckpt["mae_history"]
             if "density_mae_history" in ckpt:
                 self._resume_density_mae_history = ckpt["density_mae_history"]
+            if (
+                "uncertainty_weighter" in ckpt
+                and ckpt["uncertainty_weighter"] is not None
+                and self.uncertainty_weighter is not None
+            ):
+                self.uncertainty_weighter.load_state_dict(ckpt["uncertainty_weighter"])
             if reset_opt:
                 logger.info(
                     f"Resumed model weights from {cfg.resume} (optimizer reset, training from epoch 0)"
@@ -257,6 +274,7 @@ class Trainer:
                 cfg.clip_max_norm,
                 cfg=cfg,  # Pass config for multi-scale density prediction
                 ssim_criterion=self.ssim_criterion,
+                uncertainty_weighter=self.uncertainty_weighter,
             )
             t2 = time.time()
 
@@ -268,6 +286,11 @@ class Trainer:
             for key in ("loss_sum", "losses", "den_loss", "loss_ce"):
                 if key in stat:
                     self.writer.add_scalar(f"loss/{key}", stat[key], epoch)
+            if self.uncertainty_weighter is not None:
+                for k, v in self.uncertainty_weighter.get_weights().items():
+                    self.writer.add_scalar(f"uw/{k}", v, epoch)
+                for k, v in self.uncertainty_weighter.get_log_vars().items():
+                    self.writer.add_scalar(f"uw/{k}", v, epoch)
             for i, pg in enumerate(self.optimizer.param_groups):
                 tag = "lr/backbone" if i == 1 else "lr/base"
                 self.writer.add_scalar(tag, pg["lr"], epoch)
@@ -290,6 +313,9 @@ class Trainer:
                     "mae_history": mae_history,
                     "density_mae_history": density_mae_history,
                     "moe_temperature": moe_temperature,
+                    "uncertainty_weighter": self.uncertainty_weighter.state_dict()
+                    if self.uncertainty_weighter is not None
+                    else None,
                 },
                 ckpt_path,
             )

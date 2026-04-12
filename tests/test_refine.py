@@ -123,7 +123,7 @@ class TestRefineIntegration:
         )
         from crowdcount.models import build_model
 
-        model, criterion = build_model(cfg, training=True)
+        model, criterion, _ = build_model(cfg, training=True)
         model = model.to(device)
         criterion = criterion.to(device)
         model.eval()
@@ -145,7 +145,7 @@ class TestRefineIntegration:
         """When use_refine=False, loss_refine should not be in losses list."""
         from crowdcount.models import build_model
 
-        model, criterion = build_model(base_cfg, training=True)
+        model, criterion, _ = build_model(base_cfg, training=True)
         model = model.to(device)
         criterion = criterion.to(device)
         model.eval()

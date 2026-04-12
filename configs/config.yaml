@@ -25,6 +25,17 @@ tensorboard_dir: runs/dsgc
 
 density_loss_weight: 0.01 # Global scale factor applied to all density map losses
 
+# Uncertainty Weighting (Kendall et al. 2018): learnable multi-task loss balancing.
+# When enabled, replaces fixed density_loss_weight / weight_dict scalars with
+# learned log-variance parameters that auto-balance density, CE, and regression losses.
+uncertainty_weighting:
+  enabled: false
+  # Initial log(σ²) values derived from current fixed weights: s₀ = -log(2w)
+  init_log_var_den: 3.91 # ← from density_loss_weight=0.01
+  init_log_var_ce: -0.693 # ← from loss_ce weight=1.0
+  init_log_var_reg: 8.52 # ← from point_loss_coef=0.0002
+  lr_scale: 1.0 # σ param lr = base_lr × lr_scale
+
 # DM-Count style density loss (RCCFormer §3.3): L_C + λ1·L_OT + λ2·L_TV
 # When enabled, replaces the default MSE density loss with distribution-matching.
 density_dmcount:

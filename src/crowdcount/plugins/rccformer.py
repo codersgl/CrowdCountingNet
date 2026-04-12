@@ -63,15 +63,15 @@ class MFFM(nn.Module):
         k = f2 + f3 + f4  # Fa: Add分支    -> K
         v = k  # Fa: Add分支    -> V
 
-        # Step 4: 展平为 [B, HW, C] 供 Attention 使用
-        q = q.view(b, -1, self.dim)
-        k = k.view(b, -1, self.dim)
-        v = v.view(b, -1, self.dim)
+        # Step 4: NCHW → [B, HW, C] (permute 确保每个 token 对应一个空间位置)
+        q = q.permute(0, 2, 3, 1).reshape(b, -1, self.dim)
+        k = k.permute(0, 2, 3, 1).reshape(b, -1, self.dim)
+        v = v.permute(0, 2, 3, 1).reshape(b, -1, self.dim)
 
         # Step 5: 交叉注意力细粒度融合
         out = self.cross_attn(q, k, v)
 
-        out = out.view(b, self.dim, h, w)
+        out = out.reshape(b, h, w, self.dim).permute(0, 3, 1, 2)
 
         return out
 
@@ -182,24 +182,24 @@ class IDConv(nn.Module):
             grid_flat,
             mode="bilinear",
             padding_mode="zeros",
-            align_corners=False,
+            align_corners=True,
         )
-        # 恢复形状: [B, C, K, H, W]
-        sampled = sampled_flat.view(B, C, self.num_points, H, W)
+        # 恢复形状: [B, K, C, H, W]
+        sampled = sampled_flat.view(B, self.num_points, C, H, W)
 
         # ===== 4. 生成动态权重 (Weight branch) =====
-        # GAP over spatial dims: [B, C, K]
-        gap_feat = sampled.mean(dim=[-1, -2])
+        # GAP over spatial dims: [B, K, C] → 转置为 [B, C, K] 以匹配 Conv1d(C, ...)
+        gap_feat = sampled.mean(dim=[-1, -2]).permute(0, 2, 1)
         # MLP → [B, 1, K]
         weights = self.weight_net(gap_feat)
         # 🔑 添加 Softmax 归一化，提升数值稳定性
         weights = F.softmax(weights, dim=-1)
-        # 广播维度: [B, 1, K, 1, 1]
-        weights = weights.view(B, 1, self.num_points, 1, 1)
+        # 广播维度: [B, 1, K, 1, 1] → [B, K, 1, 1, 1] 以匹配 sampled 的 dim=1
+        weights = weights.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)
 
         # ===== 5. 加权求和输出 =====
         # y(p0) = Σ w(pn) * x(p0 + pn + Δpn)
-        out = (sampled * weights).sum(dim=2)  # [B, C, H, W]
+        out = (sampled * weights).sum(dim=1)  # [B, C, H, W]
 
         return self.out_proj(out)
 
@@ -475,12 +475,13 @@ class MFFMNeck(nn.Module):
         k = f2 + f3 + f4
         v = k
 
-        q = q.view(b, -1, self.dim)
-        k = k.view(b, -1, self.dim)
-        v = v.view(b, -1, self.dim)
+        # NCHW → [B, HW, C] (permute 确保每个 token 对应一个空间位置)
+        q = q.permute(0, 2, 3, 1).reshape(b, -1, self.dim)
+        k = k.permute(0, 2, 3, 1).reshape(b, -1, self.dim)
+        v = v.permute(0, 2, 3, 1).reshape(b, -1, self.dim)
 
         out = self.cross_attn(q, k, v)
-        return out.view(b, self.dim, h, w)  # [B, dim, H/8, W/8]
+        return out.reshape(b, h, w, self.dim).permute(0, 3, 1, 2)  # [B, dim, H/8, W/8]
 
 
 class DensityPredDEAB(nn.Module):

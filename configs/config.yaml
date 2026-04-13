@@ -76,6 +76,11 @@ eval_counting:
   threshold: 0.5 # Score cutoff used when method="threshold"
   min_score: 0.3 # Minimum confidence filter for density_guided (ignore anchors below this)
 
+# Optimal threshold search during training evaluation
+threshold_search:
+  enabled: false # Enable periodic threshold sweep during training eval
+  every_n_epochs: 50 # Run search every N eval epochs (1 = every eval)
+
 hydra:
   run:
     dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}

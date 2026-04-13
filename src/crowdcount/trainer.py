@@ -21,7 +21,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 from crowdcount.data import build_dataset, collate_fn_crowd, collate_fn_crowd_train
 from crowdcount.data.collate import collate_fn_crowd_depth, collate_fn_crowd_train_depth
-from crowdcount.engine import evaluate_crowd_no_overlap, train_one_epoch
+from crowdcount.engine import (
+    collect_scores_and_counts,
+    evaluate_crowd_no_overlap,
+    search_optimal_threshold,
+    train_one_epoch,
+)
 from crowdcount.models import build_model
 from crowdcount.models.ssim_loss import SSIMLoss
 from crowdcount.utils.logging import logger, setup_logger
@@ -352,6 +357,33 @@ class Trainer:
                 self.writer.add_scalar("metric/density_mse", result[3], step)
                 step += 1
 
+                # Periodic threshold search
+                ts_cfg = getattr(cfg, "threshold_search", None)
+                ts_enabled = (
+                    bool(getattr(ts_cfg, "enabled", False)) if ts_cfg else False
+                )
+                ts_every = int(getattr(ts_cfg, "every_n_epochs", 50)) if ts_cfg else 50
+                best_threshold = 0.5
+                if ts_enabled and epoch % ts_every == 0:
+                    all_scores, gt_counts, _ = collect_scores_and_counts(
+                        self.model,
+                        self.data_loader_val,
+                        self.device,
+                        use_depth=self._needs_depth,
+                    )
+                    best_threshold, opt_mae, _ = search_optimal_threshold(
+                        all_scores, gt_counts
+                    )
+                    self.writer.add_scalar(
+                        "metric/optimal_threshold", best_threshold, step - 1
+                    )
+                    self.writer.add_scalar("metric/optimal_mae", opt_mae, step - 1)
+                    if opt_mae < result[0]:
+                        logger.info(
+                            f"[Eval] threshold search: MAE {result[0]:.2f} → {opt_mae:.2f} "
+                            f"(threshold {best_threshold:.2f})"
+                        )
+
                 # Save best MAE checkpoint (strict: only when current epoch is the new minimum)
                 if result[0] <= np.min(mae_history):
                     torch.save(
@@ -363,6 +395,7 @@ class Trainer:
                             "mae_history": mae_history,
                             "density_mae_history": density_mae_history,
                             "moe_temperature": moe_temperature,
+                            "best_threshold": best_threshold,
                         },
                         self.checkpoints_dir / "best_mae.pth",
                     )

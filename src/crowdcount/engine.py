@@ -446,3 +446,94 @@ def evaluate_crowd_no_overlap(
     density_mae = float(np.mean(density_maes))
     density_mse = float(np.sqrt(np.mean(density_mses)))
     return mae, mse, density_mae, density_mse
+
+
+# ---------------------------------------------------------------------------
+# Optimal threshold search
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def collect_scores_and_counts(
+    model: nn.Module,
+    data_loader: Iterable,
+    device: torch.device,
+    use_depth: bool = False,
+) -> tuple[list[torch.Tensor], list[int], list[float]]:
+    """Run a single forward pass over the val set and collect per-image scores.
+
+    Returns:
+        all_scores: list of 1-D CPU tensors (softmax class-1 probabilities)
+        gt_counts:  list of ground-truth point counts
+        density_sums: list of density-map integrals
+    """
+    model.eval()
+    all_scores: list[torch.Tensor] = []
+    gt_counts: list[int] = []
+    density_sums: list[float] = []
+
+    for batch in data_loader:
+        if use_depth:
+            samples, targets, depth_map = batch
+            depth_map = torch.stack(depth_map).to(device)
+        else:
+            samples, targets = batch
+            depth_map = None
+
+        samples = samples.to(device)
+        outputs = (
+            model(samples, depth_map=depth_map)
+            if depth_map is not None
+            else model(samples)
+        )
+
+        scores = torch.nn.functional.softmax(outputs["pred_logits"], -1)[:, :, 1]
+        assert scores.shape[0] == 1, "collect_scores_and_counts expects batch_size=1"
+
+        all_scores.append(scores[0].cpu())
+        gt_counts.append(int(targets[0]["point"].shape[0]))
+        density_sums.append(float(torch.sum(outputs["density_out"]).item()))
+
+    return all_scores, gt_counts, density_sums
+
+
+def search_optimal_threshold(
+    all_scores: list[torch.Tensor],
+    gt_counts: list[int],
+    t_min: float = 0.1,
+    t_max: float = 0.95,
+    t_step: float = 0.01,
+) -> tuple[float, float, dict[float, float]]:
+    """Sweep thresholds on cached scores and return the one with lowest MAE.
+
+    Args:
+        all_scores: Per-image score tensors from :func:`collect_scores_and_counts`.
+        gt_counts:  Corresponding ground-truth counts.
+        t_min:  Lower bound of search range (inclusive).
+        t_max:  Upper bound of search range (inclusive).
+        t_step: Step size.
+
+    Returns:
+        best_threshold: Threshold that minimises MAE.
+        best_mae: MAE at the best threshold.
+        results: Dict mapping each candidate threshold to its MAE.
+    """
+    thresholds = np.arange(t_min, t_max + t_step / 2, t_step)
+    results: dict[float, float] = {}
+
+    for t in thresholds:
+        t_val = float(t)
+        maes = [
+            abs(int((s > t_val).sum().item()) - gt)
+            for s, gt in zip(all_scores, gt_counts)
+        ]
+        results[round(t_val, 4)] = float(np.mean(maes))
+
+    best_threshold = min(results, key=results.get)  # type: ignore[arg-type]
+    best_mae = results[best_threshold]
+
+    logger.info(
+        f"Threshold search complete: best={best_threshold:.2f}, MAE={best_mae:.2f} "
+        f"(searched {len(thresholds)} candidates in [{t_min}, {t_max}])"
+    )
+    return best_threshold, best_mae, results

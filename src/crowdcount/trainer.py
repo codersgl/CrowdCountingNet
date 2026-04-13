@@ -357,35 +357,35 @@ class Trainer:
                 self.writer.add_scalar("metric/density_mse", result[3], step)
                 step += 1
 
-                # Periodic threshold search
+                # Threshold search config
                 ts_cfg = getattr(cfg, "threshold_search", None)
                 ts_enabled = (
                     bool(getattr(ts_cfg, "enabled", False)) if ts_cfg else False
                 )
-                ts_every = int(getattr(ts_cfg, "every_n_epochs", 50)) if ts_cfg else 50
-                best_threshold = 0.5
-                if ts_enabled and epoch % ts_every == 0:
-                    all_scores, gt_counts, _ = collect_scores_and_counts(
-                        self.model,
-                        self.data_loader_val,
-                        self.device,
-                        use_depth=self._needs_depth,
-                    )
-                    best_threshold, opt_mae, _ = search_optimal_threshold(
-                        all_scores, gt_counts
-                    )
-                    self.writer.add_scalar(
-                        "metric/optimal_threshold", best_threshold, step - 1
-                    )
-                    self.writer.add_scalar("metric/optimal_mae", opt_mae, step - 1)
-                    if opt_mae < result[0]:
+
+                # Save best MAE checkpoint (strict: only when current epoch is the new minimum)
+                if result[0] <= np.min(mae_history):
+                    best_threshold = 0.5
+                    # When threshold search is enabled, run it only at best-MAE moments
+                    # to find the true optimal threshold for this checkpoint.
+                    if ts_enabled:
+                        all_scores, gt_counts, _ = collect_scores_and_counts(
+                            self.model,
+                            self.data_loader_val,
+                            self.device,
+                            use_depth=self._needs_depth,
+                        )
+                        best_threshold, opt_mae, _ = search_optimal_threshold(
+                            all_scores, gt_counts
+                        )
+                        self.writer.add_scalar(
+                            "metric/optimal_threshold", best_threshold, step - 1
+                        )
+                        self.writer.add_scalar("metric/optimal_mae", opt_mae, step - 1)
                         logger.info(
                             f"[Eval] threshold search: MAE {result[0]:.2f} → {opt_mae:.2f} "
                             f"(threshold {best_threshold:.2f})"
                         )
-
-                # Save best MAE checkpoint (strict: only when current epoch is the new minimum)
-                if result[0] <= np.min(mae_history):
                     torch.save(
                         {
                             "model": self.model.state_dict(),

@@ -18,6 +18,7 @@ from crowdcount.models.head import (
     DecoupledPredictionHead,
     DensityAttentionMask,
     Density_pred,
+    EnhancedDensityAttention,
     ForegroundSuppressionBranch,
     FreqDecoupledRouter,
     PointRefineModule,
@@ -121,6 +122,9 @@ class DSGCnet(nn.Module):
         freq_head_kernel: int = 3,
         use_density_attention: bool = False,
         density_attention_mode: str = "sigmoid",
+        density_attention_pre_gcn: bool = False,
+        density_attention_hidden: int = 32,
+        density_attention_base: float = 0.5,
         use_subpix_refine: bool = False,
         subpix_refine_cfg: DictConfig | None = None,
         use_uncertainty: bool = False,
@@ -247,10 +251,24 @@ class DSGCnet(nn.Module):
                     256, 512, 512, use_dcn=use_dcn, fpn_attention=fpn_attention
                 )
             self.density_pred = Density_pred()
-        self.density_attention: DensityAttentionMask | None = (
-            DensityAttentionMask(mode=density_attention_mode)
-            if use_density_attention
-            else None
+        self.density_attention: DensityAttentionMask | EnhancedDensityAttention | None
+        if use_density_attention:
+            if density_attention_mode == "enhanced":
+                self.density_attention = EnhancedDensityAttention(
+                    feature_channels=256,
+                    hidden_channels=density_attention_hidden,
+                    base_init=density_attention_base,
+                )
+            else:
+                self.density_attention = DensityAttentionMask(
+                    mode=density_attention_mode
+                )
+        else:
+            self.density_attention = None
+
+        # Pre-GCN density attention (lightweight sigmoid gate, independent weights)
+        self.density_attention_pre_gcn: DensityAttentionMask | None = (
+            DensityAttentionMask(mode="sigmoid") if density_attention_pre_gcn else None
         )
 
         # Multi-scale density prediction (optional)
@@ -852,6 +870,13 @@ class DSGCnet(nn.Module):
                 output_dict["density_fused"] = density
 
         # MSCADecoder produced features_pa + density; GCN still runs below
+        # Pre-GCN density attention: lightweight spatial gating before graph construction
+        if self.density_attention_pre_gcn is not None:
+            pre_mask = self.density_attention_pre_gcn(density.detach()).to(
+                features_pa.dtype
+            )
+            features_pa = features_pa * pre_mask
+
         if self.use_moe:
             assert self.esca is not None and self.moe is not None
             esca_feature = self.esca(features_pa)
@@ -935,13 +960,17 @@ class DSGCnet(nn.Module):
             output_dict["moe_aux_total"] = light_aux.get("total_aux")
             output_dict["moe_weights"] = light_weights
 
-        # SEMC post-GCN enhancement (optional, disabled by default)
+        # Post-GCN density attention: spatial+channel modulation of fused features
         if self.density_attention is not None:
-            attention_mask = self.density_attention(density.detach()).to(
-                feature_fl.dtype
-            )
-            feature_fl = feature_fl * attention_mask
+            if isinstance(self.density_attention, EnhancedDensityAttention):
+                feature_fl = self.density_attention(density.detach(), feature_fl)
+            else:
+                attention_mask = self.density_attention(density.detach()).to(
+                    feature_fl.dtype
+                )
+                feature_fl = feature_fl * attention_mask
 
+        # SEMC post-GCN enhancement (optional, disabled by default)
         if self.semc_enhancer is not None and not self.use_moe:
             feature_fl = self.semc_enhancer(
                 feature_fl,

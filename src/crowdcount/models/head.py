@@ -49,6 +49,124 @@ class DensityAttentionMask(nn.Module):
         return torch.sigmoid(self.proj(density))
 
 
+class EnhancedDensityAttention(nn.Module):
+    """Multi-scale, channel+spatial density attention with gradient-aware boundary enhancement.
+
+    Combines four complementary mechanisms to maximise the utility of density maps:
+
+    1. **Multi-scale density encoder** – depthwise dilated convolutions (d=1,2,3)
+       capture density patterns at multiple receptive-field sizes.
+    2. **Density gradient (boundary) branch** – fixed Sobel filters extract horizontal
+       and vertical gradients; a 1×1 conv compresses them into a boundary-aware feature.
+    3. **Channel attention** – SE-style squeeze-excite produces per-channel weights
+       conditioned on the density encoding, so each feature channel is density-aware.
+    4. **Spatial attention** – a lightweight projection produces a per-pixel mask
+       that highlights foreground / suppresses background.
+    5. **Residual dual-path output** – ``feature * (base + spatial_mask) * channel_weight``
+       where *base* is a learnable scalar (init 0.5) that prevents complete suppression.
+
+    Args:
+        feature_channels: Number of channels in the feature tensor (default 256).
+        hidden_channels: Internal width of density encoder / gradient branch (default 32).
+        base_init: Initial value for the residual base scalar (default 0.5).
+    """
+
+    def __init__(
+        self,
+        feature_channels: int = 256,
+        hidden_channels: int = 32,
+        base_init: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.feature_channels = feature_channels
+
+        # --- Multi-scale density encoder (dilation 1/2/3) ---
+        self.ms_dw_d1 = nn.Conv2d(
+            1, hidden_channels, kernel_size=3, padding=1, dilation=1, bias=False
+        )
+        self.ms_dw_d2 = nn.Conv2d(
+            1, hidden_channels, kernel_size=3, padding=2, dilation=2, bias=False
+        )
+        self.ms_dw_d3 = nn.Conv2d(
+            1, hidden_channels, kernel_size=3, padding=3, dilation=3, bias=False
+        )
+        self.ms_bn = nn.BatchNorm2d(hidden_channels)
+
+        # --- Density gradient (Sobel) branch ---
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]
+        ).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+        self.grad_proj = nn.Sequential(
+            nn.Conv2d(2, hidden_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # --- Fusion of multi-scale + gradient features ---
+        fused_channels = hidden_channels * 2  # ms + grad
+        self.fuse_conv = nn.Sequential(
+            nn.Conv2d(fused_channels, hidden_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # --- Channel attention (SE-style) ---
+        reduction = max(feature_channels // 16, 4)
+        self.ca_pool = nn.AdaptiveAvgPool2d(1)
+        self.ca_fc = nn.Sequential(
+            nn.Linear(hidden_channels, reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduction, feature_channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+        # --- Spatial attention ---
+        self.sa_conv = nn.Sequential(
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+        # --- Residual base ---
+        self.base = nn.Parameter(torch.tensor(base_init))
+
+    def forward(self, density: torch.Tensor, feature: torch.Tensor) -> torch.Tensor:
+        """Apply density-guided channel + spatial attention with residual path.
+
+        Args:
+            density: Density map ``[B, 1, H, W]`` (detached recommended).
+            feature: Feature tensor ``[B, C, H, W]`` to be modulated.
+
+        Returns:
+            Modulated features ``[B, C, H, W]``.
+        """
+        # Multi-scale density encoding
+        ms = self.ms_dw_d1(density) + self.ms_dw_d2(density) + self.ms_dw_d3(density)
+        ms = F.relu(self.ms_bn(ms), inplace=True)  # [B, hidden, H, W]
+
+        # Gradient (boundary) encoding
+        gx = F.conv2d(density, self.sobel_x, padding=1)
+        gy = F.conv2d(density, self.sobel_y, padding=1)
+        grad = self.grad_proj(torch.cat([gx, gy], dim=1))  # [B, hidden, H, W]
+
+        # Fuse multi-scale + gradient
+        fused = self.fuse_conv(torch.cat([ms, grad], dim=1))  # [B, hidden, H, W]
+
+        # Channel attention
+        ca = self.ca_pool(fused).squeeze(-1).squeeze(-1)  # [B, hidden]
+        ca = self.ca_fc(ca).unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
+
+        # Spatial attention
+        sa = self.sa_conv(fused)  # [B, 1, H, W]
+
+        # Residual dual-path: feature * (base + spatial_mask) * channel_weight
+        return feature * (self.base + sa) * ca
+
+
 class SharedPredictionTrunk(nn.Module):
     """Shared 2-layer conv feature extractor for regression and classification heads.
 

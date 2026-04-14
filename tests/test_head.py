@@ -10,6 +10,7 @@ from crowdcount.models.head import (
     DecoupledPredictionHead,
     DensityAttentionMask,
     Density_pred,
+    EnhancedDensityAttention,
     RegressionModel,
     SharedPredictionTrunk,
 )
@@ -169,3 +170,56 @@ def test_decoupled_head_end_to_end(feature_map):
     B, H, W = feature_map.shape[0], feature_map.shape[2], feature_map.shape[3]
     assert reg_out.shape == (B, H * W * 4, 2)
     assert cls_out.shape == (B, H * W * 4, 2)
+
+
+# ---------------------------------------------------------------------------
+# EnhancedDensityAttention
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("hidden", [16, 32])
+def test_enhanced_density_attention_shape(feature_map, hidden):
+    """Output shape must match input feature shape."""
+    module = EnhancedDensityAttention(feature_channels=256, hidden_channels=hidden)
+    density = torch.rand(2, 1, 16, 16)
+    out = module(density, feature_map)
+    assert out.shape == feature_map.shape
+
+
+def test_enhanced_density_attention_gradient_flow(feature_map):
+    """Gradients must flow through both density and feature paths."""
+    module = EnhancedDensityAttention(feature_channels=256, hidden_channels=16)
+    density = torch.rand(2, 1, 16, 16, requires_grad=True)
+    feat = feature_map.clone().requires_grad_(True)
+    out = module(density, feat)
+    loss = out.sum()
+    loss.backward()
+    assert density.grad is not None and density.grad.abs().sum() > 0
+    assert feat.grad is not None and feat.grad.abs().sum() > 0
+
+
+def test_enhanced_density_attention_residual_nonzero():
+    """With base > 0, output should never be all-zero even for zero density."""
+    module = EnhancedDensityAttention(feature_channels=256, base_init=0.5)
+    density = torch.zeros(1, 1, 8, 8)
+    feature = torch.ones(1, 256, 8, 8)
+    out = module(density, feature)
+    assert out.abs().sum() > 0, "Residual base should prevent complete suppression"
+
+
+def test_enhanced_density_attention_param_budget():
+    """Total parameters should stay under 300K for default config."""
+    module = EnhancedDensityAttention(feature_channels=256, hidden_channels=32)
+    total = sum(p.numel() for p in module.parameters())
+    assert total < 300_000, f"Parameter count {total} exceeds 300K budget"
+
+
+def test_enhanced_density_attention_sobel_not_learnable():
+    """Sobel kernels must be buffers, not parameters."""
+    module = EnhancedDensityAttention()
+    param_names = {n for n, _ in module.named_parameters()}
+    assert "sobel_x" not in param_names
+    assert "sobel_y" not in param_names
+    buffer_names = {n for n, _ in module.named_buffers()}
+    assert "sobel_x" in buffer_names
+    assert "sobel_y" in buffer_names

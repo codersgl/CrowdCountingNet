@@ -13,7 +13,10 @@ gm_input_dim: 256
 gm_hidden_dim: 128
 gm_spatial: true # true: per-pixel spatial gate | false: legacy global gate
 use_density_attention: false # Use density_out as a spatial attention mask on fused features
-density_attention_mode: sigmoid # sigmoid | learned
+density_attention_mode: sigmoid # sigmoid | learned | enhanced
+density_attention_pre_gcn: false # Also inject lightweight density attention before GCN
+density_attention_hidden: 32 # Hidden channels for enhanced mode (controls param budget)
+density_attention_base: 0.5 # Residual base for enhanced mode (prevents full suppression)
 use_msaa: false
 msaa_in_channels: 1280
 msaa_reduction: 4

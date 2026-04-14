@@ -55,6 +55,16 @@ def train_one_epoch(
     use_multi_scale_density = bool(
         getattr(density_cfg, "enabled", False) if density_cfg is not None else False
     )
+    consistency_weight = float(
+        getattr(density_cfg, "consistency_weight", 0.0)
+        if density_cfg is not None
+        else 0.0
+    )
+    count_consistency_weight = float(
+        getattr(density_cfg, "count_consistency_weight", 0.0)
+        if density_cfg is not None
+        else 0.0
+    )
     density_loss_weight = (
         float(getattr(cfg, "density_loss_weight", 0.01)) if cfg is not None else 0.01
     )
@@ -222,6 +232,61 @@ def train_one_epoch(
                     loss_orig / gt_dmap.shape[0] * density_loss_weight
                 ).item(),
             )
+
+            # Cross-scale consistency loss: enforce aligned predictions
+            if consistency_weight > 0:
+                target_size = et_dmap.shape[-2:]
+                d3_aligned = F.interpolate(
+                    outputs["density_block3"],
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                d4_aligned = F.interpolate(
+                    outputs["density_block4"],
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                d5_aligned = F.interpolate(
+                    outputs["density_block5"],
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                consist_loss = (
+                    (
+                        F.l1_loss(d3_aligned, d4_aligned)
+                        + F.l1_loss(d4_aligned, d5_aligned)
+                        + F.l1_loss(d3_aligned, et_dmap.detach())
+                    )
+                    / 3.0
+                    * consistency_weight
+                )
+                density_loss = density_loss + consist_loss
+                metric_logger.update(den_consist=consist_loss.item())
+
+            # Count consistency loss: density integrals should match GT count
+            # Each scale has different spatial resolution, so we normalise by
+            # the number of pixels to compare mean density (≈ count / area).
+            if count_consistency_weight > 0:
+                gt_mean = gt_dmap.mean(dim=(1, 2, 3))  # [B]
+                mean_block3 = outputs["density_block3"].mean(dim=(1, 2, 3))
+                mean_block4 = outputs["density_block4"].mean(dim=(1, 2, 3))
+                mean_block5 = outputs["density_block5"].mean(dim=(1, 2, 3))
+                mean_orig = et_dmap.mean(dim=(1, 2, 3))
+                count_loss = (
+                    (
+                        F.l1_loss(mean_block3, gt_mean)
+                        + F.l1_loss(mean_block4, gt_mean)
+                        + F.l1_loss(mean_block5, gt_mean)
+                        + F.l1_loss(mean_orig, gt_mean)
+                    )
+                    / 4.0
+                    * count_consistency_weight
+                )
+                density_loss = density_loss + count_loss
+                metric_logger.update(den_count_consist=count_loss.item())
         else:
             # Single-scale density prediction (original behavior)
             density_loss_raw = density_criterion(et_dmap, gt_dmap) / gt_dmap.shape[0]

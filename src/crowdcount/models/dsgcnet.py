@@ -39,6 +39,10 @@ from crowdcount.plugins.graph_moe import GraphAwareMoE
 from crowdcount.plugins.msaa import MSAAGate, MSAALite, MsaaAdaptiveLayer
 from crowdcount.plugins.MSCA import MSCADecoder, MSCANeck
 from crowdcount.plugins.rccformer import DensityPredDEAB, MFFMNeck
+from crowdcount.plugins.cross_scale_density import (
+    CrossScaleDensityRefinement,
+    MultiScaleDensityFusion,
+)
 
 
 class _DepthEncoder(nn.Module):
@@ -250,10 +254,26 @@ class DSGCnet(nn.Module):
         )
 
         # Multi-scale density prediction (optional)
+        self.use_cross_scale_refine = bool(
+            getattr(density_cfg, "cross_scale_refine", False)
+            if density_cfg is not None
+            else False
+        )
+        self.use_fuse_to_gcn = bool(
+            getattr(density_cfg, "fuse_to_gcn", False)
+            if density_cfg is not None
+            else False
+        )
         if self.use_multi_scale_density:
-            self.density_pred_block3 = DensityPred_Block3()
-            self.density_pred_block4 = DensityPred_Block4()
-            self.density_pred_block5 = DensityPred_Block5()
+            if self.use_cross_scale_refine:
+                # Coarse-to-fine refinement replaces independent heads
+                self.cross_scale_refine = CrossScaleDensityRefinement()
+            else:
+                self.density_pred_block3 = DensityPred_Block3()
+                self.density_pred_block4 = DensityPred_Block4()
+                self.density_pred_block5 = DensityPred_Block5()
+            if self.use_fuse_to_gcn:
+                self.density_fuse = MultiScaleDensityFusion(num_scales=4)
 
         if self.use_moe:
             top_k = int(getattr(moe_cfg, "top_k", 2)) if moe_cfg is not None else 2
@@ -811,17 +831,25 @@ class DSGCnet(nn.Module):
         }
 
         if self.use_multi_scale_density:
-            density_block3 = self.density_pred_block3(c3)
-            density_block4 = self.density_pred_block4(c4)
-            density_block5 = self.density_pred_block5(c5)
-
-            output_dict.update(
-                {
-                    "density_block3": density_block3,
-                    "density_block4": density_block4,
-                    "density_block5": density_block5,
+            if self.use_cross_scale_refine:
+                ms_densities = self.cross_scale_refine(c3, c4, c5)
+            else:
+                ms_densities = {
+                    "density_block3": self.density_pred_block3(c3),
+                    "density_block4": self.density_pred_block4(c4),
+                    "density_block5": self.density_pred_block5(c5),
                 }
-            )
+            output_dict.update(ms_densities)
+
+            # Fuse multi-scale densities into GCN input (optional)
+            if self.use_fuse_to_gcn:
+                density = self.density_fuse(
+                    density,
+                    ms_densities["density_block3"],
+                    ms_densities["density_block4"],
+                    ms_densities["density_block5"],
+                )
+                output_dict["density_fused"] = density
 
         # MSCADecoder produced features_pa + density; GCN still runs below
         if self.use_moe:

@@ -64,6 +64,10 @@ fg_pos_weight: 5.0 # BCE pos_weight to handle foreground/background imbalance
 # Multi-scale density prediction (experimental)
 density_multi_scale:
   enabled: false # Enable multi-scale density prediction with auxiliary supervision
+  cross_scale_refine: false # Coarse-to-fine refinement (block5→block4→block3)
+  fuse_to_gcn: false # Fuse multi-scale densities into a single map for GCN input
+  consistency_weight: 0.0 # Cross-scale pixel-level consistency loss weight (0 = off)
+  count_consistency_weight: 0.0 # Cross-scale count consistency loss weight (0 = off)
   weights:
     block3: 0.5 # Weight for H/8 density loss
     block4: 1.0 # Weight for H/16 density loss (original scale)

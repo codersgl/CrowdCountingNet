@@ -123,6 +123,15 @@ depth_geo:
   initial_value: 2.0
   heads_range: 4.0
 
+# Dual-VGG RGBD fusion (disabled by default)
+# Uses a second VGG backbone (1-channel input) for depth feature extraction.
+# Mutually exclusive with use_depth and use_depth_geo.
+use_depth_dual_vgg: false
+depth_dual_vgg:
+  variant: vgg16_bn # vgg16_bn | vgg16 (must match RGB backbone for fair comparison)
+  pretrained: true # load ImageNet pretrained weights (1st-layer adapted to 1ch)
+  frozen_stages: 0 # 0=all trainable; 1=freeze body1; 2=freeze body1+body2; etc.
+
 # SEMC post-GCN enhancer (disabled by default; enable via CLI or override)
 use_semc_enhancer: false
 semc:

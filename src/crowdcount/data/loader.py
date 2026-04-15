@@ -39,7 +39,10 @@ def build_dataset(cfg: DictConfig):
 
     use_depth = bool(getattr(getattr(cfg, "model", None), "use_depth", False))
     use_depth_geo = bool(getattr(getattr(cfg, "model", None), "use_depth_geo", False))
-    needs_depth = use_depth or use_depth_geo
+    use_depth_dual_vgg = bool(
+        getattr(getattr(cfg, "model", None), "use_depth_dual_vgg", False)
+    )
+    needs_depth = use_depth or use_depth_geo or use_depth_dual_vgg
     depth_cfg = (
         getattr(getattr(cfg, "model", None), "depth", None) if needs_depth else None
     )

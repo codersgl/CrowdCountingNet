@@ -75,6 +75,12 @@ def base_cfg():
                     "initial_value": 2.0,
                     "heads_range": 4.0,
                 },
+                "use_depth_dual_vgg": False,
+                "depth_dual_vgg": {
+                    "variant": "vgg16_bn",
+                    "pretrained": True,
+                    "frozen_stages": 0,
+                },
                 "use_refine": False,
                 "refine": {
                     "num_steps": 2,

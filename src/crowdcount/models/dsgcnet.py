@@ -33,7 +33,9 @@ from crowdcount.models.neck import Decoder_SPD_PAFPN
 from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
+from crowdcount.plugins.concat_gate_fusion import ConcatGateFusion
 from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
+from crowdcount.models.backbone import DepthBackbone_VGG
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.graph_moe import GraphAwareMoE
@@ -105,6 +107,8 @@ class DSGCnet(nn.Module):
         depth_cfg: DictConfig | None = None,
         use_depth_geo: bool = False,
         depth_geo_cfg: DictConfig | None = None,
+        use_depth_dual_vgg: bool = False,
+        depth_dual_vgg_cfg: DictConfig | None = None,
         gcn_adaptive: bool = False,
         gcn_k: int = 4,
         gcn_k_min: int = 2,
@@ -153,6 +157,16 @@ class DSGCnet(nn.Module):
         self.use_mamba_moe = fusion_mode == "mamba_moe"
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
+        self.use_depth_dual_vgg = use_depth_dual_vgg
+
+        # Mutual exclusion: only one depth fusion path at a time
+        _depth_flags = sum([use_depth, use_depth_geo, use_depth_dual_vgg])
+        if _depth_flags > 1:
+            raise ValueError(
+                "At most one depth fusion path may be enabled. Got: "
+                f"use_depth={use_depth}, use_depth_geo={use_depth_geo}, "
+                f"use_depth_dual_vgg={use_depth_dual_vgg}"
+            )
         self.use_freq_head = use_freq_head
         self.use_density_attention = use_density_attention
         self.use_subpix_refine = use_subpix_refine
@@ -599,6 +613,37 @@ class DSGCnet(nn.Module):
             self.geo_attn_c4 = None
             self.geo_attn_c5 = None
 
+        # Dual-VGG RGBD fusion (optional, alternative to use_depth / use_depth_geo)
+        if use_depth_dual_vgg:
+            _dvgg_variant = (
+                str(getattr(depth_dual_vgg_cfg, "variant", "vgg16_bn"))
+                if depth_dual_vgg_cfg is not None
+                else "vgg16_bn"
+            )
+            _dvgg_pretrained = (
+                bool(getattr(depth_dual_vgg_cfg, "pretrained", True))
+                if depth_dual_vgg_cfg is not None
+                else True
+            )
+            _dvgg_frozen = (
+                int(getattr(depth_dual_vgg_cfg, "frozen_stages", 0))
+                if depth_dual_vgg_cfg is not None
+                else 0
+            )
+            self.depth_vgg_backbone: DepthBackbone_VGG | None = DepthBackbone_VGG(
+                name=_dvgg_variant,
+                pretrained=_dvgg_pretrained,
+                frozen_stages=_dvgg_frozen,
+            )
+            self.dvgg_fusion_c3: ConcatGateFusion | None = ConcatGateFusion(256)
+            self.dvgg_fusion_c4: ConcatGateFusion | None = ConcatGateFusion(512)
+            self.dvgg_fusion_c5: ConcatGateFusion | None = ConcatGateFusion(512)
+        else:
+            self.depth_vgg_backbone = None
+            self.dvgg_fusion_c3 = None
+            self.dvgg_fusion_c4 = None
+            self.dvgg_fusion_c5 = None
+
         # DINOv2 semantic injection (optional, disabled by default)
         # cfg may be full hydra config (has .model) or flat model-level config from tests
         _model_cfg = getattr(cfg, "model", cfg) if cfg is not None else None
@@ -807,6 +852,23 @@ class DSGCnet(nn.Module):
             c3 = self.geo_attn_c3(c3, depth_map)  # type: ignore[misc]
             c4 = self.geo_attn_c4(c4, depth_map)  # type: ignore[misc]
             c5 = self.geo_attn_c5(c5, depth_map)  # type: ignore[misc]
+
+        # Dual-VGG RGBD fusion: depth through a separate VGG, then concat-gate
+        if self.use_depth_dual_vgg and depth_map is not None:
+            assert self.depth_vgg_backbone is not None
+            if depth_map.shape[-2:] != samples.shape[-2:]:
+                depth_map = F.interpolate(
+                    depth_map,
+                    size=samples.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            depth_feats = self.depth_vgg_backbone(depth_map)
+            # depth_feats: [d_c1, d_c3, d_c4, d_c5] matching VGG body1..body4
+            d_c3, d_c4, d_c5 = depth_feats[1], depth_feats[2], depth_feats[3]
+            c3 = self.dvgg_fusion_c3(c3, d_c3)  # type: ignore[misc]
+            c4 = self.dvgg_fusion_c4(c4, d_c4)  # type: ignore[misc]
+            c5 = self.dvgg_fusion_c5(c5, d_c5)  # type: ignore[misc]
 
         # --- MSCADecoder path: replaces PA-FPN + Density_pred, GCN runs downstream ---
         if self.use_msca_decoder:

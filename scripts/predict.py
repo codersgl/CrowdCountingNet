@@ -45,6 +45,15 @@ def main(cfg: DictConfig) -> None:
     min_score = eval_counting.get("min_score", 0.3)
     gpu_id = cfg.gpu_id
 
+    # Check whether the model requires depth input
+    _mcfg = predict_cfg.get("model", {})
+    needs_depth = (
+        _mcfg.get("use_depth", False)
+        or _mcfg.get("use_depth_geo", False)
+        or _mcfg.get("use_depth_dual_vgg", False)
+    )
+    depth_dir = predict_cfg.get("predict", {}).get("depth_dir", None)
+
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -97,8 +106,33 @@ def main(cfg: DictConfig) -> None:
         img = transform(img_raw)
         samples = torch.Tensor(img).unsqueeze(0).to(device)
 
+        # Load depth map if needed
+        depth_map = None
+        if needs_depth:
+            base_name = os.path.splitext(jpg_file)[0]
+            depth_npy = None
+            if depth_dir:
+                depth_npy = os.path.join(depth_dir, f"{base_name}.npy")
+            else:
+                # Fallback: look for gt_depth_maps alongside root_dir structure
+                depth_npy = os.path.join(scene_path, f"{base_name}_depth.npy")
+            if depth_npy and os.path.exists(depth_npy):
+                d = np.load(depth_npy).astype(np.float32)
+                # Normalize to [0, 1]
+                d_min, d_max = d.min(), d.max()
+                if d_max - d_min > 1e-6:
+                    d = (d - d_min) / (d_max - d_min)
+                d = cv2.resize(
+                    d, (new_width, new_height), interpolation=cv2.INTER_LINEAR
+                )
+                depth_map = torch.from_numpy(d).unsqueeze(0).unsqueeze(0).to(device)
+            else:
+                logger.warning(
+                    f"Depth map not found for {base_name}, running without depth."
+                )
+
         with torch.no_grad():
-            outputs = model(samples)
+            outputs = model(samples, depth_map=depth_map)
 
         outputs_scores = torch.nn.functional.softmax(outputs["pred_logits"], dim=-1)[
             :, :, 1

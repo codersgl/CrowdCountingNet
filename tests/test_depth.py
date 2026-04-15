@@ -182,3 +182,145 @@ def test_shha_depth_return_shape(tmp_path, monkeypatch):
     assert img.shape[0] == 3
     assert isinstance(target, list)
     assert depth.shape == (1, 256, 256)
+
+
+# ---------------------------------------------------------------------------
+# ConcatGateFusion tests
+# ---------------------------------------------------------------------------
+
+
+def test_concat_gate_fusion_shape_256():
+    from crowdcount.plugins.concat_gate_fusion import ConcatGateFusion
+
+    module = ConcatGateFusion(in_channels=256)
+    rgb = torch.randn(2, 256, 16, 16)
+    dep = torch.randn(2, 256, 16, 16)
+    out = module(rgb, dep)
+    assert out.shape == (2, 256, 16, 16)
+
+
+def test_concat_gate_fusion_shape_512():
+    from crowdcount.plugins.concat_gate_fusion import ConcatGateFusion
+
+    module = ConcatGateFusion(in_channels=512)
+    rgb = torch.randn(2, 512, 8, 8)
+    dep = torch.randn(2, 512, 8, 8)
+    out = module(rgb, dep)
+    assert out.shape == (2, 512, 8, 8)
+
+
+def test_concat_gate_fusion_gradient_flow():
+    from crowdcount.plugins.concat_gate_fusion import ConcatGateFusion
+
+    module = ConcatGateFusion(in_channels=256)
+    rgb = torch.randn(1, 256, 8, 8, requires_grad=True)
+    dep = torch.randn(1, 256, 8, 8, requires_grad=True)
+    out = module(rgb, dep)
+    out.sum().backward()
+    assert rgb.grad is not None
+    assert dep.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# DepthBackbone_VGG tests  (no pretrained download — pretrained=False)
+# ---------------------------------------------------------------------------
+
+
+def test_depth_backbone_vgg_first_layer_1ch():
+    """First Conv layer of DepthBackbone_VGG should accept 1-channel input."""
+    from crowdcount.models.backbone import DepthBackbone_VGG
+
+    model = DepthBackbone_VGG(name="vgg16_bn", pretrained=False, frozen_stages=0)
+    first_conv = model.body1[0]
+    assert first_conv.in_channels == 1, (
+        f"Expected in_channels=1, got {first_conv.in_channels}"
+    )
+
+
+def test_depth_backbone_vgg_output_scales():
+    """DepthBackbone_VGG should output 4 tensors at correct channel widths."""
+    from crowdcount.models.backbone import DepthBackbone_VGG
+
+    model = DepthBackbone_VGG(name="vgg16_bn", pretrained=False, frozen_stages=0)
+    model.eval()
+    x = torch.randn(1, 1, 128, 128)
+    with torch.no_grad():
+        outs = model(x)
+    assert len(outs) == 4
+    # c3 = outs[1]: 256ch, c4 = outs[2]: 512ch, c5 = outs[3]: 512ch
+    assert outs[1].shape[1] == 256
+    assert outs[2].shape[1] == 512
+    assert outs[3].shape[1] == 512
+
+
+def test_depth_backbone_vgg_frozen_stages():
+    """frozen_stages=2 freezes body1 and body2 parameters."""
+    from crowdcount.models.backbone import DepthBackbone_VGG
+
+    model = DepthBackbone_VGG(name="vgg16_bn", pretrained=False, frozen_stages=2)
+    for p in model.body1.parameters():
+        assert not p.requires_grad
+    for p in model.body2.parameters():
+        assert not p.requires_grad
+    # body3 should still be trainable
+    assert any(p.requires_grad for p in model.body3.parameters())
+
+
+# ---------------------------------------------------------------------------
+# DSGCnet dual-VGG forward tests
+# ---------------------------------------------------------------------------
+
+
+def test_dsgcnet_forward_with_dual_vgg(sample_batch, depth_sample):
+    """DSGCnet with use_depth_dual_vgg=True should produce correct output keys."""
+    from crowdcount.models.backbone import DepthBackbone_VGG
+
+    backbone = TinyVGGBackbone()
+    dual_vgg_cfg = OmegaConf.create(
+        {"variant": "vgg16_bn", "pretrained": False, "frozen_stages": 0}
+    )
+    model = DSGCnet(backbone, use_depth_dual_vgg=True, depth_dual_vgg_cfg=dual_vgg_cfg)
+    model.eval()
+
+    with torch.no_grad():
+        out = model(sample_batch, depth_map=depth_sample)
+
+    assert "pred_logits" in out
+    assert "pred_points" in out
+    assert "density_out" in out
+    assert out["pred_logits"].shape[0] == sample_batch.shape[0]
+    assert out["pred_points"].shape[0] == sample_batch.shape[0]
+    assert out["density_out"].shape[0] == sample_batch.shape[0]
+
+
+def test_dsgcnet_dual_vgg_no_depthmap_runs(sample_batch):
+    """When depth_map=None with dual_vgg enabled, model should still run (skips fusion)."""
+    backbone = TinyVGGBackbone()
+    dual_vgg_cfg = OmegaConf.create(
+        {"variant": "vgg16_bn", "pretrained": False, "frozen_stages": 0}
+    )
+    model = DSGCnet(backbone, use_depth_dual_vgg=True, depth_dual_vgg_cfg=dual_vgg_cfg)
+    model.eval()
+
+    with torch.no_grad():
+        out = model(sample_batch)  # no depth_map
+
+    assert out["pred_logits"].shape[0] == sample_batch.shape[0]
+
+
+def test_dsgcnet_dual_vgg_exclusivity_raises():
+    """Enabling use_depth_dual_vgg together with use_depth should raise ValueError."""
+    import pytest
+
+    backbone = TinyVGGBackbone()
+    with pytest.raises(ValueError, match="At most one depth fusion path"):
+        DSGCnet(backbone, use_depth=True, use_depth_dual_vgg=True)
+
+
+def test_dsgcnet_dual_vgg_exclusivity_with_geo_raises():
+    """Enabling use_depth_dual_vgg together with use_depth_geo should raise ValueError."""
+    import pytest
+
+    backbone = TinyVGGBackbone()
+    with pytest.raises(ValueError, match="At most one depth fusion path"):
+        DSGCnet(backbone, use_depth_geo=True, use_depth_dual_vgg=True)

@@ -78,6 +78,64 @@ class Backbone_VGG(BackboneBase_VGG):
         super().__init__(backbone, num_channels, name, return_interm_layers)
 
 
+class DepthBackbone_VGG(BackboneBase_VGG):
+    """VGG backbone adapted for single-channel depth input.
+
+    The first Conv2d layer is replaced with a 1-channel version.  When
+    ``pretrained=True`` the original 3-channel kernel weights are averaged
+    across the input-channel dimension so that the pretrained statistics
+    transfer meaningfully to the depth domain.
+    """
+
+    def __init__(
+        self,
+        name: str = "vgg16_bn",
+        pretrained: bool = True,
+        frozen_stages: int = 0,
+    ):
+        if name == "vgg16_bn":
+            backbone = vgg_models.vgg16_bn(pretrained=pretrained)
+        elif name == "vgg16":
+            backbone = vgg_models.vgg16(pretrained=pretrained)
+        else:
+            raise ValueError(f"Unsupported VGG variant for depth branch: {name}")
+
+        # --- Adapt first Conv layer: 3ch → 1ch ---
+        old_conv: nn.Conv2d = backbone.features[0]  # type: ignore[assignment]
+        new_conv = nn.Conv2d(
+            1,
+            old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,  # type: ignore[arg-type]
+            stride=old_conv.stride,  # type: ignore[arg-type]
+            padding=old_conv.padding,  # type: ignore[arg-type]
+            bias=old_conv.bias is not None,
+        )
+        if pretrained:
+            # Average RGB kernel weights → 1-channel kernel
+            with torch.no_grad():
+                new_conv.weight.copy_(old_conv.weight.mean(dim=1, keepdim=True))
+                if old_conv.bias is not None and new_conv.bias is not None:
+                    new_conv.bias.copy_(old_conv.bias)
+        backbone.features[0] = new_conv
+
+        num_channels = 256
+        super().__init__(backbone, num_channels, name, return_interm_layers=True)
+
+        # Optionally freeze early stages for transfer learning
+        if frozen_stages >= 1:
+            for p in self.body1.parameters():
+                p.requires_grad = False
+        if frozen_stages >= 2:
+            for p in self.body2.parameters():
+                p.requires_grad = False
+        if frozen_stages >= 3:
+            for p in self.body3.parameters():
+                p.requires_grad = False
+        if frozen_stages >= 4:
+            for p in self.body4.parameters():
+                p.requires_grad = False
+
+
 # ---------------------------------------------------------------------------
 # DINOv2 backbone
 # ---------------------------------------------------------------------------

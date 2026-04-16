@@ -133,7 +133,9 @@ class CAM(nn.Module):
     """Cross-level Attention Module: aggregates multi-scale features via ASPP
     and generates per-level sigmoid attention maps.
 
-    Adapted from the original CrowdFPN paper for 3 feature levels.
+    Uses parallel multi-scale downsampling instead of cascade to avoid error
+    accumulation.  Each attention level has an independent path from the
+    aggregated feature.
     """
 
     def __init__(self, inplanes: int, num_levels: int = 3) -> None:
@@ -149,15 +151,18 @@ class CAM(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Per-level downsampling + attention conv
-        self.down_conv = nn.ModuleList()
-        self.att_conv = nn.ModuleList()
+        # Parallel per-level downsampling + attention conv
+        # Each path is independent (no cascading)
+        self.down_paths = nn.ModuleList()
         for i in range(num_levels):
-            stride = 1 if i == 0 else 2
-            self.down_conv.append(
-                nn.Conv2d(inplanes, inplanes, 3, stride=stride, padding=1)
-            )
-            self.att_conv.append(nn.Conv2d(inplanes, 1, 3, padding=1))
+            num_down = i  # level 0: no downsampling, level 1: 2×, level 2: 4×
+            layers: list[nn.Module] = []
+            for _ in range(num_down):
+                layers.append(nn.Conv2d(inplanes, inplanes, 3, stride=2, padding=1))
+                layers.append(nn.BatchNorm2d(inplanes))
+                layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Conv2d(inplanes, 1, 3, padding=1))
+            self.down_paths.append(nn.Sequential(*layers))
 
         self._init_weights()
 
@@ -180,12 +185,17 @@ class CAM(nn.Module):
             )
         agg = self.dila_conv(torch.cat(multi_feats, dim=1))
 
-        # Generate per-level attention
+        # Generate per-level attention in parallel (no cascading)
         atts = []
-        x = agg
         for i in range(self.num_levels):
-            x = self.down_conv[i](x)
-            atts.append(torch.sigmoid(self.att_conv[i](x)))
+            att_map = torch.sigmoid(self.down_paths[i](agg))
+            # Ensure attention matches target spatial size
+            target_sz = features[i].shape[2:]
+            if att_map.shape[-2:] != target_sz:
+                att_map = F.interpolate(
+                    att_map, size=target_sz, mode="bilinear", align_corners=False
+                )
+            atts.append(att_map)
         return atts
 
 
@@ -238,7 +248,9 @@ class CoordinateAttention(nn.Module):
 class CrowdFPN(nn.Module):
     """CrowdFPN: BiFPN-style neck with CAM + CoordinateAttention.
 
-    Adapted from the original CrowdFPN paper for 3 input scales.
+    Adapted from the original CrowdFPN paper for 3 input scales, with
+    enhancements: parallel CAM, scale-specific coordinate attention, and
+    learnable BiFPN weight fusion.
 
     Input (from Swin backbone after projection):
         C2: [B, C2_ch, H/4,  W/4 ]  (stride 4)
@@ -268,23 +280,36 @@ class CrowdFPN(nn.Module):
         # --- CAM (Cross-level Attention Module) ---
         self.cam = CAM(fs, num_levels=3)
 
-        # --- BiFPN top-down pathway ---
-        # cat(x2, upsample(x3)) → SeparableConv  [at stride 8]
-        self.conv_td_2 = SeparableConvBlock(2 * fs, fs)
-        # cat(x1, upsample(x2_up)) → SeparableConv  [at stride 4]
-        self.conv_td_1 = SeparableConvBlock(2 * fs, fs)
+        # --- BiFPN top-down pathway with learnable fusion weights ---
+        # Weighted fuse(x2, upsample(x3)) → Swish → SeparableConv  [at stride 8]
+        self.conv_td_2 = SeparableConvBlock(fs, fs)
+        # Weighted fuse(x1, upsample(x2_up)) → Swish → SeparableConv  [at stride 4]
+        self.conv_td_1 = SeparableConvBlock(fs, fs)
 
-        # --- BiFPN bottom-up pathway ---
-        # cat(x2, x2_up, downsample(x1_out)) → SeparableConv  [at stride 8]
-        self.conv_bu_2 = SeparableConvBlock(3 * fs, fs)
-        # cat(x3, downsample(x2_out)) → SeparableConv  [at stride 16]
-        self.conv_bu_3 = SeparableConvBlock(2 * fs, fs)
+        # Learnable BiFPN fusion weights (EfficientDet-style)
+        # td_2: merge x2 + up(x3) → 2 inputs
+        self.td2_weights = nn.Parameter(torch.ones(2))
+        # td_1: merge x1 + up(x2_up) → 2 inputs
+        self.td1_weights = nn.Parameter(torch.ones(2))
+
+        # --- BiFPN bottom-up pathway with learnable fusion weights ---
+        # Weighted fuse(x2, x2_up, downsample(x1_out)) → Swish → SeparableConv  [at stride 8]
+        self.conv_bu_2 = SeparableConvBlock(fs, fs)
+        # Weighted fuse(x3, downsample(x2_out)) → Swish → SeparableConv  [at stride 16]
+        self.conv_bu_3 = SeparableConvBlock(fs, fs)
+
+        # bu_2: merge x2 + x2_up + down(x1_out) → 3 inputs
+        self.bu2_weights = nn.Parameter(torch.ones(3))
+        # bu_3: merge x3 + down(x2_out) → 2 inputs
+        self.bu3_weights = nn.Parameter(torch.ones(2))
 
         self.swish = Swish()
         self.downsample = nn.Conv2d(fs, fs, 3, stride=2, padding=1)
 
-        # --- CoordinateAttention on each output level ---
-        self.coord_att = CoordinateAttention(fs, fs)
+        # --- Scale-specific CoordinateAttention ---
+        self.coord_att_1 = CoordinateAttention(fs, fs)  # stride 4
+        self.coord_att_2 = CoordinateAttention(fs, fs)  # stride 8
+        self.coord_att_3 = CoordinateAttention(fs, fs)  # stride 16
 
         # --- Final fusion: upsample all to stride-8, concat → project ---
         self.final_conv = nn.Sequential(
@@ -304,6 +329,15 @@ class CrowdFPN(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+
+    @staticmethod
+    def _weighted_fuse(
+        tensors: list[torch.Tensor], weights: nn.Parameter
+    ) -> torch.Tensor:
+        """Fuse tensors with learnable softmax-normalised weights."""
+        w = F.softmax(weights, dim=0)
+        out = sum(w[i] * t for i, t in enumerate(tensors))
+        return out
 
     def forward(self, inputs: list[torch.Tensor]) -> torch.Tensor:
         """inputs: [C2, C3, C4] from backbone.
@@ -333,41 +367,36 @@ class CrowdFPN(nn.Module):
         x2 = (1 + att_list[1]) * x2
         x3 = (1 + att_list[2]) * x3
 
-        # 3) BiFPN top-down
-        # x2_up: merge x2 (stride 8) + upsampled x3 (stride 16→8)
-        x2_up = self.conv_td_2(
-            self.swish(
-                torch.cat(
-                    [x2, F.interpolate(x3, size=x2.shape[-2:], mode="nearest")], dim=1
-                )
-            )
-        )
-        # x1_out: merge x1 (stride 4) + upsampled x2_up (stride 8→4)
-        x1_out = self.conv_td_1(
-            self.swish(
-                torch.cat(
-                    [x1, F.interpolate(x2_up, size=x1.shape[-2:], mode="nearest")],
-                    dim=1,
-                )
-            )
-        )
+        # 3) BiFPN top-down with learnable weighted fusion
+        # x2_up: weighted merge x2 (stride 8) + upsampled x3 (stride 16→8)
+        x3_up = F.interpolate(x3, size=x2.shape[-2:], mode="nearest")
+        x2_fused_td = self._weighted_fuse([x2, x3_up], self.td2_weights)
+        x2_up = self.conv_td_2(self.swish(x2_fused_td))
 
-        # 4) BiFPN bottom-up
-        # x2_out: merge x2 + x2_up (both stride 8) + downsampled x1_out (stride 4→8)
+        # x1_out: weighted merge x1 (stride 4) + upsampled x2_up (stride 8→4)
+        x2_up_up = F.interpolate(x2_up, size=x1.shape[-2:], mode="nearest")
+        x1_fused_td = self._weighted_fuse([x1, x2_up_up], self.td1_weights)
+        x1_out = self.conv_td_1(self.swish(x1_fused_td))
+
+        # 4) BiFPN bottom-up with learnable weighted fusion
+        # x2_out: weighted merge x2 + x2_up + downsampled x1_out
         x1_down = self.downsample(x1_out)
         if x1_down.shape[-2:] != x2.shape[-2:]:
             x1_down = F.interpolate(x1_down, size=x2.shape[-2:], mode="nearest")
-        x2_out = self.conv_bu_2(self.swish(torch.cat([x2, x2_up, x1_down], dim=1)))
-        # x3_out: merge x3 (stride 16) + downsampled x2_out (stride 8→16)
+        x2_fused_bu = self._weighted_fuse([x2, x2_up, x1_down], self.bu2_weights)
+        x2_out = self.conv_bu_2(self.swish(x2_fused_bu))
+
+        # x3_out: weighted merge x3 + downsampled x2_out
         x2_down = self.downsample(x2_out)
         if x2_down.shape[-2:] != x3.shape[-2:]:
             x2_down = F.interpolate(x2_down, size=x3.shape[-2:], mode="nearest")
-        x3_out = self.conv_bu_3(self.swish(torch.cat([x3, x2_down], dim=1)))
+        x3_fused_bu = self._weighted_fuse([x3, x2_down], self.bu3_weights)
+        x3_out = self.conv_bu_3(self.swish(x3_fused_bu))
 
-        # 5) Coordinate Attention on each output level
-        x1_out = self.coord_att(x1_out)  # stride 4
-        x2_out = self.coord_att(x2_out)  # stride 8
-        x3_out = self.coord_att(x3_out)  # stride 16
+        # 5) Scale-specific Coordinate Attention on each output level
+        x1_out = self.coord_att_1(x1_out)  # stride 4
+        x2_out = self.coord_att_2(x2_out)  # stride 8
+        x3_out = self.coord_att_3(x3_out)  # stride 16
 
         # 6) Upsample all to stride-8 (x2's resolution) and fuse
         target_size = x2.shape[-2:]

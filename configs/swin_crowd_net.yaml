@@ -42,9 +42,9 @@ density_dmcount:
   lambda_tv: 0.01
   count_loss_type: "l1"
 
-# Density SSIM (disabled)
+# Density SSIM (enabled for structural similarity)
 density_ssim:
-  enabled: false
+  enabled: true
   weight: 0.005
   window_size: 7
   sigma: 1.5

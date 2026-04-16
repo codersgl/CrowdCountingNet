@@ -36,12 +36,21 @@ def _build_swin_crowd_net(cfg: DictConfig):
         moe_temperature_min=float(getattr(moe_cfg, "temperature_min", 0.3))
         if moe_cfg
         else 0.3,
-        moe_lambda_balance=float(getattr(moe_cfg, "lambda_balance", 0.01))
+        moe_lambda_balance=float(getattr(moe_cfg, "lambda_balance", 0.05))
         if moe_cfg
-        else 0.01,
+        else 0.05,
         moe_dense_expansion=int(getattr(moe_cfg, "dense_expansion", 2))
         if moe_cfg
         else 2,
+        moe_use_density_gate=bool(getattr(moe_cfg, "use_density_gate", True))
+        if moe_cfg
+        else True,
+        moe_lambda_decorr=float(getattr(moe_cfg, "lambda_decorr", 0.1))
+        if moe_cfg
+        else 0.1,
+        use_dfr=bool(getattr(cfg.model, "use_dfr", True)),
+        use_decoupled_head=bool(getattr(cfg.model, "use_decoupled_head", True)),
+        use_freq_router=bool(getattr(cfg.model, "use_freq_router", True)),
         cfg=cfg,
     )
     return model

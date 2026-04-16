@@ -1,0 +1,73 @@
+defaults:
+  - data: shha
+  - model: swin_crowd_net
+  - optimizer: adamw
+  - scheduler: cosine_annealing
+  - _self_
+
+# Runtime
+seed: 42
+gpu_id: 0
+num_workers: 8
+eval_freq: 1
+
+# Training
+epochs: 3500
+clip_max_norm: 0.1
+frozen_weights: null
+resume: ""
+reset_optimizer: false
+start_epoch: 0
+
+# Output dirs
+checkpoints_dir: checkpoints
+tensorboard_dir: runs/swin_crowd_net
+
+# Density loss
+density_loss_weight: 0.01
+
+# Uncertainty weighting (disabled by default for new architecture)
+uncertainty_weighting:
+  enabled: false
+  init_log_var_den: 3.91
+  init_log_var_ce: -0.693
+  init_log_var_reg: 8.52
+  lr_scale: 1.0
+
+# DM-Count density loss (disabled)
+density_dmcount:
+  enabled: false
+  lambda_count: 1.0
+  lambda_ot: 0.1
+  lambda_tv: 0.01
+  count_loss_type: "l1"
+
+# Density SSIM (disabled)
+density_ssim:
+  enabled: false
+  weight: 0.005
+  window_size: 7
+  sigma: 1.5
+
+# Refinement losses (not used by SwinCrowdNet)
+refine_loss_weight: 0.0
+fg_loss_weight: 0.0
+fg_pos_weight: 5.0
+
+# Multi-scale density (disabled)
+density_multi_scale:
+  enabled: false
+  cross_scale_refine: false
+  fuse_to_gcn: false
+  consistency_weight: 0.0
+  count_consistency_weight: 0.0
+  weights:
+    block3: 0.5
+    block4: 1.0
+    block5: 0.5
+    original: 1.0
+
+# Evaluation
+eval_counting:
+  method: "threshold"
+  threshold: 0.5

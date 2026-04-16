@@ -11,12 +11,96 @@ from crowdcount.models.matcher import build_matcher_crowd
 from crowdcount.models.uncertainty_loss import UncertaintyWeighter
 
 
+def _build_swin_crowd_net(cfg: DictConfig):
+    """Build a SwinCrowdNet model from config."""
+    from crowdcount.models.swin_backbone import BackboneSwin
+    from crowdcount.models.swin_crowd_net import SwinCrowdNet
+
+    backbone = BackboneSwin(
+        variant=cfg.model.backbone,
+        pretrained=getattr(cfg.model, "backbone_pretrained", True),
+    )
+    moe_cfg = getattr(cfg.model, "moe", None)
+    model = SwinCrowdNet(
+        backbone=backbone,
+        row=cfg.model.row,
+        line=cfg.model.line,
+        feature_dim=getattr(cfg.model, "feature_dim", 256),
+        fpn_c2_channels=getattr(cfg.model, "fpn_c2_channels", 256),
+        fpn_c3_channels=getattr(cfg.model, "fpn_c3_channels", 256),
+        fpn_c4_channels=getattr(cfg.model, "fpn_c4_channels", 512),
+        moe_grid_stride=int(getattr(moe_cfg, "grid_stride", 4)) if moe_cfg else 4,
+        moe_temperature_init=float(getattr(moe_cfg, "temperature_init", 1.0))
+        if moe_cfg
+        else 1.0,
+        moe_temperature_min=float(getattr(moe_cfg, "temperature_min", 0.3))
+        if moe_cfg
+        else 0.3,
+        moe_lambda_balance=float(getattr(moe_cfg, "lambda_balance", 0.01))
+        if moe_cfg
+        else 0.01,
+        moe_dense_expansion=int(getattr(moe_cfg, "dense_expansion", 2))
+        if moe_cfg
+        else 2,
+        cfg=cfg,
+    )
+    return model
+
+
 def build_model(cfg: DictConfig, training: bool = False):
     """
     Args:
         cfg: OmegaConf DictConfig (hydra config).
         training: if True returns (model, criterion); else model only.
     """
+    architecture = getattr(cfg.model, "architecture", "dsgcnet")
+
+    if architecture == "swin_crowd_net":
+        model = _build_swin_crowd_net(cfg)
+
+        if not training:
+            return model
+
+        num_classes = 1
+        weight_dict = {
+            "loss_ce": 1,
+            "loss_points": cfg.model.point_loss_coef,
+            "loss_count": getattr(cfg.model, "count_loss_coef", 0.0),
+            "loss_refine": 0.0,
+            "loss_consistency": float(getattr(cfg.model, "consistency_loss_coef", 0.0)),
+        }
+        losses = ["labels", "points", "count", "consistency"]
+        matcher = build_matcher_crowd(cfg)
+
+        use_focal = getattr(cfg.model, "use_focal_loss", False)
+        focal_cfg = getattr(cfg.model, "focal_loss", None)
+        focal_alpha = float(getattr(focal_cfg, "alpha", 0.25)) if focal_cfg else 0.25
+        focal_gamma = float(getattr(focal_cfg, "gamma", 2.0)) if focal_cfg else 2.0
+
+        criterion = SetCriterion_Crowd(
+            num_classes=num_classes,
+            matcher=matcher,
+            weight_dict=weight_dict,
+            eos_coef=cfg.model.eos_coef,
+            losses=losses,
+            use_focal_loss=use_focal,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
+        )
+
+        # No uncertainty weighter for SwinCrowdNet by default
+        uw_cfg = getattr(cfg, "uncertainty_weighting", None)
+        uncertainty_weighter = None
+        if uw_cfg is not None and bool(getattr(uw_cfg, "enabled", False)):
+            uncertainty_weighter = UncertaintyWeighter(
+                init_log_var_den=float(getattr(uw_cfg, "init_log_var_den", 3.91)),
+                init_log_var_ce=float(getattr(uw_cfg, "init_log_var_ce", -0.693)),
+                init_log_var_reg=float(getattr(uw_cfg, "init_log_var_reg", 8.52)),
+            )
+
+        return model, criterion, uncertainty_weighter
+
+    # --- Default: DSGCNet ---
     num_classes = 1
     backbone = build_backbone(cfg)
     model = DSGCnet(

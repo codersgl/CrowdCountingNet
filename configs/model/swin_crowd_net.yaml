@@ -1,0 +1,42 @@
+# SwinCrowdNet model configuration
+# Architecture: Swin-B (Stage 1-3) → CrowdFPN → MoE-Lite → Density + Point heads
+
+architecture: swin_crowd_net
+
+# Backbone
+backbone: swin_base # swin_tiny | swin_small | swin_base
+backbone_pretrained: true
+
+# Anchor grid (same semantics as DSGCNet)
+row: 2
+line: 2
+
+# Feature dimension (CrowdFPN output channels)
+feature_dim: 256
+
+# CrowdFPN input channels (from Swin backbone projections)
+fpn_c2_channels: 256 # Stage 1 projected
+fpn_c3_channels: 256 # Stage 2 projected
+fpn_c4_channels: 512 # Stage 3 projected
+
+# MoE-Lite
+moe:
+  grid_stride: 4 # coarse routing grid stride
+  temperature_init: 1.0 # softmax temperature (decays during training)
+  temperature_min: 0.3 # minimum temperature
+  lambda_balance: 0.01 # expert balance loss weight
+  dense_expansion: 2 # DenseRegionExpert channel expansion factor
+
+# Loss weights (consumed by SetCriterion_Crowd via build_model)
+set_cost_class: 1.0
+set_cost_point: 0.05
+point_loss_coef: 0.0002
+eos_coef: 0.5
+count_loss_coef: 0.0
+consistency_loss_coef: 0.0
+
+# Focal loss (optional, disabled by default)
+use_focal_loss: false
+focal_loss:
+  alpha: 0.25
+  gamma: 2.0

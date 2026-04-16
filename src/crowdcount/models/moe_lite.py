@@ -331,6 +331,7 @@ class _BalanceLoss(nn.Module):
         """weights: [B, num_experts, H, W].
 
         Returns (total_balance_loss, decorrelation_loss).
+        Both terms are guaranteed non-negative.
         """
         E = weights.shape[1]
 
@@ -341,8 +342,10 @@ class _BalanceLoss(nn.Module):
         l_balance = self.lambda_balance * (max_entropy - entropy)
 
         # --- Decorrelation loss ---
-        # Encourage different experts to attend different spatial regions
-        # by penalising the mean cross-correlation of expert weight maps.
+        # Penalise POSITIVE correlation between expert weight maps.
+        # Anti-correlation (desired specialisation) yields zero loss.
+        # ReLU ensures the loss is non-negative — it should never act as
+        # a reward that subsidises the main training loss.
         l_decorr = torch.tensor(0.0, device=weights.device)
         if E > 1:
             # Flatten spatial dims: [B, E, H*W]
@@ -353,7 +356,7 @@ class _BalanceLoss(nn.Module):
             for i in range(E):
                 for j in range(i + 1, E):
                     corr_ij = (w_centered[:, i] * w_centered[:, j]).sum(dim=1).mean()
-                    l_decorr = l_decorr + corr_ij
+                    l_decorr = l_decorr + F.relu(corr_ij)  # only penalise positive corr
             l_decorr = self.lambda_decorr * l_decorr / (E * (E - 1) / 2)
 
         return l_balance + l_decorr, l_decorr

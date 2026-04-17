@@ -124,6 +124,7 @@ class ACDR(nn.Module):
         large_kernel: Kernel size for the context path (Path B).
         dilation: Dilation rate for the context path.
         hidden_ratio: Hidden dim ratio for the crowdedness estimator MLP.
+        gate_init: Initial value for the residual gate (0 = identity start).
     """
 
     def __init__(
@@ -132,10 +133,14 @@ class ACDR(nn.Module):
         large_kernel: int = 7,
         dilation: int = 2,
         hidden_ratio: int = 4,
+        gate_init: float = 0.0,
     ) -> None:
         super().__init__()
 
         hidden = channels // hidden_ratio
+        # Residual gate: starts at gate_init (default 0 → identity at init)
+        self.gate = nn.Parameter(torch.tensor(gate_init))
+
         self.crowd_est = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -184,7 +189,10 @@ class ACDR(nn.Module):
         fa = self.path_a(x)
         fb = self.path_b(x)
 
-        return (1 - c) * fa + c * fb
+        # Residual: x + gate * (routed_output)
+        # gate starts at 0 → identity at init, ACDR gradually learns to contribute
+        routed = (1 - c) * fa + c * fb
+        return x + self.gate.tanh() * routed
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ from crowdcount.models.head import (
     DecoupledPredictionHead,
     DensityAttentionMask,
     Density_pred,
+    Density_pred_MS,
     EnhancedDensityAttention,
     ForegroundSuppressionBranch,
     FreqDecoupledRouter,
@@ -248,7 +249,8 @@ class DSGCnet(nn.Module):
                 else 7,
                 acdr_dilation=int(getattr(_dn, "acdr_dilation", 2)) if _dn else 2,
             )
-            self.density_pred = Density_pred()
+            use_ms_density = bool(getattr(cfg.model, "use_ms_density_head", False))
+            self.density_pred = Density_pred_MS() if use_ms_density else Density_pred()
         elif use_rccformer_neck:
             # RCCFormer MFFM neck + DEAB/ASAM density head
             self.msca_decoder = None

@@ -23,6 +23,9 @@ msaa_reduction: 4
 msaa_variant: legacy # legacy | lite | msaa_gate
 fpn_attention: false # Phase 2: inject attention gates inside PA-FPN
 
+# Multi-scale density head: dilated conv (d=1,2,3) + residual + Softplus
+use_ms_density_head: false
+
 # RCCFormer-style neck: replace PA-FPN with MFFM + DEAB/ASAM density head
 use_rccformer_neck: false
 rccformer_deab_blocks: 2 # Number of DEAB blocks in density prediction branch

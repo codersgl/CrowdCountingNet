@@ -210,7 +210,7 @@ class DecoupledPredictionHead(nn.Module):
 
 
 class Density_pred(nn.Module):
-    """Density map prediction head."""
+    """Density map prediction head (baseline)."""
 
     def __init__(self):
         super().__init__()
@@ -244,6 +244,42 @@ class Density_pred(nn.Module):
         x = self.v1(x)
         x = self.v2(x)
         x = self.v3(x)
+        return self.conv_layers(x)
+
+
+class Density_pred_MS(nn.Module):
+    """Improved density head: multi-scale dilated convolutions + residual + Softplus."""
+
+    def __init__(self):
+        super().__init__()
+        self.v1 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, padding=1, dilation=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.v2 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, padding=2, dilation=2),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.v3 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, padding=3, dilation=3),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, kernel_size=1),
+            nn.Softplus(beta=1, threshold=20),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.v1(x) + self.v2(x) + self.v3(x)
         return self.conv_layers(x)
 
 

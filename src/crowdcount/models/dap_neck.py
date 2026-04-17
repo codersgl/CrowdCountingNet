@@ -115,11 +115,18 @@ class DPGA(nn.Module):
     Deep features (Query) attend to shallow features (Key/Value) with
     multi-sigma Gaussian templates as additive attention bias.
 
+    To remain memory-safe at arbitrary input resolutions (evaluation uses
+    full-size images, not 128×128 patches), both Q and KV are adaptively
+    pooled to at most ``max_pool_size`` spatial dimensions before computing
+    attention.  The resulting modulation map is then bilinearly upsampled
+    back to the original query resolution.
+
     Args:
         dim: Feature channel dimension.
         num_heads: Number of attention heads.
         sigma_list: List of Gaussian sigma values for position bias templates.
-        sr_ratio: Spatial reduction ratio for K/V (>1 reduces memory).
+        max_pool_size: Maximum spatial dimension (H or W) for the attention
+            computation.  Memory cost is bounded by O(max_pool_size⁴).
     """
 
     def __init__(
@@ -127,17 +134,18 @@ class DPGA(nn.Module):
         dim: int = 256,
         num_heads: int = 4,
         sigma_list: list[float] | None = None,
-        sr_ratio: int = 1,
-        max_bias_tokens: int = 4096,
+        max_pool_size: int = 32,
     ) -> None:
         super().__init__()
+        if dim % num_heads != 0:
+            msg = f"dim={dim} must be divisible by num_heads={num_heads}"
+            raise ValueError(msg)
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
-        self.sr_ratio = sr_ratio
+        self.max_pool_size = max_pool_size
         self.sigma_list = sigma_list or [1.0, 2.0, 4.0]
-        self.max_bias_tokens = max_bias_tokens
 
         self.q_proj = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.k_proj = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
@@ -146,15 +154,6 @@ class DPGA(nn.Module):
             nn.Conv2d(dim, dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(dim),
         )
-
-        # Spatial reduction for K/V when sr_ratio > 1
-        if sr_ratio > 1:
-            self.sr = nn.Sequential(
-                nn.Conv2d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio, bias=False),
-                nn.BatchNorm2d(dim),
-            )
-        else:
-            self.sr = None
 
         # Learnable weights for blending multiple Gaussian bias templates
         self.sigma_weights = nn.Parameter(
@@ -171,17 +170,14 @@ class DPGA(nn.Module):
 
         Returns shape [1, 1, h*w, h*w] to broadcast over batch and heads.
         """
-        # Create coordinate grids
         y = torch.arange(h, device=device, dtype=torch.float32)
         x = torch.arange(w, device=device, dtype=torch.float32)
         gy, gx = torch.meshgrid(y, x, indexing="ij")
         coords = torch.stack([gy.flatten(), gx.flatten()], dim=-1)  # [hw, 2]
 
-        # Pairwise squared distances: [hw, hw]
-        diff = coords.unsqueeze(1) - coords.unsqueeze(0)  # [hw, 1, 2] - [1, hw, 2]
+        diff = coords.unsqueeze(1) - coords.unsqueeze(0)
         dist_sq = (diff**2).sum(dim=-1)  # [hw, hw]
 
-        # Weighted sum of Gaussian kernels
         weights = self.sigma_weights.softmax(dim=0)
         bias = torch.zeros_like(dist_sq)
         for i, sigma in enumerate(self.sigma_list):
@@ -204,39 +200,49 @@ class DPGA(nn.Module):
         """
         B, C, H, W = query_feat.shape
 
-        q = self.q_proj(query_feat)  # [B, C, H, W]
+        # Determine pooled spatial size — bounded by max_pool_size
+        pool_h = min(H, self.max_pool_size)
+        pool_w = min(W, self.max_pool_size)
+        need_pool = (H > pool_h) or (W > pool_w)
 
-        if self.sr is not None:
-            kv_input = self.sr(kv_feat)
+        # Pool Q and KV to bounded spatial size for memory-safe attention
+        if need_pool:
+            q_input = F.adaptive_avg_pool2d(query_feat, (pool_h, pool_w))
+            kv_input = F.adaptive_avg_pool2d(kv_feat, (pool_h, pool_w))
         else:
+            q_input = query_feat
             kv_input = kv_feat
+
+        q = self.q_proj(q_input)
         k = self.k_proj(kv_input)
         v = self.v_proj(kv_input)
 
-        _, _, Hk, Wk = k.shape
+        Nq = pool_h * pool_w
+        Nk = pool_h * pool_w
 
         # Reshape to multi-head: [B, heads, head_dim, N]
-        q = q.reshape(B, self.num_heads, self.head_dim, H * W)
-        k = k.reshape(B, self.num_heads, self.head_dim, Hk * Wk)
-        v = v.reshape(B, self.num_heads, self.head_dim, Hk * Wk)
+        q = q.reshape(B, self.num_heads, self.head_dim, Nq)
+        k = k.reshape(B, self.num_heads, self.head_dim, Nk)
+        v = v.reshape(B, self.num_heads, self.head_dim, Nk)
 
         # Attention: [B, heads, Nq, Nk]
         attn = torch.matmul(q.transpose(-1, -2), k) * self.scale
 
-        # Add Gaussian position bias (skip when spatial reduction active or
-        # token count exceeds threshold to avoid O(N²) memory blowup)
-        n_tokens = H * W
-        if self.sr is None and n_tokens <= self.max_bias_tokens:
-            gauss_bias = self._build_gaussian_bias(H, W, query_feat.device)
-            attn = attn + gauss_bias
+        # Add Gaussian position bias (always feasible since pool size is bounded)
+        gauss_bias = self._build_gaussian_bias(pool_h, pool_w, query_feat.device)
+        attn = attn + gauss_bias
 
         attn = attn.softmax(dim=-1)
 
         # Aggregate: [B, heads, Nq, head_dim]
         out = torch.matmul(attn, v.transpose(-1, -2))
-        out = out.transpose(-1, -2).reshape(B, C, H, W)
+        out = out.transpose(-1, -2).reshape(B, C, pool_h, pool_w)
 
         out = self.out_proj(out)
+
+        # Upsample modulation map back to original resolution
+        if need_pool:
+            out = F.interpolate(out, size=(H, W), mode="bilinear", align_corners=False)
 
         # Gated residual (gate starts at 0 → identity at init)
         return query_feat + self.gate.tanh() * out
@@ -371,7 +377,7 @@ class DAPNeck(nn.Module):
         peem_on_c5: Whether to apply PEEM on C5 (small spatial size).
         num_heads: Number of attention heads for DPGA.
         sigma_list: Gaussian sigma values for DPGA position bias.
-        dpga_sr_ratio: Spatial reduction ratio for DPGA K/V.
+        dpga_max_pool_size: Max spatial dim for DPGA attention (bounds memory).
         acdr_large_kernel: Large kernel size for ACDR Path B.
         acdr_dilation: Dilation rate for ACDR Path B.
         use_bottom_up: Enable bottom-up enhancement path.
@@ -387,7 +393,7 @@ class DAPNeck(nn.Module):
         peem_on_c5: bool = False,
         num_heads: int = 4,
         sigma_list: list[float] | None = None,
-        dpga_sr_ratio: int = 1,
+        dpga_max_pool_size: int = 32,
         acdr_large_kernel: int = 7,
         acdr_dilation: int = 2,
         use_bottom_up: bool = True,
@@ -428,13 +434,13 @@ class DAPNeck(nn.Module):
             dim=feature_size,
             num_heads=num_heads,
             sigma_list=sigma_list,
-            sr_ratio=dpga_sr_ratio,
+            max_pool_size=dpga_max_pool_size,
         )
         self.dpga_e4_p3 = DPGA(
             dim=feature_size,
             num_heads=num_heads,
             sigma_list=sigma_list,
-            sr_ratio=dpga_sr_ratio,
+            max_pool_size=dpga_max_pool_size,
         )
 
         # Post-fusion refinement convs

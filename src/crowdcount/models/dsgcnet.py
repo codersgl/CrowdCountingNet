@@ -246,7 +246,9 @@ class DSGCnet(nn.Module):
                 sigma_list=list(getattr(_dn, "sigma_list", [1.0, 2.0, 4.0]))
                 if _dn
                 else [1.0, 2.0, 4.0],
-                dpga_sr_ratio=int(getattr(_dn, "dpga_sr_ratio", 1)) if _dn else 1,
+                dpga_max_pool_size=int(getattr(_dn, "dpga_max_pool_size", 32))
+                if _dn
+                else 32,
                 acdr_large_kernel=int(getattr(_dn, "acdr_large_kernel", 7))
                 if _dn
                 else 7,

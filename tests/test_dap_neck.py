@@ -96,8 +96,8 @@ class TestDPGA:
         out = dpga(q, kv)
         assert out.shape == q.shape
 
-    def test_with_spatial_reduction(self):
-        dpga = DPGA(dim=256, num_heads=4, sr_ratio=2)
+    def test_with_pooling(self):
+        dpga = DPGA(dim=256, num_heads=4, max_pool_size=8)
         q = torch.randn(1, 256, 16, 16)
         kv = torch.randn(1, 256, 16, 16)
         out = dpga(q, kv)
@@ -119,13 +119,17 @@ class TestDPGA:
         out = dpga(q, kv)
         assert out.shape == q.shape
 
-    def test_skips_bias_for_large_spatial(self):
-        """Gaussian bias is skipped when token count exceeds max_bias_tokens."""
-        dpga = DPGA(dim=64, num_heads=4, max_bias_tokens=16)
-        q = torch.randn(1, 64, 8, 8)  # 64 tokens > 16 threshold
-        kv = torch.randn(1, 64, 8, 8)
+    def test_pools_large_spatial_dims(self):
+        """DPGA should handle large spatial dims via adaptive pooling."""
+        dpga = DPGA(dim=64, num_heads=4, max_pool_size=8)
+        q = torch.randn(1, 64, 64, 48)  # much larger than max_pool_size
+        kv = torch.randn(1, 64, 64, 48)
         out = dpga(q, kv)
         assert out.shape == q.shape
+
+    def test_rejects_indivisible_heads(self):
+        with pytest.raises(ValueError, match="divisible"):
+            DPGA(dim=256, num_heads=3)
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +201,8 @@ class TestDAPNeck:
         out = neck([feat_c3, feat_c4, feat_c5])
         assert out.shape == (2, 256, 16, 16)
 
-    def test_output_shape_with_sr_ratio(self, feat_c3, feat_c4, feat_c5):
-        neck = DAPNeck(C3_size=256, C4_size=512, C5_size=512, dpga_sr_ratio=2)
+    def test_output_shape_with_small_pool(self, feat_c3, feat_c4, feat_c5):
+        neck = DAPNeck(C3_size=256, C4_size=512, C5_size=512, dpga_max_pool_size=8)
         out = neck([feat_c3, feat_c4, feat_c5])
         assert out.shape == (2, 256, 16, 16)
 
@@ -273,7 +277,7 @@ class TestDAPNeckIntegration:
                 "peem_on_c5": True,
                 "num_heads": 2,
                 "sigma_list": [1.0, 3.0],
-                "dpga_sr_ratio": 2,
+                "dpga_max_pool_size": 16,
                 "acdr_large_kernel": 5,
                 "acdr_dilation": 1,
                 "use_bottom_up": False,

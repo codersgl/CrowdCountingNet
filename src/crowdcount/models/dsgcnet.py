@@ -232,7 +232,7 @@ class DSGCnet(nn.Module):
 
         self.anchor_points = AnchorPoints(pyramid_levels=[3], row=row, line=line)
         if use_dap_neck:
-            # DAP-Neck: Density-Aware Phase-guided Neck
+            # DAP-Neck v2: SPD-PAFPN + ACDR
             self.msca_decoder = None
             _dn = dap_neck_cfg
             self.pa = DAPNeck(
@@ -240,22 +240,13 @@ class DSGCnet(nn.Module):
                 C4_size=512,
                 C5_size=512,
                 feature_size=256,
+                use_peem=bool(getattr(_dn, "use_peem", False)) if _dn else False,
                 freq_cutoff=float(getattr(_dn, "freq_cutoff", 0.25)) if _dn else 0.25,
-                peem_on_c5=bool(getattr(_dn, "peem_on_c5", False)) if _dn else False,
-                num_heads=int(getattr(_dn, "num_heads", 4)) if _dn else 4,
-                sigma_list=list(getattr(_dn, "sigma_list", [1.0, 2.0, 4.0]))
-                if _dn
-                else [1.0, 2.0, 4.0],
-                dpga_max_pool_size=int(getattr(_dn, "dpga_max_pool_size", 32))
-                if _dn
-                else 32,
+                use_dcn=bool(getattr(_dn, "use_dcn", False)) if _dn else False,
                 acdr_large_kernel=int(getattr(_dn, "acdr_large_kernel", 7))
                 if _dn
                 else 7,
                 acdr_dilation=int(getattr(_dn, "acdr_dilation", 2)) if _dn else 2,
-                use_bottom_up=bool(getattr(_dn, "use_bottom_up", True))
-                if _dn
-                else True,
             )
             self.density_pred = Density_pred()
         elif use_rccformer_neck:

@@ -202,16 +202,13 @@ msca_num_blocks: 2 # number of stacked MSCA blocks (×N)
 # Mutually exclusive with use_msca_decoder.
 use_msca_neck: false
 
-# DAP-Neck: Density-Aware Phase-guided Neck (disabled by default)
-# Replaces PA-FPN with frequency-decoupled fusion + Gaussian prior attention + adaptive routing.
+# DAP-Neck v2: SPD-PAFPN + ACDR (disabled by default)
+# Uses proven SPD-PAFPN backbone with density-adaptive routing.
 # Mutually exclusive with use_msca_decoder, use_msca_neck, use_rccformer_neck.
 use_dap_neck: false
 dap_neck:
+  use_peem: false # Enable PEEM on C3 (frequency-domain edge enhancement)
   freq_cutoff: 0.25 # PEEM low-pass Gaussian cutoff ratio (0, 1]
-  peem_on_c5: false # Apply PEEM on C5 (8×8 spatial may be too small for FFT)
-  num_heads: 4 # DPGA attention heads
-  sigma_list: [1.0, 2.0, 4.0] # Gaussian sigma values for DPGA position bias
-  dpga_max_pool_size: 32 # DPGA max spatial dim for attention (bounds memory to O(n^4))
+  use_dcn: false # Use deformable conv in PEEM and FPN 3×3 convs
   acdr_large_kernel: 7 # ACDR context path kernel size
   acdr_dilation: 2 # ACDR context path dilation rate
-  use_bottom_up: true # Enable bottom-up enhancement path

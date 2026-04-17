@@ -1,4 +1,4 @@
-"""Tests for DAP-Neck: PEEM, DPGA, ACDR, and full DAPNeck integration."""
+"""Tests for DAP-Neck v2: PEEM, ACDR, and full DAPNeck integration."""
 
 from __future__ import annotations
 
@@ -6,17 +6,12 @@ import pytest
 import torch
 import torch.nn as nn
 
-from crowdcount.models.dap_neck import ACDR, DPGA, PEEM, DAPNeck, PixelShuffleUpsample
+from crowdcount.models.dap_neck import ACDR, PEEM, DAPNeck
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def device():
-    return torch.device("cpu")
 
 
 @pytest.fixture
@@ -69,67 +64,10 @@ class TestPEEM:
         assert out.shape == x.shape
 
     def test_small_spatial(self):
-        """PEEM should work even on very small spatial dims."""
         peem = PEEM(channels=512, freq_cutoff=0.25)
         x = torch.randn(1, 512, 4, 4)
         out = peem(x)
         assert out.shape == x.shape
-
-
-# ---------------------------------------------------------------------------
-# DPGA tests
-# ---------------------------------------------------------------------------
-
-
-class TestDPGA:
-    def test_output_shape(self):
-        dpga = DPGA(dim=256, num_heads=4, sigma_list=[1.0, 2.0, 4.0])
-        q = torch.randn(2, 256, 16, 16)
-        kv = torch.randn(2, 256, 16, 16)
-        out = dpga(q, kv)
-        assert out.shape == q.shape
-
-    def test_different_sigma_counts(self):
-        dpga = DPGA(dim=256, num_heads=4, sigma_list=[0.5, 1.0])
-        q = torch.randn(1, 256, 8, 8)
-        kv = torch.randn(1, 256, 8, 8)
-        out = dpga(q, kv)
-        assert out.shape == q.shape
-
-    def test_with_pooling(self):
-        dpga = DPGA(dim=256, num_heads=4, max_pool_size=8)
-        q = torch.randn(1, 256, 16, 16)
-        kv = torch.randn(1, 256, 16, 16)
-        out = dpga(q, kv)
-        assert out.shape == q.shape
-
-    def test_residual_at_init(self):
-        """At initialisation, gate=0 so output should be close to query_feat."""
-        dpga = DPGA(dim=64, num_heads=4)
-        q = torch.randn(1, 64, 8, 8)
-        kv = torch.randn(1, 64, 8, 8)
-        out = dpga(q, kv)
-        # gate starts at 0 → tanh(0) = 0 → output ≈ query_feat
-        assert torch.allclose(out, q, atol=1e-6)
-
-    def test_single_head(self):
-        dpga = DPGA(dim=256, num_heads=1)
-        q = torch.randn(1, 256, 8, 8)
-        kv = torch.randn(1, 256, 8, 8)
-        out = dpga(q, kv)
-        assert out.shape == q.shape
-
-    def test_pools_large_spatial_dims(self):
-        """DPGA should handle large spatial dims via adaptive pooling."""
-        dpga = DPGA(dim=64, num_heads=4, max_pool_size=8)
-        q = torch.randn(1, 64, 64, 48)  # much larger than max_pool_size
-        kv = torch.randn(1, 64, 64, 48)
-        out = dpga(q, kv)
-        assert out.shape == q.shape
-
-    def test_rejects_indivisible_heads(self):
-        with pytest.raises(ValueError, match="divisible"):
-            DPGA(dim=256, num_heads=3)
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +83,6 @@ class TestACDR:
         assert out.shape == x.shape
 
     def test_crowdedness_range(self):
-        """Crowdedness estimator should output values in [0, 1]."""
         acdr = ACDR(channels=256)
         x = torch.randn(4, 256, 16, 16)
         c = acdr.crowd_est(x)
@@ -165,18 +102,12 @@ class TestACDR:
         out = acdr(x)
         assert out.shape == x.shape
 
-
-# ---------------------------------------------------------------------------
-# PixelShuffleUpsample tests
-# ---------------------------------------------------------------------------
-
-
-class TestPixelShuffleUpsample:
-    def test_doubles_spatial(self):
-        up = PixelShuffleUpsample(channels=256)
-        x = torch.randn(1, 256, 8, 8)
-        out = up(x)
-        assert out.shape == (1, 256, 16, 16)
+    def test_large_spatial_resolution(self):
+        """ACDR must handle eval-sized feature maps."""
+        acdr = ACDR(channels=256, large_kernel=7, dilation=2)
+        x = torch.randn(1, 256, 96, 128)
+        out = acdr(x)
+        assert out.shape == x.shape
 
 
 # ---------------------------------------------------------------------------
@@ -188,21 +119,15 @@ class TestDAPNeck:
     def test_output_shape(self, feat_c3, feat_c4, feat_c5):
         neck = DAPNeck(C3_size=256, C4_size=512, C5_size=512, feature_size=256)
         out = neck([feat_c3, feat_c4, feat_c5])
-        # Output should be at C4 resolution (H/8)
         assert out.shape == (2, 256, 16, 16)
 
-    def test_output_shape_without_bottom_up(self, feat_c3, feat_c4, feat_c5):
-        neck = DAPNeck(C3_size=256, C4_size=512, C5_size=512, use_bottom_up=False)
+    def test_output_shape_with_peem(self, feat_c3, feat_c4, feat_c5):
+        neck = DAPNeck(C3_size=256, C4_size=512, C5_size=512, use_peem=True)
         out = neck([feat_c3, feat_c4, feat_c5])
         assert out.shape == (2, 256, 16, 16)
 
-    def test_output_shape_with_peem_on_c5(self, feat_c3, feat_c4, feat_c5):
-        neck = DAPNeck(C3_size=256, C4_size=512, C5_size=512, peem_on_c5=True)
-        out = neck([feat_c3, feat_c4, feat_c5])
-        assert out.shape == (2, 256, 16, 16)
-
-    def test_output_shape_with_small_pool(self, feat_c3, feat_c4, feat_c5):
-        neck = DAPNeck(C3_size=256, C4_size=512, C5_size=512, dpga_max_pool_size=8)
+    def test_output_shape_with_dcn(self, feat_c3, feat_c4, feat_c5):
+        neck = DAPNeck(C3_size=256, C4_size=512, C5_size=512, use_dcn=True)
         out = neck([feat_c3, feat_c4, feat_c5])
         assert out.shape == (2, 256, 16, 16)
 
@@ -224,6 +149,23 @@ class TestDAPNeck:
         loss = out.sum()
         loss.backward()
         assert feat_c3.grad is not None
+
+    def test_eval_resolution(self):
+        """DAPNeck must produce correct output at eval-sized full-resolution inputs.
+
+        This is the critical test: train uses 128×128 patches, eval uses ~768×1024.
+        The neck must handle both without any resolution-dependent behaviour.
+        """
+        neck = DAPNeck(C3_size=256, C4_size=512, C5_size=512)
+        neck.eval()
+        # Simulate ~512×768 input image → backbone outputs
+        c3 = torch.randn(1, 256, 128, 192)  # H/4
+        c4 = torch.randn(1, 512, 64, 96)  # H/8
+        c5 = torch.randn(1, 512, 32, 48)  # H/16
+        with torch.no_grad():
+            out = neck([c3, c4, c5])
+        assert out.shape == (1, 256, 64, 96)
+        assert torch.isfinite(out).all()
 
 
 # ---------------------------------------------------------------------------
@@ -273,14 +215,11 @@ class TestDAPNeckIntegration:
 
         dap_cfg = OmegaConf.create(
             {
+                "use_peem": True,
                 "freq_cutoff": 0.3,
-                "peem_on_c5": True,
-                "num_heads": 2,
-                "sigma_list": [1.0, 3.0],
-                "dpga_max_pool_size": 16,
+                "use_dcn": False,
                 "acdr_large_kernel": 5,
                 "acdr_dilation": 1,
-                "use_bottom_up": False,
             }
         )
         backbone = TinyVGGBackbone()

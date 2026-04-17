@@ -43,8 +43,8 @@ set_cost_class: 1.0
 set_cost_point: 0.05
 point_loss_coef: 0.001
 eos_coef: 0.5
-count_loss_coef: 0.01 # global counting L1 loss
-consistency_loss_coef: 0.01 # density-point consistency loss
+count_loss_coef: 0.001 # keep small: unscaled ~2000 with patch_size=256
+consistency_loss_coef: 0.001 # keep small: unscaled ~1800 with patch_size=256
 
 # Focal loss (enabled for foreground/background imbalance)
 use_focal_loss: true

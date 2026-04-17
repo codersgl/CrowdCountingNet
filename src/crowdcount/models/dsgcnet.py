@@ -29,6 +29,7 @@ from crowdcount.models.head import (
     DensityPred_Block4,
     DensityPred_Block5,
 )
+from crowdcount.models.dap_neck import DAPNeck
 from crowdcount.models.neck import Decoder_SPD_PAFPN
 from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
@@ -145,6 +146,8 @@ class DSGCnet(nn.Module):
         use_msca_neck: bool = False,
         use_rccformer_neck: bool = False,
         rccformer_deab_blocks: int = 2,
+        use_dap_neck: bool = False,
+        dap_neck_cfg: DictConfig | None = None,
     ):
         super().__init__()
         self.backbone = backbone
@@ -176,6 +179,17 @@ class DSGCnet(nn.Module):
         self.use_decoupled_head = use_decoupled_head
         self.use_msca_neck = use_msca_neck
         self.use_rccformer_neck = use_rccformer_neck
+        self.use_dap_neck = use_dap_neck
+
+        _neck_flags = sum(
+            [use_msca_neck, use_msca_decoder, use_rccformer_neck, use_dap_neck]
+        )
+        if _neck_flags > 1:
+            raise ValueError(
+                "Neck options are mutually exclusive; enable at most one. Got: "
+                f"use_msca_neck={use_msca_neck}, use_msca_decoder={use_msca_decoder}, "
+                f"use_rccformer_neck={use_rccformer_neck}, use_dap_neck={use_dap_neck}"
+            )
 
         if use_msca_neck and use_msca_decoder:
             raise ValueError(
@@ -217,7 +231,32 @@ class DSGCnet(nn.Module):
         )
 
         self.anchor_points = AnchorPoints(pyramid_levels=[3], row=row, line=line)
-        if use_rccformer_neck:
+        if use_dap_neck:
+            # DAP-Neck: Density-Aware Phase-guided Neck
+            self.msca_decoder = None
+            _dn = dap_neck_cfg
+            self.pa = DAPNeck(
+                C3_size=256,
+                C4_size=512,
+                C5_size=512,
+                feature_size=256,
+                freq_cutoff=float(getattr(_dn, "freq_cutoff", 0.25)) if _dn else 0.25,
+                peem_on_c5=bool(getattr(_dn, "peem_on_c5", False)) if _dn else False,
+                num_heads=int(getattr(_dn, "num_heads", 4)) if _dn else 4,
+                sigma_list=list(getattr(_dn, "sigma_list", [1.0, 2.0, 4.0]))
+                if _dn
+                else [1.0, 2.0, 4.0],
+                dpga_sr_ratio=int(getattr(_dn, "dpga_sr_ratio", 1)) if _dn else 1,
+                acdr_large_kernel=int(getattr(_dn, "acdr_large_kernel", 7))
+                if _dn
+                else 7,
+                acdr_dilation=int(getattr(_dn, "acdr_dilation", 2)) if _dn else 2,
+                use_bottom_up=bool(getattr(_dn, "use_bottom_up", True))
+                if _dn
+                else True,
+            )
+            self.density_pred = Density_pred()
+        elif use_rccformer_neck:
             # RCCFormer MFFM neck + DEAB/ASAM density head
             self.msca_decoder = None
             self.pa = MFFMNeck(

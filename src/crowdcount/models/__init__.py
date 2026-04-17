@@ -81,6 +81,8 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_msca_neck=getattr(cfg.model, "use_msca_neck", False),
         use_rccformer_neck=getattr(cfg.model, "use_rccformer_neck", False),
         rccformer_deab_blocks=int(getattr(cfg.model, "rccformer_deab_blocks", 2)),
+        use_dap_neck=getattr(cfg.model, "use_dap_neck", False),
+        dap_neck_cfg=getattr(cfg.model, "dap_neck", None),
     )
 
     if not training:

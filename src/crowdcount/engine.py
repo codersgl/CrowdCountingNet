@@ -465,9 +465,19 @@ def evaluate_crowd_no_overlap(
         else:
             outputs = model(samples)
 
-        outputs_scores = torch.nn.functional.softmax(outputs["pred_logits"], -1)[
-            :, :, 1
-        ]
+        # Use sigmoid when focal loss is enabled (training uses sigmoid BCE),
+        # softmax otherwise (training uses cross-entropy)
+        _use_focal = (
+            getattr(getattr(cfg, "model", None), "use_focal_loss", False)
+            if cfg is not None
+            else False
+        )
+        if _use_focal:
+            outputs_scores = outputs["pred_logits"].sigmoid()[:, :, 1]
+        else:
+            outputs_scores = torch.nn.functional.softmax(outputs["pred_logits"], -1)[
+                :, :, 1
+            ]
         assert outputs_scores.shape[0] == 1, (
             "evaluate_crowd_no_overlap expects batch_size=1"
         )
@@ -531,11 +541,12 @@ def collect_scores_and_counts(
     data_loader: Iterable,
     device: torch.device,
     use_depth: bool = False,
+    cfg=None,
 ) -> tuple[list[torch.Tensor], list[int], list[float]]:
     """Run a single forward pass over the val set and collect per-image scores.
 
     Returns:
-        all_scores: list of 1-D CPU tensors (softmax class-1 probabilities)
+        all_scores: list of 1-D CPU tensors (class-1 probabilities)
         gt_counts:  list of ground-truth point counts
         density_sums: list of density-map integrals
     """
@@ -559,7 +570,15 @@ def collect_scores_and_counts(
             else model(samples)
         )
 
-        scores = torch.nn.functional.softmax(outputs["pred_logits"], -1)[:, :, 1]
+        _use_focal = (
+            getattr(getattr(cfg, "model", None), "use_focal_loss", False)
+            if cfg is not None
+            else False
+        )
+        if _use_focal:
+            scores = outputs["pred_logits"].sigmoid()[:, :, 1]
+        else:
+            scores = torch.nn.functional.softmax(outputs["pred_logits"], -1)[:, :, 1]
         assert scores.shape[0] == 1, "collect_scores_and_counts expects batch_size=1"
 
         all_scores.append(scores[0].cpu())

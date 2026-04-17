@@ -109,9 +109,7 @@ class SparseRegionExpert(nn.Module):
     more active in low-density regions.
     """
 
-    def __init__(
-        self, dim: int = 256, use_density_gate: bool = True
-    ) -> None:
+    def __init__(self, dim: int = 256, use_density_gate: bool = True) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(dim, dim, 3, padding=2, dilation=2, groups=dim, bias=False),
@@ -152,9 +150,7 @@ class BoundaryExpert(nn.Module):
     density-gated so that it focuses on boundary regions.
     """
 
-    def __init__(
-        self, dim: int = 256, use_density_gate: bool = True
-    ) -> None:
+    def __init__(self, dim: int = 256, use_density_gate: bool = True) -> None:
         super().__init__()
         # Sobel-initialised edge conv (learnable)
         self.edge_conv = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
@@ -254,22 +250,34 @@ class DensityGuidedRouter(nn.Module):
         self.temperature.clamp_(min=self.temperature_min)
         self.temperature.mul_(decay_rate)
 
-    def _multi_scale_density(self, density: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    def _multi_scale_density(
+        self, density: torch.Tensor, target_h: int, target_w: int
+    ) -> torch.Tensor:
         """Encode density at three scales: full, 1/2, 1/4.
 
         All outputs are resized to (target_h, target_w) for concatenation.
         """
         d1 = density  # full resolution
-        d2 = F.adaptive_avg_pool2d(density, (max(1, density.shape[2] // 2), max(1, density.shape[3] // 2)))
-        d3 = F.adaptive_avg_pool2d(density, (max(1, density.shape[2] // 4), max(1, density.shape[3] // 4)))
+        d2 = F.adaptive_avg_pool2d(
+            density, (max(1, density.shape[2] // 2), max(1, density.shape[3] // 2))
+        )
+        d3 = F.adaptive_avg_pool2d(
+            density, (max(1, density.shape[2] // 4), max(1, density.shape[3] // 4))
+        )
 
         # Resize all to target size
         if d1.shape[-2:] != (target_h, target_w):
-            d1 = F.interpolate(d1, size=(target_h, target_w), mode="bilinear", align_corners=False)
+            d1 = F.interpolate(
+                d1, size=(target_h, target_w), mode="bilinear", align_corners=False
+            )
         if d2.shape[-2:] != (target_h, target_w):
-            d2 = F.interpolate(d2, size=(target_h, target_w), mode="bilinear", align_corners=False)
+            d2 = F.interpolate(
+                d2, size=(target_h, target_w), mode="bilinear", align_corners=False
+            )
         if d3.shape[-2:] != (target_h, target_w):
-            d3 = F.interpolate(d3, size=(target_h, target_w), mode="bilinear", align_corners=False)
+            d3 = F.interpolate(
+                d3, size=(target_h, target_w), mode="bilinear", align_corners=False
+            )
 
         return torch.cat([d1, d2, d3], dim=1)  # [B, 3, h, w]
 
@@ -387,12 +395,16 @@ class MoELite(nn.Module):
         dense_expansion: int = 2,
         use_density_gate: bool = True,
         lambda_decorr: float = 0.1,
+        lambda_diversity: float = 0.1,
     ) -> None:
         super().__init__()
+        self.lambda_diversity = lambda_diversity
 
         self.experts = nn.ModuleList(
             [
-                DenseRegionExpert(dim, expansion=dense_expansion, use_density_gate=use_density_gate),
+                DenseRegionExpert(
+                    dim, expansion=dense_expansion, use_density_gate=use_density_gate
+                ),
                 SparseRegionExpert(dim, use_density_gate=use_density_gate),
                 BoundaryExpert(dim, use_density_gate=use_density_gate),
             ]
@@ -452,13 +464,39 @@ class MoELite(nn.Module):
         aux: dict[str, torch.Tensor] = {}
         if training:
             bal_total, l_decorr = self.balance_loss(weights)
+            # Expert output diversity: penalise high cosine similarity
+            l_diversity = self._diversity_loss(expert_outs)
             aux["l_balance"] = bal_total
             aux["l_decorr"] = l_decorr
-            aux["total_aux"] = bal_total
+            aux["l_diversity"] = l_diversity
+            aux["total_aux"] = bal_total + l_diversity
         else:
             zero = torch.tensor(0.0, device=x.device)
             aux["l_balance"] = zero
             aux["l_decorr"] = zero
+            aux["l_diversity"] = zero
             aux["total_aux"] = zero
 
         return fused, aux, weights
+
+    def _diversity_loss(self, expert_outs: list[torch.Tensor]) -> torch.Tensor:
+        """Penalise high cosine similarity between expert outputs.
+
+        Encourages experts to produce diverse feature representations rather
+        than collapsing to identical outputs.
+        """
+        E = len(expert_outs)
+        if E < 2 or self.lambda_diversity <= 0:
+            return torch.tensor(0.0, device=expert_outs[0].device)
+
+        # Flatten spatial dims: [B, C, H*W]
+        flats = [o.flatten(2) for o in expert_outs]
+        loss = torch.tensor(0.0, device=expert_outs[0].device)
+        n_pairs = 0
+        for i in range(E):
+            for j in range(i + 1, E):
+                # Cosine similarity per sample, averaged over batch
+                cos_sim = F.cosine_similarity(flats[i], flats[j], dim=1)  # [B, H*W]
+                loss = loss + cos_sim.mean()
+                n_pairs += 1
+        return self.lambda_diversity * loss / n_pairs

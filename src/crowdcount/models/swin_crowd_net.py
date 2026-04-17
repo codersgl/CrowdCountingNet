@@ -117,6 +117,7 @@ class SwinCrowdNet(nn.Module):
         moe_dense_expansion: int = 2,
         moe_use_density_gate: bool = True,
         moe_lambda_decorr: float = 0.1,
+        moe_lambda_diversity: float = 0.1,
         # Density-Feature Refine
         use_dfr: bool = True,
         # Prediction head
@@ -160,13 +161,16 @@ class SwinCrowdNet(nn.Module):
             dense_expansion=moe_dense_expansion,
             use_density_gate=moe_use_density_gate,
             lambda_decorr=moe_lambda_decorr,
+            lambda_diversity=moe_lambda_diversity,
         )
 
         # --- Prediction heads ---
         num_anchor_points = row * line
         if use_decoupled_head:
             self.pred_trunk: SharedPredictionTrunk | DecoupledPredictionHead = (
-                DecoupledPredictionHead(in_channels=feature_dim, feature_size=feature_dim)
+                DecoupledPredictionHead(
+                    in_channels=feature_dim, feature_size=feature_dim
+                )
             )
         else:
             self.pred_trunk = SharedPredictionTrunk(

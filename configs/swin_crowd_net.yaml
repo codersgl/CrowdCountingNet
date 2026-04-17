@@ -13,7 +13,7 @@ eval_freq: 1
 
 # Training
 epochs: 3500
-clip_max_norm: 0.1
+clip_max_norm: 0.5
 frozen_weights: null
 resume: ""
 reset_optimizer: false
@@ -22,6 +22,15 @@ start_epoch: 0
 # Output dirs
 checkpoints_dir: checkpoints
 tensorboard_dir: runs/swin_crowd_net
+
+# Override optimizer (lower lr for Swin-Tiny + larger patch)
+optimizer:
+  lr: 5e-5
+  lr_backbone: 5e-6
+
+# Override scheduler (longer warmup for stability)
+scheduler:
+  warmup_epochs: 50
 
 # Density loss
 density_loss_weight: 0.01

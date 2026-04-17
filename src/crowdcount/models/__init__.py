@@ -48,6 +48,9 @@ def _build_swin_crowd_net(cfg: DictConfig):
         moe_lambda_decorr=float(getattr(moe_cfg, "lambda_decorr", 0.1))
         if moe_cfg
         else 0.1,
+        moe_lambda_diversity=float(getattr(moe_cfg, "lambda_diversity", 0.1))
+        if moe_cfg
+        else 0.1,
         use_dfr=bool(getattr(cfg.model, "use_dfr", True)),
         use_decoupled_head=bool(getattr(cfg.model, "use_decoupled_head", True)),
         use_freq_router=bool(getattr(cfg.model, "use_freq_router", True)),

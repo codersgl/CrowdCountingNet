@@ -405,7 +405,7 @@ def train_one_epoch(
                 moe_aux_raw=float(moe_aux_total.item()),
             )
             moe_aux_losses = outputs.get("moe_aux_losses") or {}
-            for key in ("l_balance", "l_decorr"):
+            for key in ("l_balance", "l_decorr", "l_diversity"):
                 if key in moe_aux_losses:
                     metric_logger.update(**{key: float(moe_aux_losses[key].item())})
 

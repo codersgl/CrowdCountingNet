@@ -1,11 +1,11 @@
 # SwinCrowdNet model configuration
-# Architecture: Swin-B (Stage 1-3) → CrowdFPN (enhanced) → Density_pred →
+# Architecture: Swin-Tiny (Stage 1-3) → CrowdFPN (enhanced) → Density_pred →
 #   DensityFeatureRefine → MoE-Lite (density-gated) → DecoupledHead → output
 
 architecture: swin_crowd_net
 
 # Backbone
-backbone: swin_base # swin_tiny | swin_small | swin_base
+backbone: swin_tiny # swin_tiny | swin_small | swin_base
 backbone_pretrained: true
 
 # Anchor grid (same semantics as DSGCNet)
@@ -30,20 +30,21 @@ use_freq_router: true # Frequency-decoupled routing (Laplacian decomposition)
 # MoE-Lite (density-gated experts + multi-scale routing + decorrelation)
 moe:
   grid_stride: 4 # coarse routing grid stride
-  temperature_init: 0.5 # lower init temperature → faster expert differentiation
-  temperature_min: 0.15 # allow sharper routing
-  lambda_balance: 0.05 # increased from 0.01 to ensure non-zero balance loss
+  temperature_init: 1.0 # smooth routing early, anneal gradually
+  temperature_min: 0.5 # avoid premature hard routing
+  lambda_balance: 0.5 # strong balance regularisation
   dense_expansion: 3 # DenseRegionExpert channel expansion (2→3)
   use_density_gate: true # density-conditioned gating inside each expert
-  lambda_decorr: 0.1 # expert decorrelation loss weight
+  lambda_decorr: 0.5 # expert decorrelation loss weight
+  lambda_diversity: 0.1 # expert output diversity loss (cosine similarity penalty)
 
 # Loss weights (consumed by SetCriterion_Crowd via build_model)
 set_cost_class: 1.0
 set_cost_point: 0.05
-point_loss_coef: 0.0002
+point_loss_coef: 0.001
 eos_coef: 0.5
-count_loss_coef: 0.001 # global counting L1 loss (reduced from 0.01 — unscaled ~500 dominates)
-consistency_loss_coef: 0.001 # density-point consistency loss (reduced from 0.01 — unscaled ~500 dominates)
+count_loss_coef: 0.01 # global counting L1 loss
+consistency_loss_coef: 0.01 # density-point consistency loss
 
 # Focal loss (enabled for foreground/background imbalance)
 use_focal_loss: true

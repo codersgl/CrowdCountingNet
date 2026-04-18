@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 
 from crowdcount.models.matcher import HungarianMatcher_Crowd, build_matcher_crowd
 from crowdcount.models.criterion import SetCriterion_Crowd
-from crowdcount.models.criterion import sigmoid_focal_loss
+from crowdcount.models.criterion import softmax_focal_loss
 
 
 @pytest.fixture
@@ -234,16 +234,16 @@ def test_focal_vs_ce_different(dummy_outputs, dummy_targets, cfg):
     assert not torch.allclose(ce_losses["loss_ce"], focal_losses["loss_ce"])
 
 
-def test_sigmoid_focal_loss_reduces_easy_examples():
-    """Focal loss should produce smaller loss than BCE for easy (high-confidence) samples."""
+def test_softmax_focal_loss_reduces_easy_examples():
+    """Focal loss should produce smaller loss than CE for easy (high-confidence) samples."""
     # Easy case: logits strongly predict the correct class
     inputs = torch.tensor([[5.0, -5.0], [-5.0, 5.0]])  # 2 samples, 2 classes
     targets = torch.tensor([0, 1])
 
-    focal = sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=2.0)
-    # Compare with gamma=0 (equivalent to weighted BCE)
-    no_focus = sigmoid_focal_loss(inputs, targets, alpha=0.25, gamma=0.0)
-    assert focal < no_focus, "Focal loss should be smaller than BCE for easy examples"
+    focal = softmax_focal_loss(inputs, targets, alpha=0.75, gamma=2.0)
+    # Compare with gamma=0 (equivalent to weighted CE)
+    no_focus = softmax_focal_loss(inputs, targets, alpha=0.75, gamma=0.0)
+    assert focal < no_focus, "Focal loss should be smaller than CE for easy examples"
 
 
 # ---------------------------------------------------------------------------

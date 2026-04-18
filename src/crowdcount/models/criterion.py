@@ -7,44 +7,56 @@ from torch import nn
 from crowdcount.utils.misc import get_world_size, is_dist_avail_and_initialized
 
 
-def sigmoid_focal_loss(
+def softmax_focal_loss(
     inputs: torch.Tensor,
     targets: torch.Tensor,
-    alpha: float = 0.25,
+    alpha: float = 0.75,
     gamma: float = 2.0,
     class_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Sigmoid focal loss for dense classification (RetinaNet-style).
+    """Softmax focal loss for mutually exclusive classification.
+
+    Uses softmax (not sigmoid) since crowd counting has mutually exclusive
+    foreground/background classes.  Normalisation matches
+    ``F.cross_entropy(..., weight=..., reduction='mean')`` when ``gamma=0``
+    so that switching between focal and CE does not change loss scale.
 
     Args:
-        inputs: [N, C] raw logits (before sigmoid).
+        inputs: [N, C] raw logits (before softmax).
         targets: [N] integer class labels in [0, C).
-        alpha: Weighting factor for the foreground class.
+        alpha: Weighting factor for the **foreground** class (background
+               gets ``1 - alpha``).  Only used when *class_weight* is None.
         gamma: Focusing parameter (higher ⇒ more focus on hard examples).
         class_weight: Optional per-class weight tensor of shape [C].
+               When provided, this is used **instead of** alpha to avoid
+               double-weighting.
 
     Returns:
-        Scalar mean focal loss.
+        Scalar focal loss (weighted-mean normalised).
     """
-    num_classes = inputs.shape[-1]
-    # One-hot encode targets → [N, C]
-    target_onehot = F.one_hot(targets, num_classes=num_classes).float()
+    # Per-sample unweighted CE
+    ce = F.cross_entropy(inputs, targets, reduction="none")  # [N]
 
-    p = inputs.sigmoid()
-    ce = F.binary_cross_entropy_with_logits(inputs, target_onehot, reduction="none")
-    p_t = p * target_onehot + (1 - p) * (1 - target_onehot)
-    focal_weight = (1 - p_t) ** gamma
+    # p_t: softmax probability assigned to the true class
+    p = F.softmax(inputs, dim=-1)
+    p_t = p.gather(1, targets.unsqueeze(1)).squeeze(1)  # [N]
+    focal_weight = (1 - p_t) ** gamma  # [N]
 
-    # Per-class alpha weighting: foreground gets alpha, background gets (1 - alpha)
-    alpha_t = alpha * target_onehot + (1 - alpha) * (1 - target_onehot)
-
-    loss = alpha_t * focal_weight * ce  # [N, C]
-
-    # Apply optional class weight (e.g. eos_coef for background)
+    # Class weighting: use class_weight if provided, otherwise use alpha
     if class_weight is not None:
-        loss = loss * class_weight.unsqueeze(0)
+        w_t = class_weight[targets]  # [N]
+    else:
+        # Foreground (label>0) gets alpha, background gets 1-alpha
+        w_t = torch.where(
+            targets > 0,
+            torch.tensor(alpha, device=inputs.device),
+            torch.tensor(1 - alpha, device=inputs.device),
+        )
 
-    return loss.mean()
+    loss = w_t * focal_weight * ce  # [N]
+
+    # Weighted-mean: divide by sum(w_t) to match F.cross_entropy(weight=...) scale
+    return loss.sum() / w_t.sum().clamp(min=1.0)
 
 
 class SetCriterion_Crowd(nn.Module):
@@ -90,7 +102,7 @@ class SetCriterion_Crowd(nn.Module):
         target_classes[idx] = target_classes_o
 
         if self.use_focal_loss:
-            loss_ce = sigmoid_focal_loss(
+            loss_ce = softmax_focal_loss(
                 src_logits.flatten(0, 1),  # [B*Q, C]
                 target_classes.flatten(0, 1),  # [B*Q]
                 alpha=self.focal_alpha,

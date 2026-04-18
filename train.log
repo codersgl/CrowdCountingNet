@@ -3034,3 +3034,6 @@
 2026-04-17 23:11:01 | INFO     | crowdcount.trainer:104 - Number of trainable parameters: 22,613,204
 2026-04-17 23:11:01 | INFO     | crowdcount.trainer:145 - Optimizer: Adam
 2026-04-17 23:11:01 | INFO     | crowdcount.trainer:255 - Scheduler: step_lr (no warmup)
+2026-04-18 15:46:40 | INFO     | crowdcount.trainer:104 - Number of trainable parameters: 22,613,204
+2026-04-18 15:46:40 | INFO     | crowdcount.trainer:145 - Optimizer: Adam
+2026-04-18 15:46:40 | INFO     | crowdcount.trainer:255 - Scheduler: step_lr (no warmup)

@@ -115,8 +115,12 @@ class Trainer:
         self.use_depth = bool(getattr(cfg.model, "use_depth", False))
         self.use_depth_geo = bool(getattr(cfg.model, "use_depth_geo", False))
         self.use_depth_dual_vgg = bool(getattr(cfg.model, "use_depth_dual_vgg", False))
+        self.use_depth_attn = bool(getattr(cfg.model, "use_depth_attn", False))
         self._needs_depth = (
-            self.use_depth or self.use_depth_geo or self.use_depth_dual_vgg
+            self.use_depth
+            or self.use_depth_geo
+            or self.use_depth_dual_vgg
+            or self.use_depth_attn
         )
 
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

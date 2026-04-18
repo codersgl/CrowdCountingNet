@@ -36,6 +36,7 @@ from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
 from crowdcount.plugins.concat_gate_fusion import ConcatGateFusion
+from crowdcount.plugins.depth_residual_gating import DepthResidualGating
 from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
 from crowdcount.models.backbone import DepthBackbone_VGG
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
@@ -111,6 +112,8 @@ class DSGCnet(nn.Module):
         depth_geo_cfg: DictConfig | None = None,
         use_depth_dual_vgg: bool = False,
         depth_dual_vgg_cfg: DictConfig | None = None,
+        use_depth_attn: bool = False,
+        depth_attn_cfg: DictConfig | None = None,
         gcn_adaptive: bool = False,
         gcn_k: int = 4,
         gcn_k_min: int = 2,
@@ -162,14 +165,18 @@ class DSGCnet(nn.Module):
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
         self.use_depth_dual_vgg = use_depth_dual_vgg
+        self.use_depth_attn = use_depth_attn
 
         # Mutual exclusion: only one depth fusion path at a time
-        _depth_flags = sum([use_depth, use_depth_geo, use_depth_dual_vgg])
+        _depth_flags = sum(
+            [use_depth, use_depth_geo, use_depth_dual_vgg, use_depth_attn]
+        )
         if _depth_flags > 1:
             raise ValueError(
                 "At most one depth fusion path may be enabled. Got: "
                 f"use_depth={use_depth}, use_depth_geo={use_depth_geo}, "
-                f"use_depth_dual_vgg={use_depth_dual_vgg}"
+                f"use_depth_dual_vgg={use_depth_dual_vgg}, "
+                f"use_depth_attn={use_depth_attn}"
             )
         self.use_freq_head = use_freq_head
         self.use_density_attention = use_density_attention
@@ -678,6 +685,27 @@ class DSGCnet(nn.Module):
             self.dvgg_fusion_c4 = None
             self.dvgg_fusion_c5 = None
 
+        # Path 4: use_depth_attn — DepthResidualGating (lightweight residual gate)
+        if use_depth_attn:
+            _da_mid_ratio = (
+                int(getattr(depth_attn_cfg, "mid_ratio", 4))
+                if depth_attn_cfg is not None
+                else 4
+            )
+            self.depth_attn_c3: DepthResidualGating | None = DepthResidualGating(
+                256, mid_ratio=_da_mid_ratio
+            )
+            self.depth_attn_c4: DepthResidualGating | None = DepthResidualGating(
+                512, mid_ratio=_da_mid_ratio
+            )
+            self.depth_attn_c5: DepthResidualGating | None = DepthResidualGating(
+                512, mid_ratio=_da_mid_ratio
+            )
+        else:
+            self.depth_attn_c3 = None
+            self.depth_attn_c4 = None
+            self.depth_attn_c5 = None
+
         # DINOv2 semantic injection (optional, disabled by default)
         # cfg may be full hydra config (has .model) or flat model-level config from tests
         _model_cfg = getattr(cfg, "model", cfg) if cfg is not None else None
@@ -903,6 +931,12 @@ class DSGCnet(nn.Module):
             c3 = self.dvgg_fusion_c3(c3, d_c3)  # type: ignore[misc]
             c4 = self.dvgg_fusion_c4(c4, d_c4)  # type: ignore[misc]
             c5 = self.dvgg_fusion_c5(c5, d_c5)  # type: ignore[misc]
+
+        # Path 4: DepthResidualGating — lightweight residual gate per scale
+        if self.use_depth_attn and depth_map is not None:
+            c3 = self.depth_attn_c3(c3, depth_map)  # type: ignore[misc]
+            c4 = self.depth_attn_c4(c4, depth_map)  # type: ignore[misc]
+            c5 = self.depth_attn_c5(c5, depth_map)  # type: ignore[misc]
 
         # --- MSCADecoder path: replaces PA-FPN + Density_pred, GCN runs downstream ---
         if self.use_msca_decoder:

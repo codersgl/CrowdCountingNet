@@ -81,6 +81,10 @@ def base_cfg():
                     "pretrained": True,
                     "frozen_stages": 0,
                 },
+                "use_depth_attn": False,
+                "depth_attn": {
+                    "mid_ratio": 4,
+                },
                 "use_refine": False,
                 "refine": {
                     "num_steps": 2,

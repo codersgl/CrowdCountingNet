@@ -105,6 +105,8 @@ class SHHA(Dataset):
                 depth_npy = np.load(
                     os.path.join(self.gt_depth_root, imgname.replace(".jpg", ".npy"))
                 ).astype(np.float32)
+                # Gaussian blur to smooth depth edge discontinuities
+                depth_npy = cv2.GaussianBlur(depth_npy, (15, 15), sigmaX=5)
                 # Min-max normalise depth to [0, 1]
                 d_min, d_max = depth_npy.min(), depth_npy.max()
                 if d_max - d_min > 1e-6:
@@ -223,6 +225,8 @@ class SHHA(Dataset):
                 depth_npy = np.load(
                     os.path.join(self.gt_depth_root, imgname.replace(".jpg", ".npy"))
                 ).astype(np.float32)
+                # Gaussian blur to smooth depth edge discontinuities
+                depth_npy = cv2.GaussianBlur(depth_npy, (15, 15), sigmaX=5)
                 d_min, d_max = depth_npy.min(), depth_npy.max()
                 if d_max - d_min > 1e-6:
                     depth_npy = (depth_npy - d_min) / (d_max - d_min)

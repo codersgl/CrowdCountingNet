@@ -114,8 +114,13 @@ def train_one_epoch(
         if cfg is not None
         else False
     )
+    use_depth_attn = bool(
+        getattr(getattr(cfg, "model", None), "use_depth_attn", False)
+        if cfg is not None
+        else False
+    )
     use_depth = (
-        use_depth or use_depth_geo or use_depth_dual_vgg
+        use_depth or use_depth_geo or use_depth_dual_vgg or use_depth_attn
     )  # any flag requires depth data in batch
 
     for batch in data_loader:

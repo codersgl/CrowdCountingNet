@@ -324,3 +324,101 @@ def test_dsgcnet_dual_vgg_exclusivity_with_geo_raises():
     backbone = TinyVGGBackbone()
     with pytest.raises(ValueError, match="At most one depth fusion path"):
         DSGCnet(backbone, use_depth_geo=True, use_depth_dual_vgg=True)
+
+
+# ---------------------------------------------------------------------------
+# DepthResidualGating tests
+# ---------------------------------------------------------------------------
+
+
+def test_depth_residual_gating_shape():
+    """Output shape must match input feature shape for all three scales."""
+    from crowdcount.plugins.depth_residual_gating import DepthResidualGating
+
+    depth = torch.randn(2, 1, 128, 128)
+    for ch, h, w in [(256, 32, 32), (512, 16, 16), (512, 8, 8)]:
+        module = DepthResidualGating(ch, mid_ratio=4)
+        feat = torch.randn(2, ch, h, w)
+        out = module(feat, depth)
+        assert out.shape == (2, ch, h, w)
+
+
+def test_depth_residual_gating_gate_init_zero():
+    """Gate parameter must start at 0 for stable training."""
+    from crowdcount.plugins.depth_residual_gating import DepthResidualGating
+
+    module = DepthResidualGating(256)
+    assert module.gate.item() == 0.0
+
+
+def test_depth_residual_gating_identity_at_init():
+    """With gate=0 the module output must exactly equal the input feature."""
+    from crowdcount.plugins.depth_residual_gating import DepthResidualGating
+
+    module = DepthResidualGating(256)
+    feat = torch.randn(1, 256, 16, 16)
+    depth = torch.randn(1, 1, 64, 64)
+    out = module(feat, depth)
+    assert torch.allclose(out, feat, atol=1e-7)
+
+
+def test_depth_residual_gating_gradient_flow():
+    """Gradients must flow back through both feat and depth_encoder paths."""
+    from crowdcount.plugins.depth_residual_gating import DepthResidualGating
+
+    module = DepthResidualGating(256)
+    # Manually set gate > 0 so depth_encoder path is active
+    with torch.no_grad():
+        module.gate.fill_(1.0)
+    feat = torch.randn(1, 256, 8, 8, requires_grad=True)
+    depth = torch.randn(1, 1, 32, 32, requires_grad=True)
+    out = module(feat, depth)
+    out.sum().backward()
+    assert feat.grad is not None
+    assert depth.grad is not None
+    # gate should also receive gradient
+    assert module.gate.grad is not None
+
+
+def test_dsgcnet_forward_with_depth_attn(sample_batch, depth_sample):
+    """DSGCnet with use_depth_attn=True should produce correct output keys."""
+    backbone = TinyVGGBackbone()
+    depth_attn_cfg = OmegaConf.create({"mid_ratio": 4})
+    model = DSGCnet(backbone, use_depth_attn=True, depth_attn_cfg=depth_attn_cfg)
+    model.eval()
+
+    with torch.no_grad():
+        out = model(sample_batch, depth_map=depth_sample)
+
+    assert "pred_logits" in out
+    assert "pred_points" in out
+    assert "density_out" in out
+    assert out["pred_logits"].shape[0] == sample_batch.shape[0]
+    assert out["pred_points"].shape[0] == sample_batch.shape[0]
+    assert out["density_out"].shape[0] == sample_batch.shape[0]
+
+
+def test_dsgcnet_depth_attn_no_depthmap_runs(sample_batch):
+    """When depth_map=None with depth_attn enabled, model should still run."""
+    backbone = TinyVGGBackbone()
+    depth_attn_cfg = OmegaConf.create({"mid_ratio": 4})
+    model = DSGCnet(backbone, use_depth_attn=True, depth_attn_cfg=depth_attn_cfg)
+    model.eval()
+
+    with torch.no_grad():
+        out = model(sample_batch)  # no depth_map
+
+    assert out["pred_logits"].shape[0] == sample_batch.shape[0]
+
+
+def test_dsgcnet_depth_attn_exclusivity_raises():
+    """Enabling use_depth_attn together with another depth path should raise."""
+    import pytest
+
+    backbone = TinyVGGBackbone()
+    with pytest.raises(ValueError, match="At most one depth fusion path"):
+        DSGCnet(backbone, use_depth=True, use_depth_attn=True)
+    with pytest.raises(ValueError, match="At most one depth fusion path"):
+        DSGCnet(backbone, use_depth_geo=True, use_depth_attn=True)
+    with pytest.raises(ValueError, match="At most one depth fusion path"):
+        DSGCnet(backbone, use_depth_dual_vgg=True, use_depth_attn=True)

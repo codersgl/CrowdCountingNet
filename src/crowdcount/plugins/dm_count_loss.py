@@ -88,19 +88,28 @@ class OTLoss(nn.Module):
         Args:
             p, q: [B, N] non-negative distributions (need not be normalised).
         Returns:
-            [B] per-sample W1 distances.
+            [B] per-sample W1 distances.  Returns 0 for samples where both
+            distributions are near-zero (empty crops).
         """
+        p_sum = p.sum(dim=-1, keepdim=True)
+        q_sum = q.sum(dim=-1, keepdim=True)
+
+        # Mask out samples where both pred and GT are near-zero (empty crop):
+        # OT is undefined for zero-mass distributions and would produce
+        # misleading gradients.
+        valid = (p_sum.squeeze(-1) > self.eps) | (q_sum.squeeze(-1) > self.eps)
+
         # Normalise to probability distributions
-        p_sum = p.sum(dim=-1, keepdim=True).clamp(min=self.eps)
-        q_sum = q.sum(dim=-1, keepdim=True).clamp(min=self.eps)
-        p_norm = p / p_sum
-        q_norm = q / q_sum
+        p_norm = p / p_sum.clamp(min=self.eps)
+        q_norm = q / q_sum.clamp(min=self.eps)
 
         # CDF = cumulative sum
         cdf_p = p_norm.cumsum(dim=-1)
         cdf_q = q_norm.cumsum(dim=-1)
 
-        return (cdf_p - cdf_q).abs().sum(dim=-1)
+        w1 = (cdf_p - cdf_q).abs().sum(dim=-1)
+        # Zero out invalid samples so they contribute no gradient
+        return w1 * valid.float()
 
 
 class TVLoss(nn.Module):

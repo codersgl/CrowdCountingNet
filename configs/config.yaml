@@ -45,6 +45,16 @@ density_dmcount:
   lambda_tv: 0.01 # Total Variation regularisation weight
   count_loss_type: "l1" # "l1" or "mse"
 
+# ASACL: Adaptive Structural-Perceptual Composite Loss (multi-component density loss).
+# When enabled, replaces the default MSE / DM-Count density loss with a 3-part loss:
+#   L = λ_adapt · AdaptiveWeightedL1 + λ_struct · SSIM(ws=5) + λ_percept · VGGPerceptual
+density_asacl:
+  enabled: false
+  beta: 1.0 # Adaptive weight control (β / (|Y| + β))
+  lambda_adapt: 1.0 # Weight for adaptive spatial L1
+  lambda_struct: 0.5 # Weight for local SSIM structure loss
+  lambda_percept: 0.1 # Weight for VGG perceptual loss
+
 density_ssim:
   enabled: false # Add SSIM structure loss on the main density map
   weight: 0.005 # Relative weight of SSIM loss before adding into den_loss

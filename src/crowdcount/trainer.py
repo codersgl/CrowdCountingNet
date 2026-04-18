@@ -69,12 +69,28 @@ class Trainer:
         if self.uncertainty_weighter is not None:
             self.uncertainty_weighter.to(self.device)
 
-        # Density criterion: DM-Count or MSE
+        # Density criterion: ASACL > DM-Count > MSE (priority order)
+        asacl_cfg = getattr(cfg, "density_asacl", None)
         dmcount_cfg = getattr(cfg, "density_dmcount", None)
-        if bool(getattr(dmcount_cfg, "enabled", False)):
+        if bool(getattr(asacl_cfg, "enabled", False)):
+            from crowdcount.plugins.asacl_loss import (
+                AdaptiveStructuralPerceptualLoss,
+            )
+
+            self.density_criterion: nn.Module = AdaptiveStructuralPerceptualLoss(
+                beta=float(getattr(asacl_cfg, "beta", 1.0)),
+                lambda_adapt=float(getattr(asacl_cfg, "lambda_adapt", 1.0)),
+                lambda_struct=float(getattr(asacl_cfg, "lambda_struct", 0.5)),
+                lambda_percept=float(getattr(asacl_cfg, "lambda_percept", 0.1)),
+            ).to(self.device)
+            logger.info(
+                "Using ASACL density loss "
+                "(λ_adapt·AdaptiveL1 + λ_struct·SSIM + λ_percept·VGGPercept)"
+            )
+        elif bool(getattr(dmcount_cfg, "enabled", False)):
             from crowdcount.plugins.dm_count_loss import DMCountLoss
 
-            self.density_criterion: nn.Module = DMCountLoss(
+            self.density_criterion = DMCountLoss(
                 lambda_count=float(getattr(dmcount_cfg, "lambda_count", 1.0)),
                 lambda_ot=float(getattr(dmcount_cfg, "lambda_ot", 0.1)),
                 lambda_tv=float(getattr(dmcount_cfg, "lambda_tv", 0.01)),

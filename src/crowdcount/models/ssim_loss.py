@@ -32,7 +32,7 @@ class SSIMLoss(nn.Module):
         self,
         window_size: int = 11,
         sigma: float = 1.5,
-        data_range: float = 1.0,
+        data_range: float | None = None,
         size_average: bool = True,
     ) -> None:
         super().__init__()
@@ -43,7 +43,7 @@ class SSIMLoss(nn.Module):
 
         self.window_size = window_size
         self.sigma = sigma
-        self.data_range = data_range
+        self.data_range = data_range  # None → auto from input
         self.size_average = size_average
 
         window = _gaussian_kernel(window_size, sigma).unsqueeze(0).unsqueeze(0)
@@ -72,22 +72,29 @@ class SSIMLoss(nn.Module):
 
         sigma_pred_sq = (
             F.conv2d(pred * pred, window, padding=padding, groups=channels) - mu_pred_sq
-        )
+        ).clamp(min=0)
         sigma_target_sq = (
             F.conv2d(target * target, window, padding=padding, groups=channels)
             - mu_target_sq
-        )
+        ).clamp(min=0)
         sigma_pred_target = (
             F.conv2d(pred * target, window, padding=padding, groups=channels)
             - mu_pred_target
         )
 
-        c1 = (0.01 * self.data_range) ** 2
-        c2 = (0.03 * self.data_range) ** 2
+        # Auto data_range: use the actual value range of the inputs per batch
+        if self.data_range is not None:
+            dr = self.data_range
+        else:
+            dr = float(
+                torch.max(pred.detach().max(), target.detach().max()).clamp(min=1.0)
+            )
+
+        c1 = (0.01 * dr) ** 2
+        c2 = (0.03 * dr) ** 2
 
         ssim_map = ((2 * mu_pred_target + c1) * (2 * sigma_pred_target + c2)) / (
             (mu_pred_sq + mu_target_sq + c1) * (sigma_pred_sq + sigma_target_sq + c2)
-            + 1e-12
         )
         if self.size_average:
             return 1.0 - ssim_map.mean()

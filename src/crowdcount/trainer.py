@@ -85,9 +85,12 @@ class Trainer:
             self.density_criterion = nn.MSELoss(reduction="sum").to(self.device)
         density_ssim_cfg = getattr(cfg, "density_ssim", None)
         if bool(getattr(density_ssim_cfg, "enabled", False)):
+            _dr_raw = getattr(density_ssim_cfg, "data_range", None)
+            _data_range = float(_dr_raw) if _dr_raw is not None else None
             self.ssim_criterion: nn.Module | None = SSIMLoss(
                 window_size=int(getattr(density_ssim_cfg, "window_size", 11)),
                 sigma=float(getattr(density_ssim_cfg, "sigma", 1.5)),
+                data_range=_data_range,
             ).to(self.device)
         else:
             self.ssim_criterion = None

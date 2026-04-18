@@ -53,6 +53,7 @@ density_ssim:
   # Recommend 7 for 16x16 targets, 11 for full-resolution if used elsewhere.
   window_size: 7 # Must be odd; 7 is a good default for 16x16 density maps
   sigma: 1.5 # Gaussian kernel sigma for SSIM window
+  data_range: null # null = auto from input max; set a float to fix (e.g. 100.0)
 
 # Iterative Point Refinement loss weight (only used when model.use_refine: true)
 refine_loss_weight: 0.001

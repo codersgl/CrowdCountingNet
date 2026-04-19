@@ -158,7 +158,7 @@ class Decoder_SPD_PAFPN(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, inputs):
+    def forward(self, inputs, return_intermediates: bool = False):
         C3, C4, C5 = inputs
 
         P5_x = self.P5_1(C5)
@@ -193,10 +193,13 @@ class Decoder_SPD_PAFPN(nn.Module):
         else:
             P5_x = P5_x + P4_down
         P5_x = self.P5_2_bu(P5_x)
+        P5_x_out = P5_x  # Save at original low-res for cross-scale use
         P5_x = self.P5_upsampled(P5_x)
 
         fuse = torch.cat([P3_down, P4_x, P5_x], 1)
         out = self.fusion(fuse)
         if self.fpn_attention:
             out = self.final_spatial(out)
+        if return_intermediates:
+            return out, (P3_x, P4_x, P5_x_out)
         return out

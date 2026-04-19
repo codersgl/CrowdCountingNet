@@ -45,6 +45,7 @@ from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.graph_moe import GraphAwareMoE
 from crowdcount.plugins.sdd_moe import SDDMoE
+from crowdcount.plugins.sa_dgat import SADGATFusion
 from crowdcount.plugins.msaa import MSAAGate, MSAALite, MsaaAdaptiveLayer
 from crowdcount.plugins.MSCA import MSCADecoder, MSCANeck
 from crowdcount.plugins.rccformer import DensityPredDEAB, MFFMNeck
@@ -168,7 +169,9 @@ class DSGCnet(nn.Module):
         self.use_graph_attn_moe = fusion_mode == "graph_attn_moe"
         self.use_mamba_moe = fusion_mode == "mamba_moe"
         self.use_sdd_moe = fusion_mode == "sdd_moe"
+        self.use_sa_dgat = fusion_mode == "sa_dgat"
         self.sdd_moe: SDDMoE | None = None
+        self.sa_dgat_fusion: SADGATFusion | None = None
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
         self.use_depth_dual_vgg = use_depth_dual_vgg
@@ -219,9 +222,10 @@ class DSGCnet(nn.Module):
             "graph_attn_moe",
             "mamba_moe",
             "sdd_moe",
+            "sa_dgat",
         }:
             raise ValueError(
-                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', 'graph_attn_moe', 'mamba_moe', or 'sdd_moe'"
+                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', 'graph_attn_moe', 'mamba_moe', 'sdd_moe', or 'sa_dgat'"
             )
 
         density_cfg = (
@@ -496,6 +500,60 @@ class DSGCnet(nn.Module):
             self.sdd_moe: SDDMoE | None = SDDMoE(
                 in_channels=256,
                 cfg=sdd_moe_cfg,
+            )
+            self.esca = None
+            self.moe = None
+            self.density_gcn = None
+            self.feature_gcn = None
+            self.alpha = None
+            self.gm = None
+            self.graph_attn_moe = None
+            self.mamba_moe = None
+            self.supernode_gcn = None
+            self.cross_stream_gcn = None
+        elif self.use_sa_dgat:
+            _sa_cfg = getattr(cfg, "model", cfg) if cfg is not None else None
+            _sa_dgat_cfg = (
+                getattr(_sa_cfg, "sa_dgat", None) if _sa_cfg is not None else None
+            )
+            self.sa_dgat_fusion = SADGATFusion(
+                in_channels=256,
+                num_scale_prompts=int(getattr(_sa_dgat_cfg, "num_scale_prompts", 5))
+                if _sa_dgat_cfg
+                else 5,
+                deformable_k=int(getattr(_sa_dgat_cfg, "deformable_k", 8))
+                if _sa_dgat_cfg
+                else 8,
+                num_heads=int(getattr(_sa_dgat_cfg, "num_heads", 4))
+                if _sa_dgat_cfg
+                else 4,
+                lambda_init=float(getattr(_sa_dgat_cfg, "lambda_init", 1.0))
+                if _sa_dgat_cfg
+                else 1.0,
+                mu_init=float(getattr(_sa_dgat_cfg, "mu_init", 1.0))
+                if _sa_dgat_cfg
+                else 1.0,
+                k_local=int(getattr(_sa_dgat_cfg, "k_local", 12))
+                if _sa_dgat_cfg
+                else 12,
+                k_global=int(getattr(_sa_dgat_cfg, "k_global", 4))
+                if _sa_dgat_cfg
+                else 4,
+                num_gat_layers=int(getattr(_sa_dgat_cfg, "num_gat_layers", 2))
+                if _sa_dgat_cfg
+                else 2,
+                occ_hidden=int(getattr(_sa_dgat_cfg, "occ_hidden", 64))
+                if _sa_dgat_cfg
+                else 64,
+                use_depth_prior=bool(getattr(_sa_dgat_cfg, "use_depth_prior", False))
+                if _sa_dgat_cfg
+                else False,
+                use_cross_scale=bool(getattr(_sa_dgat_cfg, "use_cross_scale", True))
+                if _sa_dgat_cfg
+                else True,
+                dropout=float(getattr(_sa_dgat_cfg, "dropout", 0.1))
+                if _sa_dgat_cfg
+                else 0.1,
             )
             self.esca = None
             self.moe = None
@@ -981,12 +1039,18 @@ class DSGCnet(nn.Module):
             c5 = self.depth_attn_c5(c5, depth_map)  # type: ignore[misc]
 
         # --- MSCADecoder path: replaces PA-FPN + Density_pred, GCN runs downstream ---
+        fpn_intermediates = None
         if self.use_msca_decoder:
             assert self.msca_decoder is not None
             feature_fl, density = self.msca_decoder([c3, c4, c5])
             features_pa = feature_fl  # alias for downstream consumers
         else:
-            features_pa = self.pa([c3, c4, c5])  # [batch_size, 256, 16, 16]
+            # For SA-DGAT, get FPN intermediates in a single pass
+            if self.use_sa_dgat:
+                _pa_result = self.pa([c3, c4, c5], return_intermediates=True)
+                features_pa, fpn_intermediates = _pa_result
+            else:
+                features_pa = self.pa([c3, c4, c5])  # [batch_size, 256, 16, 16]
 
             # Phase 1: MSAALite post-PA-FPN attention refinement
             if self.msaa_lite is not None:
@@ -1087,6 +1151,15 @@ class DSGCnet(nn.Module):
             output_dict["moe_aux_losses"] = sdd_aux_losses
             output_dict["moe_aux_total"] = sdd_aux_losses.get("total_aux")
             output_dict["moe_weights"] = sdd_weights
+        elif self.use_sa_dgat:
+            assert self.sa_dgat_fusion is not None
+            feature_fl, sa_dgat_aux = self.sa_dgat_fusion(
+                features_pa,
+                density,
+                depth_map=depth_map,
+                fpn_intermediates=fpn_intermediates,
+            )
+            output_dict["sa_dgat_aux"] = sa_dgat_aux
         else:
             if self._gcn_mode == "supernode":
                 assert self.supernode_gcn is not None

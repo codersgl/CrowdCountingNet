@@ -30,10 +30,11 @@ use_ms_density_head: false
 use_rccformer_neck: false
 rccformer_deab_blocks: 2 # Number of DEAB blocks in density prediction branch
 
-# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe | mamba_moe
+# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe | mamba_moe | sa_dgat
 # gcn_moe: GCN dual-stream + LightMoE post-refinement (recommended)
 # graph_attn_moe: 2-expert MoE (local conv + graph-biased attention)
 # mamba_moe: routed directional Mamba experts + shared channel scan
+# sa_dgat: Scale-Aware Deformable Graph Attention Network
 fusion_mode: gcn
 
 # Adaptive GCN graph construction (only used when fusion_mode: gcn)
@@ -122,6 +123,31 @@ sdd_moe:
   lambda_scale: 0.1
   lambda_ssim: 0.1
   ssim_window_size: 7
+
+# SA-DGAT: Scale-Aware Deformable Graph Attention Network
+# (only used when fusion_mode: sa_dgat)
+# Replaces the dual-stream GCN with a pipeline of:
+#   Scale Prompt → Deformable Graph Attention → Occlusion-Aware GAT → Cross-Scale Aggregation
+sa_dgat:
+  num_scale_prompts: 5 # learnable scale prompts (tiny/small/medium/large/crowd)
+  deformable_k: 8 # number of deformable neighbours per node
+  num_heads: 4 # attention heads for all sub-modules
+  lambda_init: 1.0 # distance penalty coefficient (learnable)
+  mu_init: 1.0 # scale matching reward coefficient (learnable)
+  k_local: 12 # local graph neighbours for cross-scale aggregation
+  k_global: 4 # global graph neighbours for cross-scale aggregation
+  num_gat_layers: 2 # stacked occlusion-aware GAT layers
+  occ_hidden: 64 # hidden channels for occlusion predictor
+  use_depth_prior: false # use depth map for occlusion prediction
+  use_cross_scale: true # enable cross-scale graph aggregation (requires FPN intermediates)
+  dropout: 0.1
+  # Loss weights (0.0 = disabled)
+  bayesian_loss_weight: 0.005 # Bayesian crowd loss on density maps
+  bayesian_sigma: 8.0 # Gaussian sigma for Bayesian loss
+  bayesian_bg_weight: 0.1 # background pixel weight in Bayesian loss
+  ranking_loss_weight: 0.001 # local count ranking loss
+  ranking_grid_size: 4 # patch grid size for ranking loss
+  ranking_num_pairs: 16 # random patch pairs per image
 
 use_dino_inject: false
 dino_inject_variant: dinov2_b

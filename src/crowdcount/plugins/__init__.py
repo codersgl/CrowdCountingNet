@@ -3,6 +3,7 @@ from crowdcount.plugins.concat_gate_fusion import ConcatGateFusion
 from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.moe import ESCA, MoE
+from crowdcount.plugins.sdd_moe import SDDMoE
 from crowdcount.plugins.msaa import (
     FPNAttentionGate,
     FPNSpatialAttention,
@@ -25,4 +26,5 @@ __all__ = [
     "FPNSpatialAttention",
     "ESCA",
     "MoE",
+    "SDDMoE",
 ]

@@ -109,6 +109,20 @@ mamba_moe:
   use_density_hint: false
   d_spectral: 256
 
+sdd_moe:
+  fg_threshold: 0.3
+  gumbel_temperature: 1.0
+  gumbel_temp_min: 0.3
+  gumbel_temp_decay: 0.99998
+  aspp_rates: [1, 6, 12, 18]
+  self_attn_heads: 2
+  self_attn_dim: 128
+  aux_loss_weight: 0.2
+  lambda_balance: 0.01
+  lambda_scale: 0.1
+  lambda_ssim: 0.1
+  ssim_window_size: 7
+
 use_dino_inject: false
 dino_inject_variant: dinov2_b
 

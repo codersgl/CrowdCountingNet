@@ -44,6 +44,7 @@ from crowdcount.models.backbone import DepthBackbone_VGG
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.graph_moe import GraphAwareMoE
+from crowdcount.plugins.sdd_moe import SDDMoE
 from crowdcount.plugins.msaa import MSAAGate, MSAALite, MsaaAdaptiveLayer
 from crowdcount.plugins.MSCA import MSCADecoder, MSCANeck
 from crowdcount.plugins.rccformer import DensityPredDEAB, MFFMNeck
@@ -108,6 +109,7 @@ class DSGCnet(nn.Module):
         moe_cfg: DictConfig | None = None,
         graph_attn_moe_cfg: DictConfig | None = None,
         mamba_moe_cfg: DictConfig | None = None,
+        sdd_moe_cfg: DictConfig | None = None,
         use_depth: bool = False,
         depth_cfg: DictConfig | None = None,
         use_depth_geo: bool = False,
@@ -165,6 +167,8 @@ class DSGCnet(nn.Module):
         self.use_gcn_moe = fusion_mode == "gcn_moe"
         self.use_graph_attn_moe = fusion_mode == "graph_attn_moe"
         self.use_mamba_moe = fusion_mode == "mamba_moe"
+        self.use_sdd_moe = fusion_mode == "sdd_moe"
+        self.sdd_moe: SDDMoE | None = None
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
         self.use_depth_dual_vgg = use_depth_dual_vgg
@@ -214,9 +218,10 @@ class DSGCnet(nn.Module):
             "gcn_moe",
             "graph_attn_moe",
             "mamba_moe",
+            "sdd_moe",
         }:
             raise ValueError(
-                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', 'graph_attn_moe', or 'mamba_moe'"
+                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', 'graph_attn_moe', 'mamba_moe', or 'sdd_moe'"
             )
 
         density_cfg = (
@@ -484,6 +489,22 @@ class DSGCnet(nn.Module):
             self.alpha = None
             self.gm = None
             self.graph_attn_moe = None
+            self.supernode_gcn = None
+            self.cross_stream_gcn = None
+            self.sdd_moe = None
+        elif self.use_sdd_moe:
+            self.sdd_moe: SDDMoE | None = SDDMoE(
+                in_channels=256,
+                cfg=sdd_moe_cfg,
+            )
+            self.esca = None
+            self.moe = None
+            self.density_gcn = None
+            self.feature_gcn = None
+            self.alpha = None
+            self.gm = None
+            self.graph_attn_moe = None
+            self.mamba_moe = None
             self.supernode_gcn = None
             self.cross_stream_gcn = None
         else:
@@ -869,12 +890,15 @@ class DSGCnet(nn.Module):
         return (
             (self.use_moe and self.moe is not None)
             or (self.use_mamba_moe and self.mamba_moe is not None)
+            or (self.use_sdd_moe and self.sdd_moe is not None)
             or self.light_moe is not None
         )
 
     def get_moe_gating_parameters(self) -> list[nn.Parameter]:
         if self.light_moe is not None:
             return list(self.light_moe.router.parameters())
+        if self.sdd_moe is not None:
+            return list(self.sdd_moe.router.parameters())
         if self.mamba_moe is not None:
             params: list[nn.Parameter] = []
             for momeb in self.mamba_moe.blocks:
@@ -887,12 +911,17 @@ class DSGCnet(nn.Module):
         )
 
     def update_moe_temperature(self, decay_rate: float = 0.9999) -> None:
-        if self.moe is None:
-            return
-        self.moe.update_temperature(decay_rate=decay_rate)
+        if self.moe is not None:
+            self.moe.update_temperature(decay_rate=decay_rate)
+        if self.sdd_moe is not None:
+            self.sdd_moe.update_temperature(decay_rate=decay_rate)
 
     def forward(
-        self, samples: torch.Tensor, depth_map: torch.Tensor | None = None
+        self,
+        samples: torch.Tensor,
+        depth_map: torch.Tensor | None = None,
+        targets: list[dict[str, torch.Tensor]] | None = None,
+        gt_density: torch.Tensor | None = None,
     ) -> dict:
         features = self.backbone(samples)
 
@@ -1045,6 +1074,19 @@ class DSGCnet(nn.Module):
             output_dict["moe_aux_losses"] = mamba_aux_losses
             output_dict["moe_aux_total"] = mamba_aux_losses.get("total_aux")
             output_dict["moe_weights"] = mamba_weights
+        elif self.use_sdd_moe:
+            assert self.sdd_moe is not None
+            feature_fl, sdd_aux_losses, sdd_weights = self.sdd_moe(
+                features_pa,
+                density_hint=density.detach(),
+                targets=targets if self.training else None,
+                gt_density=gt_density if self.training else None,
+                image_size=(samples.shape[-2], samples.shape[-1]),
+                training=self.training,
+            )
+            output_dict["moe_aux_losses"] = sdd_aux_losses
+            output_dict["moe_aux_total"] = sdd_aux_losses.get("total_aux")
+            output_dict["moe_weights"] = sdd_weights
         else:
             if self._gcn_mode == "supernode":
                 assert self.supernode_gcn is not None

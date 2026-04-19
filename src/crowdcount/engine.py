@@ -6,6 +6,7 @@ print() statements replaced with loguru logger.
 
 from __future__ import annotations
 
+import inspect
 import math
 import sys
 from typing import Iterable, Optional, cast
@@ -17,6 +18,24 @@ import numpy as np
 
 from crowdcount.utils.misc import MetricLogger, SmoothedValue, reduce_dict
 from loguru import logger
+
+
+def _forward_model(
+    model: nn.Module,
+    samples: torch.Tensor,
+    depth_map: torch.Tensor | None = None,
+    targets: list[dict[str, torch.Tensor]] | None = None,
+    gt_density: torch.Tensor | None = None,
+) -> dict:
+    signature = inspect.signature(model.forward)
+    kwargs: dict[str, object] = {}
+    if depth_map is not None and "depth_map" in signature.parameters:
+        kwargs["depth_map"] = depth_map
+    if targets is not None and "targets" in signature.parameters:
+        kwargs["targets"] = targets
+    if gt_density is not None and "gt_density" in signature.parameters:
+        kwargs["gt_density"] = gt_density
+    return model(samples, **kwargs)
 
 
 def train_one_epoch(
@@ -83,16 +102,26 @@ def train_one_epoch(
         else 0.005
     )
     model_moe_cfg = getattr(getattr(cfg, "model", None), "moe", None)
+    fusion_mode = str(getattr(getattr(cfg, "model", None), "fusion_mode", "gcn"))
     moe_aux_weight = (
         float(getattr(model_moe_cfg, "aux_loss_weight", 1.0))
         if model_moe_cfg is not None
         else 1.0
     )
+    model_sdd_moe_cfg = getattr(getattr(cfg, "model", None), "sdd_moe", None)
+    if fusion_mode == "sdd_moe" and model_sdd_moe_cfg is not None:
+        moe_aux_weight = float(
+            getattr(model_sdd_moe_cfg, "aux_loss_weight", moe_aux_weight)
+        )
     moe_temperature_decay = (
         float(getattr(model_moe_cfg, "temperature_decay", 0.9999))
         if model_moe_cfg is not None
         else 0.9999
     )
+    if fusion_mode == "sdd_moe" and model_sdd_moe_cfg is not None:
+        moe_temperature_decay = float(
+            getattr(model_sdd_moe_cfg, "gumbel_temp_decay", moe_temperature_decay)
+        )
     fg_loss_weight = (
         float(getattr(cfg, "fg_loss_weight", 0.1)) if cfg is not None else 0.1
     )
@@ -135,10 +164,13 @@ def train_one_epoch(
         gt_dmap = gt_dmap.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        if depth_map is not None:
-            outputs = model(samples, depth_map=depth_map)
-        else:
-            outputs = model(samples)
+        outputs = _forward_model(
+            model,
+            samples,
+            depth_map=depth_map,
+            targets=targets,
+            gt_density=gt_dmap,
+        )
         loss_dict = criterion(outputs, targets)
         weight_dict = cast(dict[str, torch.Tensor | float], criterion.weight_dict)
 
@@ -410,16 +442,27 @@ def train_one_epoch(
                 moe_aux_raw=float(moe_aux_total.item()),
             )
             moe_aux_losses = outputs.get("moe_aux_losses") or {}
-            for key in ("l_balance", "l_decorr"):
+            for key in ("l_balance", "l_decorr", "l_scale", "l_ssim"):
                 if key in moe_aux_losses:
                     metric_logger.update(**{key: float(moe_aux_losses[key].item())})
 
-            moe_module = getattr(model, "moe", None) or getattr(
-                model, "light_moe", None
+            moe_module = (
+                getattr(model, "moe", None)
+                or getattr(model, "light_moe", None)
+                or getattr(model, "sdd_moe", None)
             )
             if moe_module is not None:
-                if hasattr(moe_module, "temperature"):
-                    metric_logger.update(moe_temperature=float(moe_module.temperature))
+                # Temperature: direct attr or nested in router (SDDMoE)
+                _temp = getattr(moe_module, "temperature", None)
+                if _temp is None:
+                    _router = getattr(moe_module, "router", None)
+                    _temp = (
+                        getattr(_router, "temperature", None)
+                        if _router is not None
+                        else None
+                    )
+                if _temp is not None:
+                    metric_logger.update(moe_temperature=float(_temp))
                 # Log EMA expert usage spread for monitoring load balance
                 if hasattr(moe_module, "ema_usage"):
                     ema_u = moe_module.ema_usage
@@ -465,10 +508,7 @@ def evaluate_crowd_no_overlap(
             samples, targets = batch
             depth_map = None
         samples = samples.to(device)
-        if depth_map is not None:
-            outputs = model(samples, depth_map=depth_map)
-        else:
-            outputs = model(samples)
+        outputs = _forward_model(model, samples, depth_map=depth_map)
 
         outputs_scores = torch.nn.functional.softmax(outputs["pred_logits"], -1)[
             :, :, 1
@@ -558,11 +598,7 @@ def collect_scores_and_counts(
             depth_map = None
 
         samples = samples.to(device)
-        outputs = (
-            model(samples, depth_map=depth_map)
-            if depth_map is not None
-            else model(samples)
-        )
+        outputs = _forward_model(model, samples, depth_map=depth_map)
 
         scores = torch.nn.functional.softmax(outputs["pred_logits"], -1)[:, :, 1]
         assert scores.shape[0] == 1, "collect_scores_and_counts expects batch_size=1"

@@ -302,7 +302,14 @@ class DAPNeck(nn.Module):
             dilation=acdr_dilation,
         )
 
-    def forward(self, inputs: list[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        inputs: list[torch.Tensor],
+        return_intermediates: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    ):
         """Forward pass.
 
         Args:
@@ -310,9 +317,14 @@ class DAPNeck(nn.Module):
                 C3: [B, C3_size, H/4,  W/4 ]
                 C4: [B, C4_size, H/8,  W/8 ]
                 C5: [B, C5_size, H/8,  W/8 ] (VGG) or [B, C5_size, H/16, W/16]
+            return_intermediates: If True, also return (P3, P4, P5) intermediate
+                features for cross-scale modules (e.g. SA-DGAT).
 
         Returns:
             Fused feature map [B, feature_size, H/8, W/8].
+            If *return_intermediates*, returns
+            ``(fused, (P3_x, P4_x, P5_x_lowres))`` where P5_x_lowres is at
+            the original low resolution (before upsampling).
         """
         c3, c4, c5 = inputs
 
@@ -341,8 +353,8 @@ class DAPNeck(nn.Module):
 
         P4_down = self.P4_downsampled(P4_x)
         P5_x = P5_x + P4_down
-        P5_x = self.P5_2_bu(P5_x)
-        P5_x = self.P5_upsampled(P5_x)
+        P5_x_out = self.P5_2_bu(P5_x)  # low-res before upsample
+        P5_x = self.P5_upsampled(P5_x_out)
 
         # 4. Fuse all three scales at P4 resolution
         fused = torch.cat([P3_down, P4_x, P5_x], dim=1)
@@ -351,4 +363,6 @@ class DAPNeck(nn.Module):
         # 5. ACDR: density-adaptive routing
         out = self.acdr(out)
 
+        if return_intermediates:
+            return out, (P3_x, P4_x, P5_x_out)
         return out

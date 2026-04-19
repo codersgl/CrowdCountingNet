@@ -161,6 +161,15 @@ focal_loss:
   alpha: 0.75 # Foreground weight (only effective without class_weight)
   gamma: 2.0 # Focusing parameter; higher = more focus on hard examples
 
+# Quality Focal Loss (disabled by default; mutually exclusive with use_focal_loss)
+# Replaces hard 0/1 classification targets with soft quality labels:
+# matched predictions get exp(-dist/sigma), unmatched get 0.
+# Encodes localisation quality directly into the classification score.
+use_qfl: false
+qfl:
+  beta: 2.0 # Focusing parameter; higher = more focus on hard examples
+  sigma: 10.0 # Distance normalisation for quality target (pixels)
+
 # Deformable Convolution in PA-FPN (disabled by default)
 use_dcn: false
 
@@ -188,6 +197,11 @@ freq_head_kernel: 3 # AvgPool kernel size for low-pass filter
 # Replaces the shared prediction trunk with two independent trunks so that
 # classification and regression tasks learn completely separate features.
 use_decoupled_head: false
+
+# Deep Prediction Head (disabled by default)
+# Replaces the single-layer regression/classification projection with
+# 3-layer Conv3x3 + GroupNorm + ReLU stacks for stronger feature extraction.
+use_deep_head: false
 
 # Sub-Pixel Refinement (disabled by default)
 # For top-K high-confidence points, bilinear-samples from C3 (stride 8) features

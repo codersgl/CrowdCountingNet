@@ -85,6 +85,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         rccformer_deab_blocks=int(getattr(cfg.model, "rccformer_deab_blocks", 2)),
         use_dap_neck=getattr(cfg.model, "use_dap_neck", False),
         dap_neck_cfg=getattr(cfg.model, "dap_neck", None),
+        use_deep_head=getattr(cfg.model, "use_deep_head", False),
     )
 
     if not training:
@@ -110,6 +111,12 @@ def build_model(cfg: DictConfig, training: bool = False):
     focal_alpha = float(getattr(focal_cfg, "alpha", 0.25)) if focal_cfg else 0.25
     focal_gamma = float(getattr(focal_cfg, "gamma", 2.0)) if focal_cfg else 2.0
 
+    # Quality Focal Loss config
+    use_qfl = getattr(cfg.model, "use_qfl", False)
+    qfl_cfg = getattr(cfg.model, "qfl", None)
+    qfl_beta = float(getattr(qfl_cfg, "beta", 2.0)) if qfl_cfg else 2.0
+    qfl_sigma = float(getattr(qfl_cfg, "sigma", 10.0)) if qfl_cfg else 10.0
+
     criterion = SetCriterion_Crowd(
         num_classes=num_classes,
         matcher=matcher,
@@ -121,6 +128,9 @@ def build_model(cfg: DictConfig, training: bool = False):
         focal_gamma=focal_gamma,
         use_uncertainty_weighting=getattr(cfg.model, "use_uncertainty", False),
         uncertainty_boost=float(getattr(cfg.model, "uncertainty_boost", 2.0)),
+        use_qfl=use_qfl,
+        qfl_beta=qfl_beta,
+        qfl_sigma=qfl_sigma,
     )
 
     # Uncertainty weighting (Kendall et al. 2018)

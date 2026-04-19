@@ -16,6 +16,8 @@ from crowdcount.models.gcn import (
 from crowdcount.models.head import (
     ClassificationModel,
     DecoupledPredictionHead,
+    DeepClassificationModel,
+    DeepRegressionModel,
     DensityAttentionMask,
     Density_pred,
     Density_pred_MS,
@@ -152,6 +154,7 @@ class DSGCnet(nn.Module):
         rccformer_deab_blocks: int = 2,
         use_dap_neck: bool = False,
         dap_neck_cfg: DictConfig | None = None,
+        use_deep_head: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
@@ -229,14 +232,24 @@ class DSGCnet(nn.Module):
             if use_decoupled_head
             else SharedPredictionTrunk(in_channels=256, feature_size=256)
         )
-        self.regression = RegressionModel(
-            num_features_in=256, num_anchor_points=num_anchor_points
-        )
-        self.classification = ClassificationModel(
-            num_features_in=256,
-            num_classes=self.num_classes,
-            num_anchor_points=num_anchor_points,
-        )
+        if use_deep_head:
+            self.regression = DeepRegressionModel(
+                num_features_in=256, num_anchor_points=num_anchor_points
+            )
+            self.classification = DeepClassificationModel(
+                num_features_in=256,
+                num_classes=self.num_classes,
+                num_anchor_points=num_anchor_points,
+            )
+        else:
+            self.regression = RegressionModel(
+                num_features_in=256, num_anchor_points=num_anchor_points
+            )
+            self.classification = ClassificationModel(
+                num_features_in=256,
+                num_classes=self.num_classes,
+                num_anchor_points=num_anchor_points,
+            )
 
         self.anchor_points = AnchorPoints(pyramid_levels=[3], row=row, line=line)
         if use_dap_neck:
@@ -1153,7 +1166,7 @@ class DSGCnet(nn.Module):
         # Sub-pixel refinement for dense-region points (optional)
         if self.subpix_refine is not None:
             img_h, img_w = samples.shape[-2], samples.shape[-1]
-            fg_scores = output_class[:, :, 1].sigmoid()
+            fg_scores = F.softmax(output_class, dim=-1)[:, :, 1]
             output_dict["pred_points"] = self.subpix_refine(
                 hr_feat=c3_hr,
                 lr_feat=features_pa,

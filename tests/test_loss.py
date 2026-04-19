@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 
 from crowdcount.models.matcher import HungarianMatcher_Crowd, build_matcher_crowd
 from crowdcount.models.criterion import SetCriterion_Crowd
-from crowdcount.models.criterion import softmax_focal_loss
+from crowdcount.models.criterion import softmax_focal_loss, quality_focal_loss
 
 
 @pytest.fixture
@@ -582,3 +582,135 @@ def test_consistency_img_size_coordinate_mapping(cfg):
     assert losses_fixed["loss_consistency"] < losses_broken["loss_consistency"], (
         "img_size mapping should improve density sampling accuracy"
     )
+
+
+# ---------------------------------------------------------------------------
+# Quality Focal Loss (standalone function)
+# ---------------------------------------------------------------------------
+
+
+def test_qfl_zero_for_perfect_prediction():
+    """When p_fg == target_soft exactly, loss should be near zero."""
+    # Logits that produce softmax fg_prob ≈ 0.8
+    logits = torch.tensor([[0.0, 2.0], [0.0, 2.0]])  # [N=2, C=2]
+    probs_fg = torch.softmax(logits, dim=-1)[:, 1]  # ≈ 0.88
+    loss = quality_focal_loss(logits, probs_fg, beta=2.0)
+    # |y - p|^beta should be ~0, making the loss very small
+    assert loss.item() < 1e-5
+
+
+def test_qfl_positive_for_mismatch():
+    """QFL should be positive when prediction doesn't match soft target."""
+    logits = torch.tensor([[2.0, -2.0], [2.0, -2.0]])  # fg_prob ≈ 0.02
+    targets = torch.tensor([0.9, 0.9])  # expect high fg
+    loss = quality_focal_loss(logits, targets, beta=2.0)
+    assert loss.item() > 0
+
+
+def test_qfl_gradient_flow():
+    """QFL must be differentiable w.r.t. logits."""
+    logits = torch.randn(10, 2, requires_grad=True)
+    targets = torch.rand(10)
+    loss = quality_focal_loss(logits, targets, beta=2.0)
+    loss.backward()
+    assert logits.grad is not None
+    assert logits.grad.abs().sum() > 0
+
+
+def test_qfl_with_class_weight():
+    """QFL should accept class_weight without error."""
+    logits = torch.randn(10, 2)
+    targets = torch.rand(10)
+    cw = torch.tensor([0.5, 1.0])
+    loss = quality_focal_loss(logits, targets, beta=2.0, class_weight=cw)
+    assert loss.isfinite()
+
+
+# ---------------------------------------------------------------------------
+# SetCriterion_Crowd with QFL
+# ---------------------------------------------------------------------------
+
+
+def test_qfl_criterion_loss_keys(dummy_outputs, dummy_targets, cfg):
+    """QFL-enabled criterion should still produce loss_ce key."""
+    matcher = build_matcher_crowd(cfg)
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_points": 0.0002, "loss_count": 0.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points", "count"],
+        use_qfl=True,
+        qfl_beta=2.0,
+        qfl_sigma=10.0,
+    )
+    losses = criterion(dummy_outputs, dummy_targets)
+    assert "loss_ce" in losses
+    assert losses["loss_ce"].isfinite()
+
+
+def test_qfl_criterion_scalar_and_differentiable(dummy_targets, cfg):
+    """QFL loss should be scalar and support backward pass."""
+    matcher = build_matcher_crowd(cfg)
+    B, Q = 2, 20
+    outputs = {
+        "pred_logits": torch.randn(B, Q, 2, requires_grad=True),
+        "pred_points": torch.rand(B, Q, 2) * 128,
+        "density_out": torch.rand(B, 1, 16, 16),
+    }
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_points": 0.0002, "loss_count": 0.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points", "count"],
+        use_qfl=True,
+        qfl_beta=2.0,
+        qfl_sigma=10.0,
+    )
+    losses = criterion(outputs, dummy_targets)
+    assert losses["loss_ce"].dim() == 0
+    losses["loss_ce"].backward()
+    assert outputs["pred_logits"].grad is not None
+
+
+def test_qfl_vs_ce_different(dummy_outputs, dummy_targets, cfg):
+    """QFL and CE should produce different loss_ce values."""
+    matcher = build_matcher_crowd(cfg)
+    ce_crit = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_points": 0.0002, "loss_count": 0.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points", "count"],
+        use_qfl=False,
+    )
+    qfl_crit = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_points": 0.0002, "loss_count": 0.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels", "points", "count"],
+        use_qfl=True,
+        qfl_beta=2.0,
+        qfl_sigma=10.0,
+    )
+    ce_loss = ce_crit(dummy_outputs, dummy_targets)["loss_ce"]
+    qfl_loss = qfl_crit(dummy_outputs, dummy_targets)["loss_ce"]
+    # They should almost certainly differ (different loss formulations)
+    assert not torch.allclose(ce_loss, qfl_loss, atol=1e-6)
+
+
+def test_qfl_focal_mutual_exclusion(cfg):
+    """use_qfl and use_focal_loss cannot both be True."""
+    matcher = build_matcher_crowd(cfg)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SetCriterion_Crowd(
+            num_classes=1,
+            matcher=matcher,
+            weight_dict={"loss_ce": 1, "loss_points": 0.0002, "loss_count": 0.0},
+            eos_coef=cfg.model.eos_coef,
+            losses=["labels", "points", "count"],
+            use_focal_loss=True,
+            use_qfl=True,
+        )

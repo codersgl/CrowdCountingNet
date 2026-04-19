@@ -12,6 +12,8 @@ Contains:
   - ForegroundSuppressionBranch: pixel-level foreground gating with residual pass-through
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -329,7 +331,16 @@ class ClassificationModel(nn.Module):
         self.output = nn.Conv2d(
             num_features_in, num_anchor_points * num_classes, kernel_size=3, padding=1
         )
-        self.output_act = nn.Sigmoid()
+
+        # Focal-loss-friendly bias initialisation:
+        # Set foreground (class 1) bias to -log((1-prior)/prior) so that
+        # initial softmax fg probability ≈ prior (e.g. 0.01).
+        with torch.no_grad():
+            bias_init = torch.zeros(num_anchor_points * num_classes)
+            fg_bias = -math.log((1 - prior) / prior)
+            for a in range(num_anchor_points):
+                bias_init[a * num_classes + 1] = fg_bias  # class 1 = foreground
+            self.output.bias.copy_(bias_init)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.output(x)
@@ -339,6 +350,95 @@ class ClassificationModel(nn.Module):
             batch_size, width, height, self.num_anchor_points, self.num_classes
         )
         return out2.contiguous().view(x.shape[0], -1, self.num_classes)
+
+
+class DeepRegressionModel(nn.Module):
+    """Deep point coordinate regression head with GroupNorm.
+
+    3 intermediate Conv3x3 + GN + ReLU layers followed by a projection
+    Conv3x3.  Drop-in replacement for :class:`RegressionModel` when
+    ``use_deep_head`` is enabled.
+    """
+
+    def __init__(
+        self,
+        num_features_in: int,
+        num_anchor_points: int = 4,
+        feature_size: int = 256,
+        num_layers: int = 3,
+        gn_groups: int = 32,
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        in_ch = num_features_in
+        for _ in range(num_layers):
+            layers.append(nn.Conv2d(in_ch, feature_size, kernel_size=3, padding=1))
+            layers.append(nn.GroupNorm(gn_groups, feature_size))
+            layers.append(nn.ReLU(inplace=True))
+            in_ch = feature_size
+        self.layers = nn.Sequential(*layers)
+        self.output = nn.Conv2d(
+            feature_size, num_anchor_points * 2, kernel_size=3, padding=1
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.layers(x)
+        out = self.output(out)
+        out = out.permute(0, 2, 3, 1)
+        return out.contiguous().view(out.shape[0], -1, 2)
+
+
+class DeepClassificationModel(nn.Module):
+    """Deep point classification head with GroupNorm + prior bias init.
+
+    3 intermediate Conv3x3 + GN + ReLU layers followed by a projection
+    Conv3x3.  Drop-in replacement for :class:`ClassificationModel` when
+    ``use_deep_head`` is enabled.
+    """
+
+    def __init__(
+        self,
+        num_features_in: int,
+        num_anchor_points: int = 4,
+        num_classes: int = 80,
+        prior: float = 0.01,
+        feature_size: int = 256,
+        num_layers: int = 3,
+        gn_groups: int = 32,
+    ) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.num_anchor_points = num_anchor_points
+
+        layers: list[nn.Module] = []
+        in_ch = num_features_in
+        for _ in range(num_layers):
+            layers.append(nn.Conv2d(in_ch, feature_size, kernel_size=3, padding=1))
+            layers.append(nn.GroupNorm(gn_groups, feature_size))
+            layers.append(nn.ReLU(inplace=True))
+            in_ch = feature_size
+        self.layers = nn.Sequential(*layers)
+        self.output = nn.Conv2d(
+            feature_size, num_anchor_points * num_classes, kernel_size=3, padding=1
+        )
+
+        # Focal-loss-friendly bias initialisation
+        with torch.no_grad():
+            bias_init = torch.zeros(num_anchor_points * num_classes)
+            fg_bias = -math.log((1 - prior) / prior)
+            for a in range(num_anchor_points):
+                bias_init[a * num_classes + 1] = fg_bias
+            self.output.bias.copy_(bias_init)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.layers(x)
+        out = self.output(out)
+        out = out.permute(0, 2, 3, 1)
+        batch_size, width, height, _ = out.shape
+        out = out.view(
+            batch_size, width, height, self.num_anchor_points, self.num_classes
+        )
+        return out.contiguous().view(batch_size, -1, self.num_classes)
 
 
 class FreqDecoupledRouter(nn.Module):

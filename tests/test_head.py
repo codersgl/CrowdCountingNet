@@ -8,6 +8,8 @@ import torch
 from crowdcount.models.head import (
     ClassificationModel,
     DecoupledPredictionHead,
+    DeepClassificationModel,
+    DeepRegressionModel,
     DensityAttentionMask,
     Density_pred,
     EnhancedDensityAttention,
@@ -196,6 +198,96 @@ def test_enhanced_density_attention_gradient_flow(feature_map):
     loss.backward()
     assert density.grad is not None and density.grad.abs().sum() > 0
     assert feat.grad is not None and feat.grad.abs().sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# DeepRegressionModel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_anchor_points", [4, 9])
+def test_deep_regression_model_output_shape(feature_map, num_anchor_points):
+    model = DeepRegressionModel(
+        num_features_in=256, num_anchor_points=num_anchor_points
+    )
+    out = model(feature_map)
+    B = feature_map.shape[0]
+    H, W = feature_map.shape[2], feature_map.shape[3]
+    assert out.shape == (B, H * W * num_anchor_points, 2)
+
+
+def test_deep_regression_matches_shallow_interface(feature_map):
+    """DeepRegressionModel is a drop-in replacement for RegressionModel."""
+    shallow = RegressionModel(num_features_in=256, num_anchor_points=4)
+    deep = DeepRegressionModel(num_features_in=256, num_anchor_points=4)
+    assert shallow(feature_map).shape == deep(feature_map).shape
+
+
+# ---------------------------------------------------------------------------
+# DeepClassificationModel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_anchor_points,num_classes", [(4, 2), (9, 2)])
+def test_deep_classification_model_output_shape(
+    feature_map, num_anchor_points, num_classes
+):
+    model = DeepClassificationModel(
+        num_features_in=256,
+        num_anchor_points=num_anchor_points,
+        num_classes=num_classes,
+    )
+    out = model(feature_map)
+    B = feature_map.shape[0]
+    H, W = feature_map.shape[2], feature_map.shape[3]
+    assert out.shape == (B, H * W * num_anchor_points, num_classes)
+
+
+def test_deep_classification_matches_shallow_interface(feature_map):
+    """DeepClassificationModel is a drop-in replacement for ClassificationModel."""
+    shallow = ClassificationModel(
+        num_features_in=256, num_anchor_points=4, num_classes=2
+    )
+    deep = DeepClassificationModel(
+        num_features_in=256, num_anchor_points=4, num_classes=2
+    )
+    assert shallow(feature_map).shape == deep(feature_map).shape
+
+
+def test_deep_classification_bias_init():
+    """Foreground (class 1) bias should be negative; background (class 0) should be ~0."""
+    import math
+
+    model = DeepClassificationModel(
+        num_features_in=256,
+        num_anchor_points=4,
+        num_classes=2,
+        prior=0.01,
+    )
+    bias = model.output.bias.detach()
+    expected_fg = -math.log((1 - 0.01) / 0.01)
+    for a in range(4):
+        assert abs(bias[a * 2 + 0].item()) < 1e-5, "Background bias should be 0"
+        assert abs(bias[a * 2 + 1].item() - expected_fg) < 1e-5, (
+            "Foreground bias should match prior init"
+        )
+
+
+def test_classification_bias_init():
+    """Verify bias init was applied to the original ClassificationModel too."""
+    import math
+
+    model = ClassificationModel(
+        num_features_in=256,
+        num_anchor_points=4,
+        num_classes=2,
+        prior=0.01,
+    )
+    bias = model.output.bias.detach()
+    expected_fg = -math.log((1 - 0.01) / 0.01)
+    for a in range(4):
+        assert abs(bias[a * 2 + 0].item()) < 1e-5
+        assert abs(bias[a * 2 + 1].item() - expected_fg) < 1e-5
 
 
 def test_enhanced_density_attention_residual_nonzero():

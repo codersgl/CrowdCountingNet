@@ -1,5 +1,7 @@
 """SetCriterion for crowd counting (classification + point regression losses)."""
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -59,6 +61,61 @@ def softmax_focal_loss(
     return loss.sum() / w_t.sum().clamp(min=1.0)
 
 
+def quality_focal_loss(
+    inputs: torch.Tensor,
+    targets_soft: torch.Tensor,
+    beta: float = 2.0,
+    class_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Quality Focal Loss (QFL) for soft classification targets.
+
+    Extends focal loss to support continuous quality targets in [0, 1] instead
+    of hard 0/1 labels.  For matched predictions the target encodes localisation
+    quality (e.g. ``exp(-dist / sigma)``); for unmatched predictions it is 0.
+
+    The loss for a single sample with 2-class softmax probability ``p`` and
+    soft target ``y ∈ [0, 1]`` (foreground class) is::
+
+        QFL = -|y - p|^β · [y · log(p) + (1 - y) · log(1 - p)]
+
+    where ``p = softmax(z)[fg_class]`` and β controls focus on hard examples.
+
+    Args:
+        inputs:       [N, 2] raw logits (background, foreground).
+        targets_soft: [N] soft quality target for the foreground class, in [0, 1].
+        beta:         Focusing parameter (default 2.0).
+        class_weight: Optional [2] tensor for background/foreground weighting.
+
+    Returns:
+        Scalar QFL loss (mean-normalised).
+    """
+    probs = F.softmax(inputs, dim=-1)  # [N, 2]
+    p_fg = probs[:, 1]  # foreground probability
+
+    # Binary cross-entropy with soft target (per-sample, no reduction)
+    bce = -(
+        targets_soft * torch.log(p_fg.clamp(min=1e-7))
+        + (1 - targets_soft) * torch.log((1 - p_fg).clamp(min=1e-7))
+    )  # [N]
+
+    # Focusing weight: |y - p|^β
+    focal_weight = (targets_soft - p_fg).abs().pow(beta)  # [N]
+
+    loss = focal_weight * bce  # [N]
+
+    # Optional class weighting: use fg weight for matched, bg weight for unmatched
+    if class_weight is not None:
+        w_t = torch.where(
+            targets_soft > 0,
+            class_weight[1],
+            class_weight[0],
+        )
+        loss = loss * w_t
+        return loss.sum() / w_t.sum().clamp(min=1.0)
+
+    return loss.mean()
+
+
 class SetCriterion_Crowd(nn.Module):
     def __init__(
         self,
@@ -72,6 +129,9 @@ class SetCriterion_Crowd(nn.Module):
         focal_gamma: float = 2.0,
         use_uncertainty_weighting: bool = False,
         uncertainty_boost: float = 2.0,
+        use_qfl: bool = False,
+        qfl_beta: float = 2.0,
+        qfl_sigma: float = 10.0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -84,6 +144,13 @@ class SetCriterion_Crowd(nn.Module):
         self.focal_gamma = focal_gamma
         self.use_uncertainty_weighting = use_uncertainty_weighting
         self.uncertainty_boost = uncertainty_boost
+        if use_qfl and use_focal_loss:
+            raise ValueError(
+                "use_qfl and use_focal_loss are mutually exclusive; enable only one."
+            )
+        self.use_qfl = use_qfl
+        self.qfl_beta = qfl_beta
+        self.qfl_sigma = qfl_sigma
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[0] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
@@ -101,7 +168,31 @@ class SetCriterion_Crowd(nn.Module):
         )
         target_classes[idx] = target_classes_o
 
-        if self.use_focal_loss:
+        if self.use_qfl:
+            # Quality Focal Loss: soft targets encoding localisation quality
+            assert "pred_points" in outputs
+            src_points = outputs["pred_points"]  # [B, Q, 2]
+
+            # Build soft quality target: 0 for unmatched, exp(-dist/sigma) for matched
+            soft_targets = torch.zeros(
+                src_logits.shape[:2], device=src_logits.device
+            )  # [B, Q]
+            # Compute quality scores for matched predictions
+            matched_src_pts = src_points[idx]  # [M, 2]
+            matched_gt_pts = torch.cat(
+                [t["point"][J] for t, (_, J) in zip(targets, indices)], dim=0
+            )  # [M, 2]
+            dists = (matched_src_pts.detach() - matched_gt_pts).pow(2).sum(-1).sqrt()
+            quality = torch.exp(-dists / self.qfl_sigma)
+            soft_targets[idx] = quality
+
+            loss_ce = quality_focal_loss(
+                src_logits.flatten(0, 1),  # [B*Q, 2]
+                soft_targets.flatten(0, 1),  # [B*Q]
+                beta=self.qfl_beta,
+                class_weight=self.empty_weight,
+            )
+        elif self.use_focal_loss:
             loss_ce = softmax_focal_loss(
                 src_logits.flatten(0, 1),  # [B*Q, C]
                 target_classes.flatten(0, 1),  # [B*Q]

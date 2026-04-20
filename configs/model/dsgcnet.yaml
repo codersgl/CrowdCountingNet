@@ -134,20 +134,18 @@ sa_dgat:
   num_heads: 4 # attention heads for all sub-modules
   lambda_init: 1.0 # distance penalty coefficient (learnable)
   mu_init: 1.0 # scale matching reward coefficient (learnable)
-  k_local: 12 # local graph neighbours for cross-scale aggregation
-  k_global: 4 # global graph neighbours for cross-scale aggregation
+  local_dilations: [1, 2, 4] # dilated conv rates for local cross-scale graph
+  global_dilations: [1, 3, 6] # dilated conv rates for global cross-scale graph
   num_gat_layers: 2 # stacked occlusion-aware GAT layers
   occ_hidden: 64 # hidden channels for occlusion predictor
   use_depth_prior: false # use depth map for occlusion prediction
   use_cross_scale: true # enable cross-scale graph aggregation (requires FPN intermediates)
   dropout: 0.1
   # Loss weights (0.0 = disabled)
-  bayesian_loss_weight: 0.005 # Bayesian crowd loss on density maps
-  bayesian_sigma: 8.0 # Gaussian sigma for Bayesian loss
-  bayesian_bg_weight: 0.1 # background pixel weight in Bayesian loss
   ranking_loss_weight: 0.001 # local count ranking loss
   ranking_grid_size: 4 # patch grid size for ranking loss
   ranking_num_pairs: 16 # random patch pairs per image
+  ranking_margin: 1.0 # margin for ranking hinge loss
 
 use_dino_inject: false
 dino_inject_variant: dinov2_b

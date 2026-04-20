@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from crowdcount.plugins.sa_dgat import (
-    BayesianCrowdLoss,
     CrossScaleGraphAggregation,
     DeformableGraphAttention,
     LocalCountRankingLoss,
@@ -55,20 +54,20 @@ class TestScalePromptEmbedding:
 
 
 class TestDeformableGraphAttention:
-    def test_output_shape(self, feat):
+    def test_output_shape(self, feat, density):
         mod = DeformableGraphAttention(in_channels=C, num_neighbors=4, num_heads=4)
-        out = mod(feat)
+        out = mod(feat, density=density)
         assert out.shape == feat.shape
 
-    def test_with_scale_weights(self, feat):
+    def test_with_scale_weights(self, feat, density):
         mod = DeformableGraphAttention(in_channels=C, num_neighbors=4, num_heads=4)
         scale_w = torch.randn(B, H * W, 3)
-        out = mod(feat, scale_weights=scale_w)
+        out = mod(feat, scale_weights=scale_w, density=density)
         assert out.shape == feat.shape
 
-    def test_gradient_flow(self, feat):
+    def test_gradient_flow(self, feat, density):
         mod = DeformableGraphAttention(in_channels=C, num_neighbors=4, num_heads=4)
-        out = mod(feat)
+        out = mod(feat, density=density)
         out.sum().backward()
         assert mod.offset_pred[-1].bias.grad is not None
 
@@ -103,7 +102,7 @@ class TestOcclusionAwareGAT:
 class TestCrossScaleGraphAggregation:
     def test_output_shape(self):
         mod = CrossScaleGraphAggregation(
-            in_channels=C, k_local=4, k_global=2, num_heads=4
+            in_channels=C, local_dilations=(1, 2), global_dilations=(1, 3)
         )
         f_local = torch.randn(B, C, H * 2, W * 2)  # High-res
         f_mid = torch.randn(B, C, H, W)  # Mid-res
@@ -113,7 +112,7 @@ class TestCrossScaleGraphAggregation:
 
     def test_gradient_flow(self):
         mod = CrossScaleGraphAggregation(
-            in_channels=C, k_local=4, k_global=2, num_heads=4
+            in_channels=C, local_dilations=(1, 2), global_dilations=(1, 3)
         )
         f_local = torch.randn(B, C, H * 2, W * 2, requires_grad=True)
         f_mid = torch.randn(B, C, H, W, requires_grad=True)
@@ -137,31 +136,6 @@ class TestSubPixelDensityHead:
         mod = SubPixelDensityHead(in_channels=C, hidden_channels=32)
         out = mod(feat)
         assert out.min() >= 0.0  # ReLU at the end
-
-
-# ── BayesianCrowdLoss ─────────────────────────────────────────────
-
-
-class TestBayesianCrowdLoss:
-    def test_scalar_output(self, density):
-        loss_fn = BayesianCrowdLoss(sigma=8.0, background_weight=0.1)
-        pred = torch.rand_like(density)
-        loss = loss_fn(pred, density)
-        assert loss.dim() == 0  # scalar
-        assert loss.item() >= 0.0
-
-    def test_zero_loss_on_match(self):
-        loss_fn = BayesianCrowdLoss()
-        d = torch.rand(1, 1, 8, 8)
-        loss = loss_fn(d, d)
-        assert loss.item() < 1e-6
-
-    def test_gradient_flow(self, density):
-        loss_fn = BayesianCrowdLoss()
-        pred = torch.rand_like(density, requires_grad=True)
-        loss = loss_fn(pred, density)
-        loss.backward()
-        assert pred.grad is not None
 
 
 # ── LocalCountRankingLoss ─────────────────────────────────────────
@@ -204,8 +178,8 @@ class TestSADGATFusion:
             num_scale_prompts=3,
             deformable_k=4,
             num_heads=4,
-            k_local=4,
-            k_global=2,
+            local_dilations=(1, 2),
+            global_dilations=(1, 3),
             use_cross_scale=True,
         )
         p3 = torch.randn(B, C, H * 2, W * 2)

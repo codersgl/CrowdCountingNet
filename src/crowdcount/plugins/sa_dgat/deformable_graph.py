@@ -46,6 +46,13 @@ class DeformableGraphAttention(nn.Module):
         assert in_channels % num_heads == 0
 
         # Offset predictor: for each node, predict K 2D offsets
+        # Input: in_channels + 1 (density channel) for density-guided sampling
+        # Project density channel into feature space first, then use depthwise conv
+        self.density_proj = nn.Sequential(
+            nn.Conv2d(in_channels + 1, in_channels, 1),
+            nn.BatchNorm2d(in_channels),
+            nn.GELU(),
+        )
         self.offset_pred = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, 1, 1, groups=in_channels),
             nn.BatchNorm2d(in_channels),
@@ -121,6 +128,7 @@ class DeformableGraphAttention(nn.Module):
         self,
         x: torch.Tensor,
         scale_weights: torch.Tensor | None = None,
+        density: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -128,6 +136,8 @@ class DeformableGraphAttention(nn.Module):
             x: Feature map [B, C, H, W].
             scale_weights: Optional scale attention weights [B, N, num_prompts]
                 from ScalePromptEmbedding, used for scale-matching bonus.
+            density: Optional density map [B, 1, H', W'] used to guide
+                offset prediction (high-density regions search further).
 
         Returns:
             Updated feature map [B, C, H, W].
@@ -136,8 +146,16 @@ class DeformableGraphAttention(nn.Module):
         N = H * W
         K = self.K
 
-        # Predict offsets
-        offsets = self.offset_pred(x)  # [B, 2K, H, W]
+        # Predict offsets with density prior
+        if density is not None:
+            density_resized = F.interpolate(
+                density, size=(H, W), mode="bilinear", align_corners=False
+            )
+        else:
+            density_resized = torch.zeros(B, 1, H, W, device=x.device)
+        offset_input = torch.cat([x, density_resized], dim=1)  # [B, C+1, H, W]
+        offset_feat = self.density_proj(offset_input)  # [B, C, H, W]
+        offsets = self.offset_pred(offset_feat)  # [B, 2K, H, W]
 
         # Sample neighbour features
         neighbor_feats, sample_coords = self._sample_neighbors(x, offsets)

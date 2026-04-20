@@ -380,41 +380,15 @@ def train_one_epoch(
         else:
             loss_sum = losses + density_loss + moe_aux_component + fg_loss
 
-        # SA-DGAT auxiliary losses: Bayesian crowd loss + local count ranking loss
-        sa_dgat_bayesian_loss = torch.tensor(0.0, device=samples.device)
+        # SA-DGAT auxiliary losses: local count ranking loss
         sa_dgat_ranking_loss = torch.tensor(0.0, device=samples.device)
         if fusion_mode == "sa_dgat" and cfg is not None:
             _sa_dgat_cfg = getattr(getattr(cfg, "model", None), "sa_dgat", None)
-            bayesian_weight = float(
-                getattr(_sa_dgat_cfg, "bayesian_loss_weight", 0.0)
-                if _sa_dgat_cfg is not None
-                else 0.0
-            )
             ranking_weight = float(
                 getattr(_sa_dgat_cfg, "ranking_loss_weight", 0.0)
                 if _sa_dgat_cfg is not None
                 else 0.0
             )
-            if bayesian_weight > 0:
-                from crowdcount.plugins.sa_dgat.bayesian_loss import BayesianCrowdLoss
-
-                if not hasattr(train_one_epoch, "_bayesian_loss"):
-                    train_one_epoch._bayesian_loss = BayesianCrowdLoss(
-                        sigma=float(
-                            getattr(_sa_dgat_cfg, "bayesian_sigma", 8.0)
-                            if _sa_dgat_cfg
-                            else 8.0
-                        ),
-                        background_weight=float(
-                            getattr(_sa_dgat_cfg, "bayesian_bg_weight", 0.1)
-                            if _sa_dgat_cfg
-                            else 0.1
-                        ),
-                    ).to(samples.device)
-                sa_dgat_bayesian_loss = (
-                    train_one_epoch._bayesian_loss(et_dmap, gt_dmap) * bayesian_weight
-                )
-                loss_sum = loss_sum + sa_dgat_bayesian_loss
             if ranking_weight > 0:
                 from crowdcount.plugins.sa_dgat.ranking_loss import (
                     LocalCountRankingLoss,
@@ -426,6 +400,11 @@ def train_one_epoch(
                             getattr(_sa_dgat_cfg, "ranking_grid_size", 4)
                             if _sa_dgat_cfg
                             else 4
+                        ),
+                        margin=float(
+                            getattr(_sa_dgat_cfg, "ranking_margin", 1.0)
+                            if _sa_dgat_cfg
+                            else 1.0
                         ),
                         num_pairs=int(
                             getattr(_sa_dgat_cfg, "ranking_num_pairs", 16)
@@ -477,8 +456,6 @@ def train_one_epoch(
             metric_logger.update(fg_loss=fg_loss.item())
 
         if fusion_mode == "sa_dgat":
-            if sa_dgat_bayesian_loss.item() > 0:
-                metric_logger.update(bayesian_loss=sa_dgat_bayesian_loss.item())
             if sa_dgat_ranking_loss.item() > 0:
                 metric_logger.update(ranking_loss=sa_dgat_ranking_loss.item())
 

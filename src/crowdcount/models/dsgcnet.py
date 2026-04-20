@@ -516,44 +516,26 @@ class DSGCnet(nn.Module):
             _sa_dgat_cfg = (
                 getattr(_sa_cfg, "sa_dgat", None) if _sa_cfg is not None else None
             )
+
+            def _get(key: str, default):
+                return getattr(_sa_dgat_cfg, key, default) if _sa_dgat_cfg else default
+
+            _local_dil = _get("local_dilations", [1, 2, 4])
+            _global_dil = _get("global_dilations", [1, 3, 6])
             self.sa_dgat_fusion = SADGATFusion(
                 in_channels=256,
-                num_scale_prompts=int(getattr(_sa_dgat_cfg, "num_scale_prompts", 5))
-                if _sa_dgat_cfg
-                else 5,
-                deformable_k=int(getattr(_sa_dgat_cfg, "deformable_k", 8))
-                if _sa_dgat_cfg
-                else 8,
-                num_heads=int(getattr(_sa_dgat_cfg, "num_heads", 4))
-                if _sa_dgat_cfg
-                else 4,
-                lambda_init=float(getattr(_sa_dgat_cfg, "lambda_init", 1.0))
-                if _sa_dgat_cfg
-                else 1.0,
-                mu_init=float(getattr(_sa_dgat_cfg, "mu_init", 1.0))
-                if _sa_dgat_cfg
-                else 1.0,
-                k_local=int(getattr(_sa_dgat_cfg, "k_local", 12))
-                if _sa_dgat_cfg
-                else 12,
-                k_global=int(getattr(_sa_dgat_cfg, "k_global", 4))
-                if _sa_dgat_cfg
-                else 4,
-                num_gat_layers=int(getattr(_sa_dgat_cfg, "num_gat_layers", 2))
-                if _sa_dgat_cfg
-                else 2,
-                occ_hidden=int(getattr(_sa_dgat_cfg, "occ_hidden", 64))
-                if _sa_dgat_cfg
-                else 64,
-                use_depth_prior=bool(getattr(_sa_dgat_cfg, "use_depth_prior", False))
-                if _sa_dgat_cfg
-                else False,
-                use_cross_scale=bool(getattr(_sa_dgat_cfg, "use_cross_scale", True))
-                if _sa_dgat_cfg
-                else True,
-                dropout=float(getattr(_sa_dgat_cfg, "dropout", 0.1))
-                if _sa_dgat_cfg
-                else 0.1,
+                num_scale_prompts=int(_get("num_scale_prompts", 5)),
+                deformable_k=int(_get("deformable_k", 8)),
+                num_heads=int(_get("num_heads", 4)),
+                lambda_init=float(_get("lambda_init", 1.0)),
+                mu_init=float(_get("mu_init", 1.0)),
+                local_dilations=tuple(int(d) for d in _local_dil),
+                global_dilations=tuple(int(d) for d in _global_dil),
+                num_gat_layers=int(_get("num_gat_layers", 2)),
+                occ_hidden=int(_get("occ_hidden", 64)),
+                use_depth_prior=bool(_get("use_depth_prior", False)),
+                use_cross_scale=bool(_get("use_cross_scale", True)),
+                dropout=float(_get("dropout", 0.1)),
             )
             self.esca = None
             self.moe = None

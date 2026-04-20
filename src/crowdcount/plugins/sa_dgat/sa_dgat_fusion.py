@@ -31,8 +31,8 @@ class SADGATFusion(nn.Module):
         num_heads: Attention heads for all sub-modules.
         lambda_init: Distance penalty init for deformable graph.
         mu_init: Scale matching reward init.
-        k_local: Local graph neighbours for cross-scale.
-        k_global: Global graph neighbours for cross-scale.
+        local_dilations: Dilation rates for local cross-scale aggregation.
+        global_dilations: Dilation rates for global cross-scale aggregation.
         num_gat_layers: Stacked GAT layers in occlusion module.
         occ_hidden: Hidden channels for occlusion predictor.
         use_depth_prior: Whether to use depth for occlusion.
@@ -49,8 +49,8 @@ class SADGATFusion(nn.Module):
         num_heads: int = 4,
         lambda_init: float = 1.0,
         mu_init: float = 1.0,
-        k_local: int = 12,
-        k_global: int = 4,
+        local_dilations: tuple[int, ...] | list[int] = (1, 2, 4),
+        global_dilations: tuple[int, ...] | list[int] = (1, 3, 6),
         num_gat_layers: int = 2,
         occ_hidden: int = 64,
         use_depth_prior: bool = False,
@@ -92,9 +92,8 @@ class SADGATFusion(nn.Module):
         if use_cross_scale:
             self.cross_scale = CrossScaleGraphAggregation(
                 in_channels=in_channels,
-                k_local=k_local,
-                k_global=k_global,
-                num_heads=num_heads,
+                local_dilations=local_dilations,
+                global_dilations=global_dilations,
                 dropout=dropout,
             )
 
@@ -133,7 +132,8 @@ class SADGATFusion(nn.Module):
         aux["scale_weights"] = scale_weights
 
         # Step 2: Deformable graph attention (dynamic neighbour discovery)
-        x_graph = self.deformable_graph(x, scale_weights=scale_weights)
+        # Density prior guides offset prediction (high-density → search further)
+        x_graph = self.deformable_graph(x, scale_weights=scale_weights, density=density)
 
         # Step 3: Occlusion-aware message passing
         # Re-sample neighbors from x_graph using cached coordinates from step 2.
@@ -157,6 +157,7 @@ class SADGATFusion(nn.Module):
             x_graph,
             neighbor_feats=neighbor_feats,
             depth=depth_map,
+            sample_coords=sample_coords,
         )
         aux["occlusion_map"] = occ_map
 

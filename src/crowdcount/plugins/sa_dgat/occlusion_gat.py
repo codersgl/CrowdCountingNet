@@ -119,6 +119,7 @@ class OcclusionAwareGAT(nn.Module):
         neighbor_feats: torch.Tensor,
         neighbor_mask: torch.Tensor | None = None,
         depth: torch.Tensor | None = None,
+        sample_coords: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
@@ -128,6 +129,9 @@ class OcclusionAwareGAT(nn.Module):
                 (from DeformableGraphAttention's sampling).
             neighbor_mask: Optional [B, N, K] boolean mask for valid neighbours.
             depth: Optional [B, 1, H, W] depth map for occlusion prior.
+            sample_coords: Optional [B, N, K, 2] sampling coordinates in [-1,1]
+                from DeformableGraphAttention, used to sample per-neighbour
+                occlusion values for sender-side damping.
 
         Returns:
             Tuple of:
@@ -141,10 +145,26 @@ class OcclusionAwareGAT(nn.Module):
         occ_map = self.occ_predictor(x, depth)
         occ_flat = occ_map.reshape(B, N)  # [B, N]
 
+        # Sample neighbour occlusion values for sender-side damping
+        occ_neighbor: torch.Tensor | None = None
+        if sample_coords is not None:
+            K = sample_coords.shape[2]
+            flat_coords = sample_coords.reshape(B, N * K, 1, 2)
+            occ_sampled = F.grid_sample(
+                occ_map,
+                flat_coords,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )  # [B, 1, N*K, 1]
+            occ_neighbor = occ_sampled.reshape(B, N, K)  # [B, N, K]
+
         x_flat = x.permute(0, 2, 3, 1).reshape(B, N, C)
 
         for layer in self.layers:
-            x_flat = layer(x_flat, neighbor_feats, occ_flat, neighbor_mask)
+            x_flat = layer(
+                x_flat, neighbor_feats, occ_flat, neighbor_mask, occ_neighbor
+            )
 
         out = x_flat.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
         return out, occ_map
@@ -185,6 +205,7 @@ class _OccGATLayer(nn.Module):
         neighbor_feats: torch.Tensor,
         occ_flat: torch.Tensor,
         neighbor_mask: torch.Tensor | None = None,
+        occ_neighbor: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass for single GAT layer.
 
@@ -193,6 +214,8 @@ class _OccGATLayer(nn.Module):
             neighbor_feats: Neighbour features [B, N, K, C].
             occ_flat: Occlusion rates [B, N] in [0, 1].
             neighbor_mask: Optional [B, N, K] validity mask.
+            occ_neighbor: Optional [B, N, K] per-neighbour occlusion rates
+                for sender-side damping.
 
         Returns:
             Updated node features [B, N, C].
@@ -214,16 +237,11 @@ class _OccGATLayer(nn.Module):
         # Attention scores: [B, num_heads, N, K]
         attn = torch.einsum("bhnd,bhnkd->bhnk", Q, K_proj) / (self.head_dim**0.5)
 
-        # Occlusion modulation on sender side:
-        # Neighbour j sends to node i: scale by (1 - occ_j)
-        # We need occ values for the K sampled neighbours.
-        # Since neighbours are sampled at arbitrary positions, we use
-        # the node-level occlusion as a proxy (neighbour features already
-        # contain the information; the exact occ values are approximated).
-        # For now: apply receiver-side boost: non-occluded receivers get enhanced attention
-        # occ_receiver: [B, N] → [B, 1, N, 1]
-        receiver_boost = (1.0 + occ_flat).unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
-        attn = attn * receiver_boost
+        # Sender-side damping: occluded neighbours send weaker messages.
+        # occ_neighbor [B, N, K] → multiply attn by (1 - occ_j) before softmax
+        if occ_neighbor is not None:
+            sender_damp = (1.0 - occ_neighbor).unsqueeze(1)  # [B, 1, N, K]
+            attn = attn * sender_damp
 
         if neighbor_mask is not None:
             attn = attn.masked_fill(~neighbor_mask.unsqueeze(1), float("-inf"))
@@ -231,8 +249,16 @@ class _OccGATLayer(nn.Module):
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
 
-        # Aggregate
+        # Receiver-side boost (post-softmax): occluded nodes aggregate more
+        # from neighbours to compensate for unreliable self-features.
+        # Applied after softmax so it scales the aggregated message magnitude
+        # rather than distorting the attention distribution.
+        # occ_receiver: [B, N] → [B, 1, N, 1]
+        receiver_boost = (1.0 + occ_flat).unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
+
+        # Aggregate with receiver boost
         out = torch.einsum("bhnk,bhnkd->bhnd", attn, V)
+        out = out * receiver_boost  # scale aggregated messages for occluded nodes
         out = out.permute(0, 2, 1, 3).reshape(B, N, C)
         out = self.out_proj(out)
 

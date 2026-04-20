@@ -17,6 +17,7 @@ from crowdcount.models.gcn import (
     ECAGCNModel,
     FeatureGCNProcessor,
     FeatureGraphBuilder,
+    GATv2Model,
     GCNModel,
     UncertaintyAdaptiveDensityGraphBuilder,
     compute_uncertainty,
@@ -379,4 +380,33 @@ def test_cross_stream_gcn_processor_output_shape(small_feature_map, small_densit
         out_channels=256,
     )
     out = proc(small_density_map, small_feature_map)
+    assert out.shape == small_feature_map.shape
+
+
+# ---------------------------------------------------------------------------
+# GATv2 Model & Processors
+# ---------------------------------------------------------------------------
+
+
+def test_gatv2_model_forward():
+    model = GATv2Model(in_channels=16, hidden_channels=32, out_channels=16, heads=4)
+    x = torch.randn(10, 16)
+    edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long)
+    out = model(x, edge_index)
+    assert out.shape == (10, 16)
+
+
+def test_density_gcn_processor_gatv2(small_feature_map, small_density_map):
+    proc = DensityGCNProcessor(
+        k=2, in_channels=256, hidden_channels=128, out_channels=256, conv_type="gatv2"
+    )
+    out = proc(small_density_map, small_feature_map)
+    assert out.shape == small_feature_map.shape
+
+
+def test_feature_gcn_processor_gatv2(small_feature_map):
+    proc = FeatureGCNProcessor(
+        k=2, in_channels=256, hidden_channels=128, out_channels=256, conv_type="gatv2"
+    )
+    out = proc(small_feature_map)
     assert out.shape == small_feature_map.shape

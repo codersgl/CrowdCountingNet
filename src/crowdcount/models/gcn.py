@@ -7,7 +7,7 @@ Supports fixed-k, adaptive, uncertainty-guided, and super-node graph constructio
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, MessagePassing
+from torch_geometric.nn import GATv2Conv, GCNConv, MessagePassing
 from torch_geometric.utils import add_self_loops
 
 
@@ -432,6 +432,68 @@ class GCNModel(nn.Module):
         return x
 
 
+class GATv2Model(nn.Module):
+    """Two-layer GATv2 with LayerNorm, residual connections, and multi-head attention.
+
+    GATv2 (Brody et al., 2022) computes *dynamic* attention coefficients,
+    making it strictly more expressive than GATv1 for distinguishing
+    neighbour importance — beneficial for density-varying crowd scenes.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        hidden_channels: int = 512,
+        out_channels: int = 256,
+        heads: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        assert hidden_channels % heads == 0, (
+            f"hidden_channels ({hidden_channels}) must be divisible by heads ({heads})"
+        )
+        # Layer 1: multi-head with concat → output dim = hidden_channels
+        self.conv1 = GATv2Conv(
+            in_channels,
+            hidden_channels // heads,
+            heads=heads,
+            concat=True,
+            dropout=dropout,
+            add_self_loops=False,
+        )
+        # Layer 2: multi-head without concat → output dim = out_channels
+        self.conv2 = GATv2Conv(
+            hidden_channels,
+            out_channels,
+            heads=heads,
+            concat=False,
+            dropout=dropout,
+            add_self_loops=False,
+        )
+        self.norm1 = nn.LayerNorm(hidden_channels)
+        self.norm2 = nn.LayerNorm(out_channels)
+        self.dropout = dropout
+        self.res_proj = (
+            nn.Linear(in_channels, out_channels, bias=False)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        residual = x
+        h = self.conv1(x, edge_index)
+        h = self.norm1(h)
+        h = F.gelu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        h = self.conv2(h, edge_index)
+        h = self.norm2(h)
+        h = F.gelu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        return h + self.res_proj(residual)
+
+
 class DensityGCNProcessor(nn.Module):
     def __init__(
         self,
@@ -446,10 +508,12 @@ class DensityGCNProcessor(nn.Module):
         use_uncertainty: bool = False,
         uncertainty_scale: float = 6.0,
         anisotropic: bool = False,
+        conv_type: str = "gcn",
     ):
         super().__init__()
         self._use_uncertainty = use_uncertainty
         self._anisotropic = anisotropic
+        self._conv_type = conv_type
         if use_uncertainty and adaptive:
             self.graph_builder = UncertaintyAdaptiveDensityGraphBuilder(
                 k_base=k,
@@ -464,7 +528,9 @@ class DensityGCNProcessor(nn.Module):
             )
         else:
             self.graph_builder = DensityGraphBuilder(k)
-        if anisotropic:
+        if conv_type == "gatv2":
+            self.gcn = GATv2Model(in_channels, hidden_channels, out_channels)
+        elif anisotropic:
             self.gcn = ECAGCNModel(in_channels, hidden_channels, out_channels)
         else:
             self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
@@ -489,7 +555,7 @@ class DensityGCNProcessor(nn.Module):
         node_features = (
             feature_maps.permute(0, 2, 3, 1).contiguous().view(-1, in_channels)
         )
-        if self._anisotropic:
+        if self._anisotropic and self._conv_type != "gatv2":
             out = self.gcn(node_features, edge_index, edge_attr)
         else:
             out = self.gcn(node_features, edge_index)
@@ -508,16 +574,20 @@ class FeatureGCNProcessor(nn.Module):
         k_max: int = 8,
         sim_threshold: float = 0.5,
         anisotropic: bool = False,
+        conv_type: str = "gcn",
     ):
         super().__init__()
         self._anisotropic = anisotropic
+        self._conv_type = conv_type
         if adaptive:
             self.graph_builder = AdaptiveFeatureGraphBuilder(
                 k_min=k_min, k_max=k_max, sim_threshold=sim_threshold
             )
         else:
             self.graph_builder = FeatureGraphBuilder(k)
-        if anisotropic:
+        if conv_type == "gatv2":
+            self.gcn = GATv2Model(in_channels, hidden_channels, out_channels)
+        elif anisotropic:
             self.gcn = ECAGCNModel(in_channels, hidden_channels, out_channels)
         else:
             self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
@@ -528,7 +598,7 @@ class FeatureGCNProcessor(nn.Module):
             feature_maps
         )
         node_features = feature_maps.permute(0, 2, 3, 1).contiguous().view(-1, C)
-        if self._anisotropic:
+        if self._anisotropic and self._conv_type != "gatv2":
             out = self.gcn(node_features, edge_index, edge_attr)
         else:
             out = self.gcn(node_features, edge_index)

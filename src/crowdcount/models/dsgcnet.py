@@ -145,6 +145,7 @@ class DSGCnet(nn.Module):
         use_uncertainty: bool = False,
         uncertainty_scale: float = 6.0,
         gcn_aniso: bool = False,
+        gcn_conv_type: str = "gcn",
         use_fg_branch: bool = False,
         fg_branch_base: float = 0.5,
         fg_branch_scale: float = 0.5,
@@ -602,6 +603,7 @@ class DSGCnet(nn.Module):
                     use_uncertainty=use_uncertainty,
                     uncertainty_scale=uncertainty_scale,
                     anisotropic=gcn_aniso,
+                    conv_type=gcn_conv_type,
                 )
                 self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(
                     k=gcn_k,
@@ -610,6 +612,7 @@ class DSGCnet(nn.Module):
                     k_max=gcn_k_max,
                     sim_threshold=gcn_sim_threshold,
                     anisotropic=gcn_aniso,
+                    conv_type=gcn_conv_type,
                 )
                 self.alpha: nn.Parameter | None = nn.Parameter(
                     torch.ones(3, dtype=torch.float32)

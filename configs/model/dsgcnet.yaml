@@ -26,6 +26,13 @@ fpn_attention: false # Phase 2: inject attention gates inside PA-FPN
 # Multi-scale density head: dilated conv (d=1,2,3) + residual + Softplus
 use_ms_density_head: false
 
+# Density head version selector (overrides use_ms_density_head when != v1):
+#   v1  — baseline 3×Conv + ReLU (default)
+#   ms  — multi-scale dilated (d=1,2,3) + residual + Softplus
+#   v3  — ASPP-Lite (d=2,4,6) + global pool + residual + Softplus
+density_head_version: v1
+density_head_upsample: false # PixelShuffle 2× upsample (only for v3)
+
 # RCCFormer-style neck: replace PA-FPN with MFFM + DEAB/ASAM density head
 use_rccformer_neck: false
 rccformer_deab_blocks: 2 # Number of DEAB blocks in density prediction branch

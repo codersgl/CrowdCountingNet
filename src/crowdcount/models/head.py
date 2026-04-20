@@ -285,6 +285,105 @@ class Density_pred_MS(nn.Module):
         return self.conv_layers(x)
 
 
+class Density_pred_V3(nn.Module):
+    """ASPP-Lite density head: global context + multi-scale dilation + residual + Softplus.
+
+    Five parallel branches capture density patterns at different receptive-field sizes:
+      - 1×1 conv (point-wise context)
+      - 3×3 dilated conv with d=2, 4, 6 (local → mid → wide context)
+      - Global average pooling (image-level context)
+
+    All branches are fused via concatenation → 1×1 projection with a residual
+    shortcut from the input.  The final regression uses Softplus to ensure
+    non-negative output and smooth gradients near zero.
+
+    Args:
+        in_channels: Number of input feature channels (default 256).
+        upsample: If ``True``, apply PixelShuffle 2× before the regression
+            layers to produce density maps at double spatial resolution.
+    """
+
+    def __init__(self, in_channels: int = 256, upsample: bool = False) -> None:
+        super().__init__()
+        mid = 64  # per-branch output channels
+
+        # --- ASPP parallel branches ---
+        self.b0 = nn.Sequential(
+            nn.Conv2d(in_channels, mid, 1, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+        )
+        self.b1 = nn.Sequential(
+            nn.Conv2d(in_channels, mid, 3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+        )
+        self.b2 = nn.Sequential(
+            nn.Conv2d(in_channels, mid, 3, padding=4, dilation=4, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+        )
+        self.b3 = nn.Sequential(
+            nn.Conv2d(in_channels, mid, 3, padding=6, dilation=6, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+        )
+        # Global context branch
+        self.b4_pool = nn.AdaptiveAvgPool2d(1)
+        self.b4_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid, 1, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+        )
+
+        # --- Fusion ---
+        self.fuse = nn.Sequential(
+            nn.Conv2d(mid * 5, in_channels, 1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
+        )
+
+        # --- Optional PixelShuffle 2× upsample ---
+        self.upsample = upsample
+        if upsample:
+            self.pixel_shuffle = nn.Sequential(
+                nn.Conv2d(in_channels, in_channels * 4, 1, bias=False),
+                nn.PixelShuffle(2),
+            )
+
+        # --- Regression layers ---
+        self.regress = nn.Sequential(
+            nn.Conv2d(in_channels, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, 1),
+            nn.Softplus(beta=1, threshold=20),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ASPP branches
+        y0 = self.b0(x)
+        y1 = self.b1(x)
+        y2 = self.b2(x)
+        y3 = self.b3(x)
+        y4 = self.b4_conv(self.b4_pool(x))
+        y4 = F.interpolate(y4, size=x.shape[2:], mode="bilinear", align_corners=False)
+
+        # Fuse + residual
+        fused = self.fuse(torch.cat([y0, y1, y2, y3, y4], dim=1))
+        out = x + fused  # residual shortcut
+
+        # Optional 2× upsample
+        if self.upsample:
+            out = self.pixel_shuffle(out)
+
+        return self.regress(out)
+
+
 class RegressionModel(nn.Module):
     """Point coordinate regression projection head.
 

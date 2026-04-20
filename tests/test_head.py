@@ -12,6 +12,7 @@ from crowdcount.models.head import (
     DeepRegressionModel,
     DensityAttentionMask,
     Density_pred,
+    Density_pred_V3,
     EnhancedDensityAttention,
     RegressionModel,
     SharedPredictionTrunk,
@@ -39,6 +40,41 @@ def test_density_pred_non_negative(feature_map):
     model = Density_pred()
     out = model(feature_map)
     assert (out >= 0).all(), "Density map should be non-negative (ReLU output)"
+
+
+# ---------------------------------------------------------------------------
+# Density_pred_V3
+# ---------------------------------------------------------------------------
+
+
+def test_density_pred_v3_output_shape(feature_map):
+    model = Density_pred_V3()
+    out = model(feature_map)
+    assert out.shape == (2, 1, 16, 16)
+
+
+def test_density_pred_v3_upsample_shape():
+    x = torch.randn(2, 256, 8, 8)
+    model = Density_pred_V3(upsample=True)
+    out = model(x)
+    assert out.shape == (2, 1, 16, 16), "PixelShuffle 2× should double spatial dims"
+
+
+def test_density_pred_v3_non_negative(feature_map):
+    model = Density_pred_V3()
+    out = model(feature_map)
+    assert (out >= 0).all(), "Density V3 should be non-negative (Softplus output)"
+
+
+def test_density_pred_v3_backward(feature_map):
+    model = Density_pred_V3()
+    out = model(feature_map)
+    loss = out.sum()
+    loss.backward()
+    # Check that gradients flow back to all ASPP branches
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            assert p.grad is not None, f"No gradient for {name}"
 
 
 # ---------------------------------------------------------------------------

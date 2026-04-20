@@ -21,6 +21,7 @@ from crowdcount.models.head import (
     DensityAttentionMask,
     Density_pred,
     Density_pred_MS,
+    Density_pred_V3,
     EnhancedDensityAttention,
     ForegroundSuppressionBranch,
     FreqDecoupledRouter,
@@ -278,8 +279,20 @@ class DSGCnet(nn.Module):
                 else 7,
                 acdr_dilation=int(getattr(_dn, "acdr_dilation", 2)) if _dn else 2,
             )
-            use_ms_density = bool(getattr(cfg.model, "use_ms_density_head", False))
-            self.density_pred = Density_pred_MS() if use_ms_density else Density_pred()
+            density_version = str(getattr(cfg.model, "density_head_version", "v1"))
+            # Backward compat: use_ms_density_head=true upgrades v1→ms
+            if (
+                bool(getattr(cfg.model, "use_ms_density_head", False))
+                and density_version == "v1"
+            ):
+                density_version = "ms"
+            if density_version == "v3":
+                _upsample = bool(getattr(cfg.model, "density_head_upsample", False))
+                self.density_pred = Density_pred_V3(upsample=_upsample)
+            elif density_version == "ms":
+                self.density_pred = Density_pred_MS()
+            else:
+                self.density_pred = Density_pred()
         elif use_rccformer_neck:
             # RCCFormer MFFM neck + DEAB/ASAM density head
             self.msca_decoder = None

@@ -9,7 +9,6 @@ from __future__ import annotations
 import os
 import random
 from pathlib import Path
-from typing import List, Optional
 
 import cv2
 import numpy as np
@@ -32,6 +31,10 @@ class SHHA(Dataset):
         flip: bool = False,
         use_depth: bool = False,
         depth_cfg=None,
+        aug_cfg=None,
+        flip_prob: float = 0.5,
+        num_patches: int = 4,
+        depth_blur_cfg=None,
     ):
         self.root_path = data_root
         self.gt_density = "gt_density_maps"
@@ -41,7 +44,55 @@ class SHHA(Dataset):
                 f"patch_size must be a positive multiple of 8, got {patch_size}"
             )
         self.patch_size = patch_size
+        self.num_patches = num_patches
         split = "train" if train else "test"
+
+        # Parse augmentation config
+        if aug_cfg is None:
+            aug_cfg = {}
+
+        # Color augmentation config
+        color_jitter_cfg = aug_cfg.get("color_jitter", {})
+        self.color_jitter_enabled = color_jitter_cfg.get("enabled", True)
+        self.color_jitter_apply_prob = float(color_jitter_cfg.get("apply_prob", 0.5))
+        self.color_jitter_brightness = float(color_jitter_cfg.get("brightness", 0.5))
+        self.color_jitter_contrast = float(color_jitter_cfg.get("contrast", 0.5))
+        self.color_jitter_saturation = float(color_jitter_cfg.get("saturation", 0.5))
+        self.color_jitter_hue = float(color_jitter_cfg.get("hue", 0.5))
+
+        # Grayscale config
+        grayscale_cfg = aug_cfg.get("random_grayscale", {})
+        self.grayscale_enabled = grayscale_cfg.get("enabled", True)
+        self.grayscale_prob = float(grayscale_cfg.get("prob", 0.5))
+
+        # Random scaling config
+        scale_cfg = aug_cfg.get("random_scale", {})
+        self.scale_enabled = scale_cfg.get("enabled", True)
+        self.scale_min = float(scale_cfg.get("scale_min", 0.7))
+        self.scale_max = float(scale_cfg.get("scale_max", 1.3))
+
+        # Flip probability
+        self.flip_prob = flip_prob
+
+        # Depth blur config
+        if depth_blur_cfg is None:
+            depth_blur_cfg = {}
+        self.depth_blur_kernel = int(depth_blur_cfg.get("kernel_size", 15))
+        self.depth_blur_sigma = float(depth_blur_cfg.get("sigma", 5.0))
+
+        # Validate depth blur kernel size (must be positive odd number)
+        if self.depth_blur_kernel <= 0 or self.depth_blur_kernel % 2 == 0:
+            raise ValueError(
+                f"depth_blur kernel_size must be a positive odd number, got {self.depth_blur_kernel}"
+            )
+
+        # Validate scale range
+        if self.scale_min > self.scale_max:
+            raise ValueError(
+                f"scale_min ({self.scale_min}) must be <= scale_max ({self.scale_max})"
+            )
+        if self.scale_min <= 0:
+            raise ValueError(f"scale_min must be positive, got {self.scale_min}")
 
         if train:
             self.gt_dmap_root = os.path.join(self.root_path, self.gt_density, "train")
@@ -106,7 +157,11 @@ class SHHA(Dataset):
                     os.path.join(self.gt_depth_root, imgname.replace(".jpg", ".npy"))
                 ).astype(np.float32)
                 # Gaussian blur to smooth depth edge discontinuities
-                depth_npy = cv2.GaussianBlur(depth_npy, (15, 15), sigmaX=5)
+                depth_npy = cv2.GaussianBlur(
+                    depth_npy,
+                    (self.depth_blur_kernel, self.depth_blur_kernel),
+                    sigmaX=self.depth_blur_sigma,
+                )
                 # Min-max normalise depth to [0, 1]
                 d_min, d_max = depth_npy.min(), depth_npy.max()
                 if d_max - d_min > 1e-6:
@@ -116,51 +171,66 @@ class SHHA(Dataset):
         img, point = _load_data((img_path, gt_path), self.train)
 
         if self.train:
-            augmentation = transforms.Compose(
-                [
+            aug_list = []
+            # Color jitter augmentation
+            if self.color_jitter_enabled:
+                aug_list.append(
                     transforms.RandomApply(
                         [
                             transforms.ColorJitter(
-                                brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5
+                                brightness=self.color_jitter_brightness,
+                                contrast=self.color_jitter_contrast,
+                                saturation=self.color_jitter_saturation,
+                                hue=self.color_jitter_hue,
                             )
                         ],
-                        p=0.5,
-                    ),
-                    transforms.RandomGrayscale(p=0.5),
-                ]
-            )
-            img = augmentation(img)
+                        p=self.color_jitter_apply_prob,
+                    )
+                )
+            # Random grayscale augmentation
+            if self.grayscale_enabled:
+                aug_list.append(transforms.RandomGrayscale(p=self.grayscale_prob))
+
+            if aug_list:
+                augmentation = transforms.Compose(aug_list)
+                img = augmentation(img)
 
         if self.transform is not None:
             img = self.transform(img)
 
-        if self.train:
-            scale_range = [0.7, 1.3]
+        if self.train and self.scale_enabled:
             min_size = min(img.shape[1:])
-            scale = random.uniform(*scale_range)
             min_crop = self.patch_size if self.patch else 128
-            if scale * min_size > min_crop:
-                img = torch.nn.functional.interpolate(
-                    img.unsqueeze(0),
+            # Dynamic lower bound: ensure scale * min_size > min_crop so the
+            # downstream crop is always feasible. This eliminates the silent
+            # "skip when scale<1 on small images" branch that biased the
+            # effective scale distribution toward zoom-in.
+            effective_min = max(self.scale_min, (min_crop + 1) / float(min_size))
+            effective_max = max(effective_min, self.scale_max)
+            scale = random.uniform(effective_min, effective_max)
+            img = torch.nn.functional.interpolate(
+                img.unsqueeze(0),
+                scale_factor=scale,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+            gt_dmap1 = torch.nn.functional.interpolate(
+                gt_dmap1.unsqueeze(0),
+                scale_factor=scale,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+            dmap_sum = torch.sum(gt_dmap1)
+            if dmap_sum > 0:
+                gt_dmap1 = gt_dmap1 / dmap_sum * torch.sum(gt_dmap)
+            if self.use_depth:
+                gt_depth1 = torch.nn.functional.interpolate(
+                    gt_depth1.unsqueeze(0),
                     scale_factor=scale,
                     mode="bilinear",
                     align_corners=False,
                 ).squeeze(0)
-                gt_dmap1 = torch.nn.functional.interpolate(
-                    gt_dmap1.unsqueeze(0),
-                    scale_factor=scale,
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(0)
-                gt_dmap1 = gt_dmap1 / torch.sum(gt_dmap1) * torch.sum(gt_dmap)
-                if self.use_depth:
-                    gt_depth1 = torch.nn.functional.interpolate(
-                        gt_depth1.unsqueeze(0),
-                        scale_factor=scale,
-                        mode="bilinear",
-                        align_corners=False,
-                    ).squeeze(0)
-                point *= scale
+            point *= scale
 
         if self.train:
             # Build joint augmentation stack: [img(3) + density(1) + depth(1)]
@@ -183,12 +253,15 @@ class SHHA(Dataset):
                 ).squeeze(0)
                 point *= scale_up
             img_with_density, point = _random_crop(
-                img_with_density, point, crop_size=self.patch_size
+                img_with_density,
+                point,
+                num_patch=self.num_patches,
+                crop_size=self.patch_size,
             )
             for i in range(len(point)):
                 point[i] = torch.Tensor(point[i])
 
-        if random.random() > 0.5 and self.train and self.flip:
+        if random.random() < self.flip_prob and self.train and self.flip:
             if img_with_density.ndim == 4:
                 img_with_density = torch.Tensor(img_with_density[:, :, :, ::-1].copy())
                 flip_w = img_with_density.shape[3]
@@ -219,6 +292,12 @@ class SHHA(Dataset):
             if self.use_depth:
                 depth = torch.Tensor(depth)
 
+            # Ensure density has batch dimension for consistent processing
+            if density.ndim == 3:  # [C, H, W] -> [1, C, H, W]
+                density = density.unsqueeze(0)
+            if self.use_depth and depth.ndim == 3:  # [C, H, W] -> [1, C, H, W]
+                depth = depth.unsqueeze(0)
+
         if not self.train:
             point = [point]
             if self.use_depth:
@@ -226,7 +305,11 @@ class SHHA(Dataset):
                     os.path.join(self.gt_depth_root, imgname.replace(".jpg", ".npy"))
                 ).astype(np.float32)
                 # Gaussian blur to smooth depth edge discontinuities
-                depth_npy = cv2.GaussianBlur(depth_npy, (15, 15), sigmaX=5)
+                depth_npy = cv2.GaussianBlur(
+                    depth_npy,
+                    (self.depth_blur_kernel, self.depth_blur_kernel),
+                    sigmaX=self.depth_blur_sigma,
+                )
                 d_min, d_max = depth_npy.min(), depth_npy.max()
                 if d_max - d_min > 1e-6:
                     depth_npy = (depth_npy - d_min) / (d_max - d_min)

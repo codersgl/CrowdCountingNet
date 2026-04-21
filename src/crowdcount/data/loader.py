@@ -11,7 +11,6 @@ import torchvision.transforms as standard_transforms
 from omegaconf import DictConfig
 
 from crowdcount.data.dataset import SHHA
-from crowdcount.data.transforms import DeNormalize
 
 
 def build_dataset(cfg: DictConfig):
@@ -48,6 +47,12 @@ def build_dataset(cfg: DictConfig):
         getattr(getattr(cfg, "model", None), "depth", None) if needs_depth else None
     )
 
+    # Extract augmentation configuration
+    aug_cfg = cfg.data.get("augmentation", None)
+    flip_prob = float(cfg.data.get("flip_prob", 0.5))
+    num_patches = int(cfg.data.get("num_patches", 4))
+    depth_blur_cfg = cfg.data.get("depth_blur", None)
+
     train_set = SHHA(
         data_root,
         train=True,
@@ -57,6 +62,10 @@ def build_dataset(cfg: DictConfig):
         flip=cfg.data.flip,
         use_depth=needs_depth,
         depth_cfg=depth_cfg,
+        aug_cfg=aug_cfg,
+        flip_prob=flip_prob,
+        num_patches=num_patches,
+        depth_blur_cfg=depth_blur_cfg,
     )
     val_set = SHHA(
         data_root,
@@ -64,5 +73,9 @@ def build_dataset(cfg: DictConfig):
         transform=transform,
         use_depth=needs_depth,
         depth_cfg=depth_cfg,
+        aug_cfg=aug_cfg,
+        flip_prob=flip_prob,
+        num_patches=num_patches,
+        depth_blur_cfg=depth_blur_cfg,
     )
     return train_set, val_set

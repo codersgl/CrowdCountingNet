@@ -1,6 +1,38 @@
 dataset: SHHA
 data_root: "data/shanghaitech/part_A_final" # override: data.data_root=/path/to/sha
 batch_size: 8
+
+# === Spatial Transforms ===
 patch: true
 patch_size: 128 # spatial size of each random crop (must be divisible by 8)
+num_patches: 4 # number of patches to extract per sample during training
+
 flip: true
+flip_prob: 0.5 # probability of horizontal flip
+
+# === Training Augmentation ===
+augmentation:
+  # Color augmentation
+  color_jitter:
+    enabled: true
+    apply_prob: 0.5 # probability of applying ColorJitter
+    brightness: 0.4 # brightness jitter range [max(0, 1-b), 1+b]
+    contrast: 0.4 # contrast jitter range [max(0, 1-c), 1+c]
+    saturation: 0.4 # saturation jitter range [max(0, 1-s), 1+s]
+    hue: 0.1 # hue jitter range [-h, h], h in [0, 0.5]
+
+  # Random grayscale conversion
+  random_grayscale:
+    enabled: true
+    prob: 0.1 # probability of converting image to grayscale
+
+  # Random scaling
+  random_scale:
+    enabled: true
+    scale_min: 0.7 # minimum scale factor
+    scale_max: 1.3 # maximum scale factor
+
+# === Depth Map Processing ===
+depth_blur:
+  kernel_size: 15 # Gaussian blur kernel size (must be odd)
+  sigma: 5.0 # Gaussian blur sigma for smoothing depth edges

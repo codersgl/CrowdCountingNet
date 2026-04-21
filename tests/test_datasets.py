@@ -131,3 +131,226 @@ def test_random_crop_output_shape():
     result_img, result_den = _random_crop(img, den, num_patch=2)
     assert result_img.shape == (2, 4, 128, 128)
     assert len(result_den) == 2
+
+
+def test_shha_augmentation_config_default(fake_dataset_root):
+    """Test that default augmentation config values match original hardcoded values."""
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    ds = SHHA(
+        str(fake_dataset_root),
+        train=True,
+        transform=transform,
+        patch=False,
+        flip=False,
+    )
+    # Verify default values match original hardcoded values
+    assert ds.color_jitter_enabled is True
+    assert ds.color_jitter_apply_prob == 0.5
+    assert ds.color_jitter_brightness == 0.5
+    assert ds.color_jitter_contrast == 0.5
+    assert ds.color_jitter_saturation == 0.5
+    assert ds.color_jitter_hue == 0.5
+    assert ds.grayscale_enabled is True
+    assert ds.grayscale_prob == 0.5
+    assert ds.scale_enabled is True
+    assert ds.scale_min == 0.7
+    assert ds.scale_max == 1.3
+    assert ds.flip_prob == 0.5
+    assert ds.num_patches == 4
+    assert ds.depth_blur_kernel == 15
+    assert ds.depth_blur_sigma == 5.0
+
+
+def test_shha_augmentation_config_custom(fake_dataset_root):
+    """Test that custom augmentation config is correctly applied."""
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+
+    # Custom augmentation config
+    aug_cfg = {
+        "color_jitter": {
+            "enabled": False,
+            "apply_prob": 0.3,
+            "brightness": 0.2,
+            "contrast": 0.3,
+            "saturation": 0.4,
+            "hue": 0.1,
+        },
+        "random_grayscale": {
+            "enabled": False,
+            "prob": 0.2,
+        },
+        "random_scale": {
+            "enabled": True,
+            "scale_min": 0.8,
+            "scale_max": 1.2,
+        },
+    }
+
+    depth_blur_cfg = {
+        "kernel_size": 11,
+        "sigma": 3.0,
+    }
+
+    ds = SHHA(
+        str(fake_dataset_root),
+        train=True,
+        transform=transform,
+        patch=False,
+        flip=True,
+        aug_cfg=aug_cfg,
+        flip_prob=0.7,
+        num_patches=8,
+        depth_blur_cfg=depth_blur_cfg,
+    )
+
+    # Verify custom values are applied
+    assert ds.color_jitter_enabled is False
+    assert ds.color_jitter_apply_prob == 0.3
+    assert ds.color_jitter_brightness == 0.2
+    assert ds.color_jitter_contrast == 0.3
+    assert ds.color_jitter_saturation == 0.4
+    assert ds.color_jitter_hue == 0.1
+    assert ds.grayscale_enabled is False
+    assert ds.grayscale_prob == 0.2
+    assert ds.scale_enabled is True
+    assert ds.scale_min == 0.8
+    assert ds.scale_max == 1.2
+    assert ds.flip_prob == 0.7
+    assert ds.num_patches == 8
+    assert ds.depth_blur_kernel == 11
+    assert ds.depth_blur_sigma == 3.0
+
+
+def test_random_crop_custom_num_patches():
+    """Test that _random_crop respects custom num_patch parameter."""
+    img = torch.randn(4, 128, 128)
+    den = np.array([[32.0, 32.0], [64.0, 64.0], [96.0, 96.0]])
+
+    # Test with num_patch=3
+    result_img, result_den = _random_crop(img, den, num_patch=3, crop_size=64)
+    assert result_img.shape == (3, 4, 64, 64)
+    assert len(result_den) == 3
+
+    # Test with num_patch=5
+    result_img, result_den = _random_crop(img, den, num_patch=5, crop_size=64)
+    assert result_img.shape == (5, 4, 64, 64)
+    assert len(result_den) == 5
+
+
+def test_shha_depth_blur_kernel_validation(fake_dataset_root):
+    """Test that invalid depth blur kernel sizes raise ValueError."""
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+
+    # Test even kernel size
+    with pytest.raises(ValueError, match="must be a positive odd number"):
+        SHHA(
+            str(fake_dataset_root),
+            train=True,
+            transform=transform,
+            depth_blur_cfg={"kernel_size": 14},
+        )
+
+    # Test negative kernel size
+    with pytest.raises(ValueError, match="must be a positive odd number"):
+        SHHA(
+            str(fake_dataset_root),
+            train=True,
+            transform=transform,
+            depth_blur_cfg={"kernel_size": -15},
+        )
+
+    # Test zero kernel size
+    with pytest.raises(ValueError, match="must be a positive odd number"):
+        SHHA(
+            str(fake_dataset_root),
+            train=True,
+            transform=transform,
+            depth_blur_cfg={"kernel_size": 0},
+        )
+
+
+def test_shha_scale_range_validation(fake_dataset_root):
+    """Test that invalid scale ranges raise ValueError."""
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+
+    # Test scale_min > scale_max
+    with pytest.raises(ValueError, match="scale_min .* must be <= scale_max"):
+        SHHA(
+            str(fake_dataset_root),
+            train=True,
+            transform=transform,
+            aug_cfg={
+                "random_scale": {
+                    "scale_min": 1.5,
+                    "scale_max": 0.8,
+                }
+            },
+        )
+
+    # Test negative scale_min
+    with pytest.raises(ValueError, match="scale_min must be positive"):
+        SHHA(
+            str(fake_dataset_root),
+            train=True,
+            transform=transform,
+            aug_cfg={
+                "random_scale": {
+                    "scale_min": -0.5,
+                    "scale_max": 1.3,
+                }
+            },
+        )
+
+
+def test_shha_augmentation_disabled_creates_no_transforms(fake_dataset_root):
+    """Test that disabling all augmentations doesn't break the pipeline."""
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+
+    aug_cfg = {
+        "color_jitter": {"enabled": False},
+        "random_grayscale": {"enabled": False},
+        "random_scale": {"enabled": False},
+    }
+
+    ds = SHHA(
+        str(fake_dataset_root),
+        train=True,
+        transform=transform,
+        patch=False,
+        flip=False,
+        aug_cfg=aug_cfg,
+    )
+
+    # Should not raise any errors
+    result = ds[0]
+    # Train mode returns (img, target, density_images) or (img, target, density_images, depth)
+    assert len(result) >= 3
+    img, target, density_images = result[:3]
+    assert isinstance(img, torch.Tensor)
+    assert isinstance(target, list)
+    assert isinstance(density_images, torch.Tensor)

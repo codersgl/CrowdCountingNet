@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from crowdcount.eval.tta import count_from_outputs, tta_predict
 from crowdcount.utils.misc import MetricLogger, SmoothedValue, reduce_dict
 from loguru import logger
 
@@ -541,6 +542,15 @@ def evaluate_crowd_no_overlap(
     )
     maes, mses, density_maes, density_mses = [], [], [], []
 
+    eval_cfg = getattr(cfg, "eval_counting", None) if cfg is not None else None
+    tta_cfg = getattr(cfg, "eval_tta", None) if cfg is not None else None
+    tta_enabled = (
+        bool(getattr(tta_cfg, "enabled", False)) if tta_cfg is not None else False
+    )
+
+    def _forward(samples_in: torch.Tensor, depth_in: torch.Tensor | None) -> dict:
+        return _forward_model(model, samples_in, depth_map=depth_in)
+
     for batch in data_loader:
         if use_depth:
             samples, targets, depth_map = batch
@@ -549,45 +559,22 @@ def evaluate_crowd_no_overlap(
             samples, targets = batch
             depth_map = None
         samples = samples.to(device)
-        outputs = _forward_model(model, samples, depth_map=depth_map)
-
-        outputs_scores = torch.nn.functional.softmax(outputs["pred_logits"], -1)[
-            :, :, 1
-        ]
-        assert outputs_scores.shape[0] == 1, (
-            "evaluate_crowd_no_overlap expects batch_size=1"
-        )
-        outputs_scores = outputs_scores[0]
         gt_cnt = targets[0]["point"].shape[0]
 
-        # Compute density map integral first (needed by density_guided)
-        et_dmap = outputs["density_out"]
-        et_dmap_sum = float(torch.sum(et_dmap).item())
-
-        # Parse counting config
-        eval_cfg = getattr(cfg, "eval_counting", None) if cfg is not None else None
-        counting_method = (
-            str(getattr(eval_cfg, "method", "threshold")) if eval_cfg else "threshold"
-        )
-
-        if counting_method == "density_guided":
-            min_score = float(getattr(eval_cfg, "min_score", 0.3))
-            density_cnt = max(1, round(et_dmap_sum))
-            # Filter by minimum confidence
-            valid_mask = outputs_scores > min_score
-            num_valid = int(valid_mask.sum().item())
-            if num_valid > 0 and density_cnt <= num_valid:
-                # Take top-k scores where k = density_cnt
-                _, topk_indices = outputs_scores[valid_mask].topk(
-                    min(density_cnt, num_valid)
-                )
-                predict_cnt = len(topk_indices)
-            else:
-                # All valid points count (density overestimates or equals)
-                predict_cnt = num_valid
+        if tta_enabled:
+            predict_cnt, et_dmap_sum = tta_predict(
+                samples,
+                depth_map,
+                _forward,
+                tta_cfg=tta_cfg,
+                eval_cfg=eval_cfg,
+            )
         else:
-            threshold = float(getattr(eval_cfg, "threshold", 0.5)) if eval_cfg else 0.5
-            predict_cnt = int((outputs_scores > threshold).sum())
+            outputs = _forward(samples, depth_map)
+            assert outputs["pred_logits"].shape[0] == 1, (
+                "evaluate_crowd_no_overlap expects batch_size=1"
+            )
+            predict_cnt, et_dmap_sum = count_from_outputs(outputs, eval_cfg)
 
         mae = abs(predict_cnt - gt_cnt)
         mse = (predict_cnt - gt_cnt) ** 2

@@ -91,6 +91,17 @@ eval_counting:
   threshold: 0.5 # Score cutoff used when method="threshold"
   min_score: 0.3 # Minimum confidence filter for density_guided (ignore anchors below this)
 
+# Test-Time Augmentation (TTA) for evaluation.
+# When enabled, runs multiple forward passes per image (flip × scales) and
+# aggregates the per-view predict_cnt / density_sum. Disabled by default to
+# avoid slowing down per-epoch evaluation; enable for final ckpt eval only.
+eval_tta:
+  enabled: false
+  flip: true # horizontal flip augmentation
+  scales: [1.0] # multiplicative input scales; e.g. [0.8, 1.0, 1.2]
+  aggregate: "mean" # "mean" | "median"
+  size_divisor: 128 # snap H/W to this multiple after scaling (VGG-friendly)
+
 # Optimal threshold search: when enabled, searches for the best classification
 # threshold each time a new best MAE is found, and stores it in the checkpoint.
 threshold_search:

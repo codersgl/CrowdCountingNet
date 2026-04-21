@@ -20,7 +20,11 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from crowdcount.data import build_dataset, collate_fn_crowd, collate_fn_crowd_train
-from crowdcount.data.collate import collate_fn_crowd_depth, collate_fn_crowd_train_depth
+from crowdcount.data.collate import (
+    collate_fn_crowd_depth,
+    collate_fn_crowd_train_depth,
+    make_train_collate,
+)
 from crowdcount.engine import (
     collect_scores_and_counts,
     evaluate_crowd_no_overlap,
@@ -175,12 +179,13 @@ class Trainer:
         batch_sampler_train = torch.utils.data.BatchSampler(
             sampler_train, cfg.data.batch_size, drop_last=True
         )
+        train_collate = make_train_collate(
+            getattr(cfg.data, "augmentation", None), use_depth=self._needs_depth
+        )
         self.data_loader_train = DataLoader(
             train_set,
             batch_sampler=batch_sampler_train,
-            collate_fn=collate_fn_crowd_train_depth
-            if self._needs_depth
-            else collate_fn_crowd_train,
+            collate_fn=train_collate,
             num_workers=cfg.num_workers,
         )
         self.data_loader_val = DataLoader(

@@ -71,6 +71,36 @@ class SHHA(Dataset):
         self.scale_min = float(scale_cfg.get("scale_min", 0.7))
         self.scale_max = float(scale_cfg.get("scale_max", 1.3))
 
+        # A1: Random erasing config
+        erasing_cfg = aug_cfg.get("random_erasing", {})
+        self.random_erasing_enabled = bool(erasing_cfg.get("enabled", False))
+        self.random_erasing_prob = float(erasing_cfg.get("prob", 0.5))
+        _scale_range = erasing_cfg.get("scale_range", [0.02, 0.2])
+        _ratio_range = erasing_cfg.get("ratio_range", [0.3, 3.3])
+        self.random_erasing_scale_range = (
+            float(_scale_range[0]),
+            float(_scale_range[1]),
+        )
+        self.random_erasing_ratio_range = (
+            float(_ratio_range[0]),
+            float(_ratio_range[1]),
+        )
+        self.random_erasing_fill = float(erasing_cfg.get("fill", 0.0))
+
+        # A2: Multi-scale patch config
+        msp_cfg = aug_cfg.get("multi_scale_patch", {})
+        self.multi_scale_patch_enabled = bool(msp_cfg.get("enabled", False))
+        _choices = list(msp_cfg.get("patch_size_choices", [96, 128, 192]))
+        if self.multi_scale_patch_enabled:
+            if len(_choices) == 0:
+                raise ValueError("multi_scale_patch.patch_size_choices must be non-empty")
+            for c in _choices:
+                if int(c) <= 0 or int(c) % 8 != 0:
+                    raise ValueError(
+                        f"patch_size_choices entries must be positive multiples of 8, got {c}"
+                    )
+        self.multi_scale_patch_choices = [int(c) for c in _choices]
+
         # Flip probability
         self.flip_prob = flip_prob
 
@@ -241,10 +271,21 @@ class SHHA(Dataset):
                 img_with_density = torch.cat((img, gt_dmap1), dim=0)
 
         if self.train and self.patch:
+            # A2: choose per-call crop size (same for all patches in this call).
+            if self.multi_scale_patch_enabled:
+                hw_min = min(img_with_density.shape[-2:])
+                valid = [c for c in self.multi_scale_patch_choices if c <= hw_min]
+                # Always include canonical patch_size as a safety floor.
+                if not valid:
+                    valid = [self.patch_size]
+                crop_size = random.choice(valid)
+            else:
+                crop_size = self.patch_size
+
             # Ensure image is large enough for cropping
             h, w = img_with_density.shape[-2:]
-            if h < self.patch_size or w < self.patch_size:
-                scale_up = max(self.patch_size / h, self.patch_size / w)
+            if h < crop_size or w < crop_size:
+                scale_up = max(crop_size / h, crop_size / w)
                 img_with_density = torch.nn.functional.interpolate(
                     img_with_density.unsqueeze(0),
                     scale_factor=scale_up,
@@ -256,10 +297,42 @@ class SHHA(Dataset):
                 img_with_density,
                 point,
                 num_patch=self.num_patches,
-                crop_size=self.patch_size,
+                crop_size=crop_size,
             )
             for i in range(len(point)):
                 point[i] = torch.Tensor(point[i])
+
+            # A2: resize each cropped patch back to canonical patch_size and
+            # rescale points; renormalise the density channel to preserve sum.
+            if crop_size != self.patch_size:
+                img_with_density = torch.from_numpy(
+                    np.ascontiguousarray(img_with_density)
+                ).float()
+                density_ch_start = img_with_density.shape[1] - (
+                    2 if self.use_depth else 1
+                )
+                density_ch_end = density_ch_start + 1
+                orig_sums = img_with_density[
+                    :, density_ch_start:density_ch_end
+                ].sum(dim=(2, 3), keepdim=True)
+                img_with_density = torch.nn.functional.interpolate(
+                    img_with_density,
+                    size=(self.patch_size, self.patch_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                new_sums = img_with_density[
+                    :, density_ch_start:density_ch_end
+                ].sum(dim=(2, 3), keepdim=True)
+                factor = orig_sums / new_sums.clamp(min=1e-9)
+                img_with_density[:, density_ch_start:density_ch_end] *= factor
+                pt_scale = float(self.patch_size) / float(crop_size)
+                for i in range(len(point)):
+                    if point[i].numel() > 0:
+                        point[i] = point[i] * pt_scale
+                # Restore numpy dtype so downstream flip's [::-1] slicing works
+                # (PyTorch tensors do not support negative-step slicing).
+                img_with_density = img_with_density.numpy()
 
         if random.random() < self.flip_prob and self.train and self.flip:
             if img_with_density.ndim == 4:
@@ -298,6 +371,33 @@ class SHHA(Dataset):
             if self.use_depth and depth.ndim == 3:  # [C, H, W] -> [1, C, H, W]
                 depth = depth.unsqueeze(0)
 
+            # A1: Random erasing applied independently per patch.
+            # Guarded to the patched 4D path; non-patch path uses 3D img where
+            # img.shape[0] is the channel count, not patch count.
+            if self.random_erasing_enabled and img.ndim == 4:
+                from crowdcount.data.transforms import RandomErasingCount
+
+                eraser = RandomErasingCount(
+                    prob=self.random_erasing_prob,
+                    scale_range=self.random_erasing_scale_range,
+                    ratio_range=self.random_erasing_ratio_range,
+                    fill=self.random_erasing_fill,
+                )
+                num_patches = img.shape[0]
+                for i in range(num_patches):
+                    img_i = img[i]
+                    den_i = density[i]  # [1, H, W]
+                    dep_i = depth[i] if self.use_depth else None
+                    pts_i = point[i]
+                    img_i, pts_i, den_i, dep_i = eraser(
+                        img_i, pts_i, den_i, dep_i
+                    )
+                    img[i] = img_i
+                    density[i] = den_i
+                    if self.use_depth:
+                        depth[i] = dep_i
+                    point[i] = pts_i
+
         if not self.train:
             point = [point]
             if self.use_depth:
@@ -324,19 +424,9 @@ class SHHA(Dataset):
             target[i]["labels"] = torch.ones([point[i].shape[0]]).long()
 
         if self.train:
-            stride = 8  # PA-FPN output stride
-            density_target_h = density.shape[-2] // stride
-            density_target_w = density.shape[-1] // stride
-            density_images = torch.zeros(
-                (density.shape[0], 1, density_target_h, density_target_w),
-                dtype=density.dtype,
-            )
-            for i in range(density.shape[0]):
-                density_img = density[i, 0, :, :]
-                resized_img = density_img.reshape(
-                    [density_target_h, stride, density_target_w, stride]
-                ).sum(axis=(1, 3))
-                density_images[i, 0, :, :] = resized_img
+            from crowdcount.data.transforms import density_resize_stride8
+
+            density_images = density_resize_stride8(density, stride=8)
             if self.use_depth:
                 return img, target, density_images, depth
             return img, target, density_images

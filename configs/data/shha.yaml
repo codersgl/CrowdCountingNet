@@ -26,11 +26,32 @@ augmentation:
     enabled: true
     prob: 0.1 # probability of converting image to grayscale
 
-  # Random scaling
+  # Random scaling (A3: widen via scale_min: 0.5, scale_max: 1.6 for more diversity)
   random_scale:
     enabled: true
     scale_min: 0.7 # minimum scale factor
     scale_max: 1.3 # maximum scale factor
+
+  # A1: Random erasing of rectangle; drops point annotations inside the box.
+  random_erasing:
+    enabled: false
+    prob: 0.5 # probability of applying per patch
+    scale_range: [0.02, 0.2] # erased area as fraction of patch area
+    ratio_range: [0.3, 3.3] # aspect ratio (h/w) of erased box
+    fill: 0.0 # value used to fill the erased region (post-normalisation)
+
+  # A2: Multi-scale random patch (crop at variable size, resize back to patch_size).
+  multi_scale_patch:
+    enabled: false
+    patch_size_choices: [96, 128, 192] # all entries must be positive multiples of 8
+
+  # B3: CopyPasteDense — paste the densest source window onto the sparsest dest
+  # window. Auto-disabled when use_depth=true. Operates at collate level.
+  copy_paste_dense:
+    enabled: false
+    prob: 0.5 # probability per pair within a batch
+    paste_size: 64 # square window size (must be a multiple of 8)
+    feather_sigma: 8.0 # Gaussian feather sigma for blending; 0 => hard paste
 
 # === Depth Map Processing ===
 depth_blur:

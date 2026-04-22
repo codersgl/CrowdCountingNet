@@ -78,22 +78,53 @@ class TestOTLoss:
 
 
 class TestTVLoss:
-    def test_zero_for_constant_map(self) -> None:
+    def test_zero_for_identical_distributions(self) -> None:
         loss_fn = TVLoss()
-        x = torch.ones(2, 1, 8, 8) * 5.0
-        assert loss_fn(x).item() == pytest.approx(0.0, abs=1e-6)
+        x = torch.rand(2, 1, 8, 8).clamp(min=0.01)
+        assert loss_fn(x, x).item() == pytest.approx(0.0, abs=1e-5)
 
-    def test_positive_for_varying_map(self) -> None:
+    def test_positive_for_different_distributions(self) -> None:
         loss_fn = TVLoss()
-        x = torch.randn(2, 1, 8, 8)
-        assert loss_fn(x).item() > 0.0
+        pred = torch.zeros(1, 1, 8, 8)
+        pred[0, 0, 0, 0] = 1.0  # all mass top-left
+        gt = torch.zeros(1, 1, 8, 8)
+        gt[0, 0, 7, 7] = 1.0  # all mass bottom-right
+        # Two disjoint normalised diracs → ‖p̄−q̄‖₁ = 2; ‖z‖₁ = 1 → 2.0
+        assert loss_fn(pred, gt).item() == pytest.approx(2.0, abs=1e-5)
 
-    def test_known_value(self) -> None:
-        """Simple 1x1x2x2 checkerboard."""
+    def test_handles_zero_maps(self) -> None:
+        """All-zero maps must not crash and should yield zero loss."""
         loss_fn = TVLoss()
-        x = torch.tensor([[[[0.0, 1.0], [1.0, 0.0]]]])  # [1,1,2,2]
-        # h-diffs: |1-0|+|0-1| = 2; w-diffs: |1-0|+|0-1| = 2; total = 4
-        assert loss_fn(x).item() == pytest.approx(4.0, abs=1e-5)
+        z = torch.zeros(2, 1, 4, 4)
+        assert loss_fn(z, z).item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_weighted_by_gt_mass(self) -> None:
+        """L_TV scales linearly with GT total mass ‖z‖₁."""
+        loss_fn = TVLoss()
+        pred = torch.zeros(1, 1, 4, 4)
+        pred[0, 0, 0, 0] = 1.0
+        gt_1x = torch.zeros(1, 1, 4, 4)
+        gt_1x[0, 0, 3, 3] = 1.0
+        gt_3x = gt_1x * 3.0  # same shape, 3x mass
+        loss_1x = loss_fn(pred, gt_1x).item()
+        loss_3x = loss_fn(pred, gt_3x).item()
+        assert loss_3x == pytest.approx(3.0 * loss_1x, abs=1e-5)
+
+    def test_invariant_to_pred_scale(self) -> None:
+        """Loss must NOT change when only the predicted mass is rescaled.
+
+        This guards against the trivial-collapse failure mode: weighting by
+        predicted mass would let the model reduce L_TV by shrinking
+        predictions to zero.
+        """
+        loss_fn = TVLoss()
+        pred = torch.zeros(1, 1, 4, 4)
+        pred[0, 0, 0, 0] = 1.0
+        gt = torch.zeros(1, 1, 4, 4)
+        gt[0, 0, 3, 3] = 1.0
+        loss_a = loss_fn(pred, gt).item()
+        loss_b = loss_fn(pred * 0.01, gt).item()  # predict 100x weaker
+        assert loss_a == pytest.approx(loss_b, abs=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +171,22 @@ class TestDMCountLoss:
         loss_b2 = loss_fn(pred2, gt2).item()
         # After engine.py divides by batch_size, per-sample cost should match
         assert loss_b1 / 1 == pytest.approx(loss_b2 / 2, abs=1e-5)
+
+    def test_magnitude_is_count_scale(self) -> None:
+        """DMCount loss magnitude is on the count scale (NOT MSE-sum scale).
+
+        This documents the units of the loss: with λ_count=1 and pred=0, the
+        per-sample loss equals the GT count.  Users must retune
+        ``density_loss_weight`` accordingly when switching from MSE.
+        """
+        loss_fn = DMCountLoss(lambda_count=1.0, lambda_ot=0.0, lambda_tv=0.0)
+        b, h, w = 2, 16, 16
+        pred = torch.zeros(b, 1, h, w)
+        gt = torch.full((b, 1, h, w), 2.0)  # per-sample count = 2 * 16 * 16 = 512
+        # forward returns total * B; engine then /B → total. Per-sample count
+        # error = 512, batch mean = 512, * B = 1024.
+        per_sample_count = 2.0 * h * w
+        assert loss_fn(pred, gt).item() == pytest.approx(per_sample_count * b, abs=1e-3)
 
     def test_zero_weights_disable_components(self) -> None:
         loss_fn = DMCountLoss(lambda_count=0.0, lambda_ot=0.0, lambda_tv=0.0)

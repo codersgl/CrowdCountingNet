@@ -1,16 +1,31 @@
 """DM-Count style density loss for RCCFormer.
 
-Implements the three-component loss from RCCFormer (arXiv:2504.04935) §3.3,
-which follows the DM-Count (Distribution Matching for Crowd Counting) paradigm:
+Implements the three-component loss from DM-Count (Wang et al., NeurIPS 2020,
+arXiv:2009.13077) as adopted by RCCFormer (arXiv:2504.04935) §3.3:
 
-    L_count = L_C(C', C) + λ1 · L_OT(D', D) + λ2 · L_TV(D')
+    L_count = L_C(C', C) + λ1 · L_OT(D', D) + λ2 · L_TV(D', D)
 
 Components:
     - L_C:  Counting loss — L1 or MSE between predicted and GT total counts.
-    - L_OT: Optimal Transport loss — 1D Wasserstein distance computed on
-            H-marginal and W-marginal distributions (closed-form, efficient).
-    - L_TV: Total Variation loss — spatial smoothness regularisation on the
-            predicted density map.
+    - L_OT: Optimal Transport loss — 1D Wasserstein-1 distance on the
+            H-marginal and W-marginal distributions (closed-form via CDFs;
+            this is the RCCFormer simplification of the original 2D Sinkhorn).
+    - L_TV: Total Variation distance between *normalised* predicted and GT
+            density distributions, weighted by the predicted total mass:
+                ‖μ‖₁ · ½ · ‖μ̄ − ẑ‖₁
+            (DM-Count Eq. 5).  Together with L_C and L_OT this provides an
+            upper bound on the true counting error.
+
+Output convention: the combined loss is multiplied by the batch size so that
+the existing engine's ``/B`` step yields the per-sample mean of the three
+components (matching the ``reduction="sum"``-then-``/B`` pattern used for
+MSE).  **Magnitude warning:** DMCount loss is naturally on the scale of the
+crowd count (e.g. O(100)–1000 per sample on ShanghaiTech) whereas
+``MSELoss(reduction="sum")/B`` is on the scale of
+``H·W · (per-pixel density)²`` (e.g. O(1)–10 on the same data).  These
+units are fundamentally different and cannot be reconciled by a constant
+factor; users **must** retune ``cfg.density_loss_weight`` (typically
+lowering it by ~100×) when switching from MSE to DMCount.
 """
 
 from __future__ import annotations
@@ -113,22 +128,59 @@ class OTLoss(nn.Module):
 
 
 class TVLoss(nn.Module):
-    """Anisotropic Total Variation loss on the predicted density map."""
+    """DM-Count Total Variation distribution distance (Eq. 5 of the paper).
 
-    def forward(
-        self, pred: torch.Tensor, _target: torch.Tensor | None = None
-    ) -> torch.Tensor:
+        L_TV = ‖z‖₁ · ‖ μ̄ − ẑ ‖₁
+
+    where ``μ`` is the predicted density, ``z`` is the GT density, and
+    ``μ̄``, ``ẑ`` are their L1-normalised counterparts.  This is a *distribution*
+    TV (between two probability simplices), not the spatial smoothness TV used
+    in image denoising.  Combined with L_C and L_OT it upper-bounds the true
+    counting error (DM-Count Theorem 1).
+
+    Implementation notes:
+    * Weighting uses the **GT** mass ``‖z‖₁`` (constant w.r.t. the model), as
+      in the official `cvlab-stonybrook/DM-Count` implementation.  Weighting
+      by predicted mass would let the model trivially reduce the loss by
+      collapsing predictions toward zero, fighting L_C.
+    * The standard TV distance includes a ½ factor; following the official
+      reference implementation we drop it (it is absorbed into ``lambda_tv``
+      so that ``λ_tv = 0.01`` matches the published recipe).
+    """
+
+    def __init__(self, eps: float = 1e-8) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pred:    [B, 1, H, W] predicted density map.
-            _target: Ignored (accepted for uniform call signature).
+            pred:   [B, 1, H, W] predicted density map (non-negative).
+            target: [B, 1, H, W] ground-truth density map (non-negative).
         Returns:
             Scalar TV loss averaged over the batch.
         """
-        # Horizontal and vertical differences
-        diff_h = (pred[:, :, 1:, :] - pred[:, :, :-1, :]).abs()
-        diff_w = (pred[:, :, :, 1:] - pred[:, :, :, :-1]).abs()
-        return (diff_h.sum(dim=(1, 2, 3)) + diff_w.sum(dim=(1, 2, 3))).mean()
+        # Flatten spatial dims → [B, N]
+        p = pred.flatten(1)
+        q = target.flatten(1)
+
+        p_sum = p.sum(dim=-1, keepdim=True)
+        q_sum = q.sum(dim=-1, keepdim=True)
+
+        # Mask out samples where both pred and GT are near-zero (empty crop):
+        # the normalised distributions are undefined and would inject noise.
+        valid = (p_sum.squeeze(-1) > self.eps) | (q_sum.squeeze(-1) > self.eps)
+
+        p_norm = p / p_sum.clamp(min=self.eps)
+        q_norm = q / q_sum.clamp(min=self.eps)
+
+        # ‖p̄ − q̄‖₁ (no ½ factor; absorbed into λ_tv per official DM-Count code)
+        tv_dist = (p_norm - q_norm).abs().sum(dim=-1)
+
+        # Weight by GT total mass ‖z‖₁ (constant w.r.t. the model)
+        per_sample = q_sum.squeeze(-1).detach() * tv_dist
+        per_sample = per_sample * valid.float()
+        return per_sample.mean()
 
 
 class DMCountLoss(nn.Module):
@@ -174,7 +226,7 @@ class DMCountLoss(nn.Module):
         """
         l_c = self.count_loss(pred, target)
         l_ot = self.ot_loss(pred, target)
-        l_tv = self.tv_loss(pred)
+        l_tv = self.tv_loss(pred, target)
 
         total = self.lambda_count * l_c + self.lambda_ot * l_ot + self.lambda_tv * l_tv
 
@@ -185,8 +237,10 @@ class DMCountLoss(nn.Module):
             "den_tv_loss": l_tv.detach().item(),
         }
 
-        # Multiply by batch size to match the existing MSELoss(reduction="sum")
-        # convention used in engine.py (which divides by batch size afterwards).
+        # Multiply by batch size to undo engine.py's subsequent ``/B`` step,
+        # leaving the per-sample mean of the three components.  Note that
+        # this is NOT magnitude-equivalent to ``MSELoss(reduction="sum")``
+        # -- see the module docstring for the magnitude caveat.
         batch_size = pred.shape[0]
         return total * batch_size
 

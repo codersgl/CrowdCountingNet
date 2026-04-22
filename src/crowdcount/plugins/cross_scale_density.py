@@ -105,21 +105,21 @@ class CrossScaleDensityRefinement(nn.Module):
         """Forward pass with coarse-to-fine refinement.
 
         Args:
-            c3: [B, 256, H/4, W/4] block3 features
-            c4: [B, 512, H/8, W/8] block4 features
-            c5: [B, 512, H/16, W/16] block5 features
+            c3: [B, 256, H/8, W/8] block3 features
+            c4: [B, 512, H/16, W/16] block4 features
+            c5: [B, 512, H/32, W/32] block5 features
 
         Returns:
             Dict with density_block3, density_block4, density_block5
         """
         # Stage 1: coarsest prediction from block5
-        density_block5 = self.head_block5(c5)  # [B, 1, H/16, W/16]
+        density_block5 = self.head_block5(c5)  # [B, 1, H/32, W/32]
 
         # Stage 2: refine to block4 resolution
-        density_block4 = self.refine_5to4(density_block5, c4)  # [B, 1, H/8, W/8]
+        density_block4 = self.refine_5to4(density_block5, c4)  # [B, 1, H/16, W/16]
 
         # Stage 3: refine to block3 resolution
-        density_block3 = self.refine_4to3(density_block4, c3)  # [B, 1, H/4, W/4]
+        density_block3 = self.refine_4to3(density_block4, c3)  # [B, 1, H/8, W/8]
 
         return {
             "density_block3": density_block3,

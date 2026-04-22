@@ -210,100 +210,106 @@ def train_one_epoch(
         if use_multi_scale_density and all(
             k in outputs for k in ["density_block3", "density_block4", "density_block5"]
         ):
-            # Multi-scale density prediction
-            # Resize GT to each prediction shape for robust supervision.
-            gt_density_block3 = F.interpolate(
-                gt_dmap,
-                size=outputs["density_block3"].shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            gt_density_block4 = F.interpolate(
-                gt_dmap,
-                size=outputs["density_block4"].shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            gt_density_block5 = F.interpolate(
-                gt_dmap,
-                size=outputs["density_block5"].shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
+            # Multi-scale density prediction.
+            # Each block predicts a density map at a lower spatial
+            # resolution. We upsample predictions to GT resolution before
+            # computing the loss so that:
+            #   (a) the GT keeps its original count-conserving values, and
+            #   (b) all per-scale losses are directly comparable in magnitude.
+            # Bilinear upsampling preserves pixel values (not the integral),
+            # so we rescale by the area ratio so that
+            # ``sum(pred_upsampled) == sum(pred_original)``. This way the
+            # network is encouraged to produce count-consistent
+            # low-resolution maps rather than count/(scale^2)-scaled maps.
+            gt_size = gt_dmap.shape[-2:]
+            gt_area = float(gt_size[0] * gt_size[1])
 
-            # Compute individual losses
-            loss_block3 = density_criterion(
-                outputs["density_block3"], gt_density_block3
-            )
-            loss_block4 = density_criterion(
-                outputs["density_block4"], gt_density_block4
-            )
-            loss_block5 = density_criterion(
-                outputs["density_block5"], gt_density_block5
-            )
+            def _upsample_count_preserving(d: torch.Tensor) -> torch.Tensor:
+                area_ratio = (d.shape[-2] * d.shape[-1]) / gt_area
+                up = F.interpolate(
+                    d, size=gt_size, mode="bilinear", align_corners=False
+                )
+                return up * area_ratio
+
+            pred_block3 = _upsample_count_preserving(outputs["density_block3"])
+            pred_block4 = _upsample_count_preserving(outputs["density_block4"])
+            pred_block5 = _upsample_count_preserving(outputs["density_block5"])
+
+            loss_block3 = density_criterion(pred_block3, gt_dmap)
+            loss_block4 = density_criterion(pred_block4, gt_dmap)
+            loss_block5 = density_criterion(pred_block5, gt_dmap)
             loss_orig = density_criterion(et_dmap, gt_dmap)
 
-            # Get weights from config
+            # Get weights from config and normalise so that they sum to 1.
+            # This keeps ``density_loss_weight`` semantically equivalent
+            # between single-scale and multi-scale modes.
             weights_cfg = getattr(density_cfg, "weights", None)
             w3 = float(getattr(weights_cfg, "block3", 1.0))
             w4 = float(getattr(weights_cfg, "block4", 1.0))
             w5 = float(getattr(weights_cfg, "block5", 1.0))
             w_orig = float(getattr(weights_cfg, "original", 1.0))
+            w_total = w3 + w4 + w5 + w_orig
+            if w_total <= 0:
+                w_total = 1.0
+            w3 /= w_total
+            w4 /= w_total
+            w5 /= w_total
+            w_orig /= w_total
 
-            # Weighted sum
-            density_loss = (
-                (
-                    w3 * loss_block3
-                    + w4 * loss_block4
-                    + w5 * loss_block5
-                    + w_orig * loss_orig
-                )
-                / gt_dmap.shape[0]
-                * density_loss_weight
+            density_loss_raw = (
+                w3 * loss_block3
+                + w4 * loss_block4
+                + w5 * loss_block5
+                + w_orig * loss_orig
+            ) / gt_dmap.shape[0]
+            if uncertainty_weighter is not None:
+                # UW will apply its own learned weight; skip fixed scale.
+                density_loss = density_loss_raw
+            else:
+                density_loss = density_loss_raw * density_loss_weight
+
+            # Log individual losses for monitoring (in their final units).
+            _log_scale = (
+                1.0 if uncertainty_weighter is not None else density_loss_weight
             )
-
-            # Log individual losses for monitoring
             metric_logger.update(
-                den_loss_block3=(
-                    loss_block3 / gt_dmap.shape[0] * density_loss_weight
-                ).item(),
-                den_loss_block4=(
-                    loss_block4 / gt_dmap.shape[0] * density_loss_weight
-                ).item(),
-                den_loss_block5=(
-                    loss_block5 / gt_dmap.shape[0] * density_loss_weight
-                ).item(),
-                den_loss_orig=(
-                    loss_orig / gt_dmap.shape[0] * density_loss_weight
-                ).item(),
+                den_loss_block3=(loss_block3 / gt_dmap.shape[0] * _log_scale).item(),
+                den_loss_block4=(loss_block4 / gt_dmap.shape[0] * _log_scale).item(),
+                den_loss_block5=(loss_block5 / gt_dmap.shape[0] * _log_scale).item(),
+                den_loss_orig=(loss_orig / gt_dmap.shape[0] * _log_scale).item(),
             )
 
             # Cross-scale consistency loss: enforce aligned predictions
             if consistency_weight > 0:
                 target_size = et_dmap.shape[-2:]
-                d3_aligned = F.interpolate(
-                    outputs["density_block3"],
-                    size=target_size,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                d4_aligned = F.interpolate(
-                    outputs["density_block4"],
-                    size=target_size,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                d5_aligned = F.interpolate(
-                    outputs["density_block5"],
-                    size=target_size,
-                    mode="bilinear",
-                    align_corners=False,
-                )
+                target_area = float(target_size[0] * target_size[1])
+
+                def _to_target_count_preserving(d: torch.Tensor) -> torch.Tensor:
+                    # Mirror the supervision-time rescaling so that the
+                    # low-resolution prediction is interpreted at the same
+                    # count scale as ``et_dmap`` (otherwise count-preserving
+                    # low-res maps -- which intentionally have much larger
+                    # per-pixel values -- would be dragged back down by this
+                    # loss, fighting the main density loss).
+                    area_ratio = (d.shape[-2] * d.shape[-1]) / target_area
+                    up = F.interpolate(
+                        d, size=target_size, mode="bilinear", align_corners=False
+                    )
+                    return up * area_ratio
+
+                d3_aligned = _to_target_count_preserving(outputs["density_block3"])
+                d4_aligned = _to_target_count_preserving(outputs["density_block4"])
+                d5_aligned = _to_target_count_preserving(outputs["density_block5"])
+                # All three predictions are pulled toward the canonical
+                # PA-FPN density (detached). Bidirectional L1 between
+                # sibling outputs would encourage mutual collapse instead
+                # of consistency.
+                teacher = et_dmap.detach()
                 consist_loss = (
                     (
-                        F.l1_loss(d3_aligned, d4_aligned)
-                        + F.l1_loss(d4_aligned, d5_aligned)
-                        + F.l1_loss(d3_aligned, et_dmap.detach())
+                        F.l1_loss(d3_aligned, teacher)
+                        + F.l1_loss(d4_aligned, teacher)
+                        + F.l1_loss(d5_aligned, teacher)
                     )
                     / 3.0
                     * consistency_weight
@@ -311,21 +317,22 @@ def train_one_epoch(
                 density_loss = density_loss + consist_loss
                 metric_logger.update(den_consist=consist_loss.item())
 
-            # Count consistency loss: density integrals should match GT count
-            # Each scale has different spatial resolution, so we normalise by
-            # the number of pixels to compare mean density (≈ count / area).
+            # Count consistency loss: each scale's density integral should
+            # match the GT count. Comparing means across scales is wrong
+            # for count-preserving density maps (mean = count / area, which
+            # depends on resolution). We compare per-sample sums instead.
             if count_consistency_weight > 0:
-                gt_mean = gt_dmap.mean(dim=(1, 2, 3))  # [B]
-                mean_block3 = outputs["density_block3"].mean(dim=(1, 2, 3))
-                mean_block4 = outputs["density_block4"].mean(dim=(1, 2, 3))
-                mean_block5 = outputs["density_block5"].mean(dim=(1, 2, 3))
-                mean_orig = et_dmap.mean(dim=(1, 2, 3))
+                gt_count = gt_dmap.sum(dim=(1, 2, 3)).detach()  # [B]
+                sum_block3 = outputs["density_block3"].sum(dim=(1, 2, 3))
+                sum_block4 = outputs["density_block4"].sum(dim=(1, 2, 3))
+                sum_block5 = outputs["density_block5"].sum(dim=(1, 2, 3))
+                sum_orig = et_dmap.sum(dim=(1, 2, 3))
                 count_loss = (
                     (
-                        F.l1_loss(mean_block3, gt_mean)
-                        + F.l1_loss(mean_block4, gt_mean)
-                        + F.l1_loss(mean_block5, gt_mean)
-                        + F.l1_loss(mean_orig, gt_mean)
+                        F.l1_loss(sum_block3, gt_count)
+                        + F.l1_loss(sum_block4, gt_count)
+                        + F.l1_loss(sum_block5, gt_count)
+                        + F.l1_loss(sum_orig, gt_count)
                     )
                     / 4.0
                     * count_consistency_weight

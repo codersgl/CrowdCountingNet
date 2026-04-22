@@ -48,6 +48,21 @@ def gaussian_filter_density(img: np.ndarray, points: np.ndarray) -> np.ndarray:
     """
     img_shape = [img.shape[0], img.shape[1]]
     density = np.zeros(img_shape, dtype=np.float32)
+    if len(points) == 0:
+        return density
+
+    # Pre-filter out-of-bound points (using rounded coordinates) BEFORE building
+    # the KDTree, otherwise their distances would still corrupt other points'
+    # sigma estimates via k-NN.
+    rounded = np.round(points).astype(np.int64)
+    in_bounds = (
+        (rounded[:, 0] >= 0)
+        & (rounded[:, 0] < img_shape[1])
+        & (rounded[:, 1] >= 0)
+        & (rounded[:, 1] < img_shape[0])
+    )
+    points = points[in_bounds]
+    rounded = rounded[in_bounds]
     gt_count = len(points)
     if gt_count == 0:
         return density
@@ -61,19 +76,17 @@ def gaussian_filter_density(img: np.ndarray, points: np.ndarray) -> np.ndarray:
     if distances.ndim == 1:
         distances = distances[:, np.newaxis]
 
-    for i, pt in enumerate(points):
+    for i in range(gt_count):
         pt2d = np.zeros(img_shape, dtype=np.float32)
-        if 0 <= int(pt[1]) < img_shape[0] and 0 <= int(pt[0]) < img_shape[1]:
-            pt2d[int(pt[1]), int(pt[0])] = 1.0
-        else:
-            continue
+        pt2d[rounded[i, 1], rounded[i, 0]] = 1.0
         if gt_count >= 4:
             sigma = (distances[i][1] + distances[i][2] + distances[i][3]) * 0.1
-        elif gt_count > 1:
+        elif gt_count >= 2:
             # Only 1..2 valid neighbours available; use their mean × 0.3
             valid_dists = distances[i][1:]
             sigma = float(np.mean(valid_dists)) * 0.3
         else:
+            # Single point: no neighbours available, fall back to image-size heuristic
             sigma = np.average(np.array(img_shape)) / 2.0 / 2.0
         density += gaussian_filter(pt2d, sigma, mode="constant")
     return density

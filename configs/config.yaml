@@ -77,13 +77,17 @@ density_multi_scale:
   enabled: false # Enable multi-scale density prediction with auxiliary supervision
   cross_scale_refine: false # Coarse-to-fine refinement (block5→block4→block3)
   fuse_to_gcn: false # Fuse multi-scale densities into a single map for GCN input
-  consistency_weight: 0.0 # Cross-scale pixel-level consistency loss weight (0 = off)
-  count_consistency_weight: 0.0 # Cross-scale count consistency loss weight (0 = off)
+  consistency_weight: 0.0 # Pixel-level L1(pred_scale, et_dmap.detach()) weight (0 = off)
+  count_consistency_weight: 0.0 # Per-sample sum-vs-GT-count L1 weight (0 = off)
+  # Per-scale weights are NORMALISED (divided by their sum) before being
+  # applied, so the relative contribution of each scale is what matters,
+  # not the absolute magnitude. ``density_loss_weight`` keeps its single-
+  # scale meaning regardless of these values.
   weights:
-    block3: 0.5 # Weight for H/8 density loss
-    block4: 1.0 # Weight for H/16 density loss (original scale)
-    block5: 0.5 # Weight for H/32 density loss
-    original: 1.0 # Weight for original PA-FPN density loss
+    block3: 0.5 # Relative weight for the H/8 density loss
+    block4: 1.0 # Relative weight for the H/16 density loss
+    block5: 0.5 # Relative weight for the H/32 density loss
+    original: 1.0 # Relative weight for the original PA-FPN density loss
 
 # Evaluation counting method
 eval_counting:

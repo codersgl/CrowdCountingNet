@@ -3106,3 +3106,12 @@
 2026-04-21 23:32:21 | INFO     | crowdcount.trainer:131 - Number of trainable parameters: 22,613,204
 2026-04-21 23:32:21 | INFO     | crowdcount.trainer:172 - Optimizer: Adam
 2026-04-21 23:32:21 | INFO     | crowdcount.trainer:283 - Scheduler: step_lr (no warmup)
+2026-04-22 21:08:38 | INFO     | crowdcount.trainer:147 - Number of trainable parameters: 22,613,204
+2026-04-22 21:08:38 | INFO     | crowdcount.trainer:188 - Optimizer: Adam
+2026-04-22 21:08:38 | INFO     | crowdcount.trainer:303 - Scheduler: step_lr (no warmup)
+2026-04-22 21:08:39 | INFO     | crowdcount.engine:526 - Averaged stats: lr: 0.000100  loss_sum: 1.2055 (1.2055)  losses: 0.7537 (0.7537)  den_loss: 0.4519 (0.4519)  loss_ce: 0.7489 (0.7489)  loss_points: 0.0048 (0.0048)  loss_ce_unscaled: 0.7489 (0.7489)  loss_points_unscaled: 24.0729 (24.0729)
+2026-04-22 21:08:39 | INFO     | crowdcount.engine:526 - Averaged stats: lr: 0.000100  loss_sum: 1.1394 (1.1580)  losses: 0.7180 (0.7321)  den_loss: 0.4265 (0.4259)  loss_ce: 0.7100 (0.7264)  loss_points: 0.0060 (0.0058)  loss_ce_unscaled: 0.7100 (0.7264)  loss_points_unscaled: 29.9425 (28.8350)
+2026-04-22 21:08:39 | INFO     | crowdcount.engine:526 - Averaged stats: lr: 0.000100  loss_sum: 1.2525 (1.2525)  losses: 0.7621 (0.7621)  den_loss: 0.4905 (0.4905)  loss_ce: 0.7583 (0.7583)  loss_points: 0.0038 (0.0038)  loss_ce_unscaled: 0.7583 (0.7583)  loss_points_unscaled: 18.8709 (18.8709)  den_ssim: 0.0041 (0.0041)
+2026-04-22 21:16:00 | INFO     | crowdcount.trainer:147 - Number of trainable parameters: 22,613,204
+2026-04-22 21:16:00 | INFO     | crowdcount.trainer:188 - Optimizer: Adam
+2026-04-22 21:16:00 | INFO     | crowdcount.trainer:303 - Scheduler: step_lr (no warmup)

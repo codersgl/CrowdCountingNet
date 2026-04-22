@@ -37,6 +37,18 @@ from crowdcount.utils.logging import logger, setup_logger
 from crowdcount.utils.misc import get_rank
 
 
+def _seed_worker(worker_id: int) -> None:
+    """Seed numpy / random inside each DataLoader worker.
+
+    PyTorch already derives a per-worker ``torch`` seed from the base
+    ``generator``; this helper extends the determinism to ``numpy`` and
+    Python's ``random`` module which are used by augmentation transforms.
+    """
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 class Trainer:
     """Encapsulates the complete DSGCNet training pipeline."""
 
@@ -50,6 +62,10 @@ class Trainer:
         torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
+        # Persist for DataLoader worker seeding (see _seed_worker / generator below)
+        self._base_seed = seed
+        self._loader_generator = torch.Generator()
+        self._loader_generator.manual_seed(seed)
 
         # Directories — use Hydra output dir so relative paths aren't broken
         # by the project root working directory.
@@ -187,6 +203,8 @@ class Trainer:
             batch_sampler=batch_sampler_train,
             collate_fn=train_collate,
             num_workers=cfg.num_workers,
+            worker_init_fn=_seed_worker,
+            generator=self._loader_generator,
         )
         self.data_loader_val = DataLoader(
             val_set,
@@ -197,6 +215,8 @@ class Trainer:
             if self._needs_depth
             else collate_fn_crowd,
             num_workers=cfg.num_workers,
+            worker_init_fn=_seed_worker,
+            generator=self._loader_generator,
         )
 
         # Optional: resume from checkpoint

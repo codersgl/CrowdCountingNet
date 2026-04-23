@@ -340,8 +340,26 @@ def train_one_epoch(
                 density_loss = density_loss + count_loss
                 metric_logger.update(den_count_consist=count_loss.item())
         else:
-            # Single-scale density prediction (original behavior)
-            density_loss_raw = density_criterion(et_dmap, gt_dmap) / gt_dmap.shape[0]
+            # Single-scale density prediction (original behavior).
+            # Some density criteria (e.g. Bayesian Loss) are point-supervised
+            # rather than density-map supervised, and consume `targets` and
+            # `image_sizes` directly.  The trainer guards against pairing
+            # such criteria with multi-scale density supervision, so the
+            # branch above never dispatches them.
+            if getattr(density_criterion, "requires_points", False):
+                density_loss_raw = (
+                    density_criterion(
+                        et_dmap,
+                        gt_dmap,
+                        targets=targets,
+                        image_sizes=samples.shape[-2:],
+                    )
+                    / gt_dmap.shape[0]
+                )
+            else:
+                density_loss_raw = (
+                    density_criterion(et_dmap, gt_dmap) / gt_dmap.shape[0]
+                )
             if uncertainty_weighter is not None:
                 # UW will apply its own learned weight; skip fixed scale
                 density_loss = density_loss_raw

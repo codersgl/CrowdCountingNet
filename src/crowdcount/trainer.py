@@ -89,15 +89,43 @@ class Trainer:
         if self.uncertainty_weighter is not None:
             self.uncertainty_weighter.to(self.device)
 
-        # Density criterion: ASACL > DM-Count > MSE (priority order)
+        # Density criterion: Bayesian > ASACL > DM-Count > MSE (priority order)
+        bayesian_cfg = getattr(cfg, "density_bayesian", None)
         asacl_cfg = getattr(cfg, "density_asacl", None)
         dmcount_cfg = getattr(cfg, "density_dmcount", None)
-        if bool(getattr(asacl_cfg, "enabled", False)):
+        if bool(getattr(bayesian_cfg, "enabled", False)):
+            # Bayesian Loss is point-supervised; the multi-scale density
+            # supervision pipeline compares per-block density maps against
+            # the Gaussian-blurred GT density and has no equivalent point
+            # formulation. Refuse to start training in this combination.
+            density_ms_cfg = getattr(cfg, "density_multi_scale", None)
+            if bool(getattr(density_ms_cfg, "enabled", False)):
+                raise ValueError(
+                    "density_bayesian.enabled=true is incompatible with "
+                    "density_multi_scale.enabled=true (BL is point-supervised "
+                    "and has no per-scale GT density to compare against). "
+                    "Disable one of the two."
+                )
+
+            from crowdcount.plugins.bayesian_loss import BayesianLoss
+
+            self.density_criterion: nn.Module = BayesianLoss(
+                sigma=float(getattr(bayesian_cfg, "sigma", 8.0)),
+                use_background=bool(getattr(bayesian_cfg, "use_background", True)),
+                bg_ratio=float(getattr(bayesian_cfg, "bg_ratio", 0.15)),
+                count_loss_type=str(getattr(bayesian_cfg, "count_loss_type", "l1")),
+            ).to(self.device)
+            logger.info(
+                "Using Bayesian Loss density criterion "
+                f"(sigma={float(getattr(bayesian_cfg, 'sigma', 8.0))}, "
+                f"use_background={bool(getattr(bayesian_cfg, 'use_background', True))})"
+            )
+        elif bool(getattr(asacl_cfg, "enabled", False)):
             from crowdcount.plugins.asacl_loss import (
                 AdaptiveStructuralPerceptualLoss,
             )
 
-            self.density_criterion: nn.Module = AdaptiveStructuralPerceptualLoss(
+            self.density_criterion = AdaptiveStructuralPerceptualLoss(
                 beta=float(getattr(asacl_cfg, "beta", 1.0)),
                 lambda_adapt=float(getattr(asacl_cfg, "lambda_adapt", 1.0)),
                 lambda_struct=float(getattr(asacl_cfg, "lambda_struct", 0.5)),

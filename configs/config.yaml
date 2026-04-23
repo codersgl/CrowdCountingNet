@@ -55,6 +55,18 @@ density_asacl:
   lambda_struct: 0.5 # Weight for local SSIM structure loss
   lambda_percept: 0.1 # Weight for VGG perceptual loss
 
+# Bayesian Loss (Ma et al. ICCV 2019): point-supervised density loss that
+# replaces MSE on Gaussian-blurred GT density maps. When enabled, takes
+# priority over ASACL / DM-Count / MSE. Incompatible with multi-scale
+# density supervision (point supervision is single-scale by construction).
+# Note: BL magnitude differs from MSE; retune density_loss_weight accordingly.
+density_bayesian:
+  enabled: false
+  sigma: 8.0 # Gaussian likelihood std (image pixels); paper default for SHTech
+  use_background: true # BL+ background pseudo-point (false → vanilla BL)
+  bg_ratio: 0.15 # Background distance as fraction of max(H_img, W_img)
+  count_loss_type: "l1" # "l1" or "mse"
+
 density_ssim:
   enabled: false # Add SSIM structure loss on the main density map
   weight: 0.005 # Relative weight of SSIM loss before adding into den_loss

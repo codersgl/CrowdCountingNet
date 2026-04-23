@@ -55,6 +55,24 @@ density_asacl:
   lambda_struct: 0.5 # Weight for local SSIM structure loss
   lambda_percept: 0.1 # Weight for VGG perceptual loss
 
+# MDS-Loss: Multi-Domain Structural Loss (density map criterion).
+# Combines L_ACPL (count + density-weighted Smooth-L1), L_GSF (SSIM + Sobel
+# gradient), and L_OT (1D marginal Wasserstein-1) for a structurally aware
+# replacement of MSE. Mutually exclusive with density_ssim (already includes
+# SSIM internally) and with Bayesian / ASACL / DM-Count density losses.
+# Magnitude differs from MSE: retune density_loss_weight (typical 0.1-1.0).
+density_mds:
+  enabled: false
+  lambda_acpl: 1.0 # Weight for ACPL term (always active)
+  lambda_gsf: 0.5 # Weight for SSIM + gradient term (warmup-ramped)
+  lambda_ot: 0.3 # Weight for marginal OT term (warmup-ramped)
+  alpha: 4.0 # ACPL spatial-weight strength (per-sample-normalised GT)
+  beta: 1.0 # GSF Sobel L1 weight (already normalised by GT std)
+  huber_delta_floor: 0.001 # Lower bound for auto-derived Smooth-L1 beta
+  ssim_window_size: 7 # Must be odd; <=7 for 16x16 density maps
+  ssim_sigma: 1.5
+  warmup_epochs: 10 # Linear ramp-up of lambda_gsf / lambda_ot
+
 # Bayesian Loss (Ma et al. ICCV 2019): point-supervised density loss that
 # replaces MSE on Gaussian-blurred GT density maps. When enabled, takes
 # priority over ASACL / DM-Count / MSE. Incompatible with multi-scale

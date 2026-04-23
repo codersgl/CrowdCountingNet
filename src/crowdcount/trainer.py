@@ -89,8 +89,9 @@ class Trainer:
         if self.uncertainty_weighter is not None:
             self.uncertainty_weighter.to(self.device)
 
-        # Density criterion: Bayesian > ASACL > DM-Count > MSE (priority order)
+        # Density criterion: Bayesian > MDS > ASACL > DM-Count > MSE (priority order)
         bayesian_cfg = getattr(cfg, "density_bayesian", None)
+        mds_cfg = getattr(cfg, "density_mds", None)
         asacl_cfg = getattr(cfg, "density_asacl", None)
         dmcount_cfg = getattr(cfg, "density_dmcount", None)
         if bool(getattr(bayesian_cfg, "enabled", False)):
@@ -119,6 +120,34 @@ class Trainer:
                 "Using Bayesian Loss density criterion "
                 f"(sigma={float(getattr(bayesian_cfg, 'sigma', 8.0))}, "
                 f"use_background={bool(getattr(bayesian_cfg, 'use_background', True))})"
+            )
+        elif bool(getattr(mds_cfg, "enabled", False)):
+            # MDS-Loss already includes an SSIM term; refuse to stack it on
+            # top of the generic density_ssim regulariser.
+            density_ssim_cfg_pre = getattr(cfg, "density_ssim", None)
+            if bool(getattr(density_ssim_cfg_pre, "enabled", False)):
+                raise ValueError(
+                    "density_mds.enabled=true is incompatible with "
+                    "density_ssim.enabled=true (MDS already contains an SSIM "
+                    "term in L_GSF). Disable density_ssim."
+                )
+            from crowdcount.plugins.mds_loss import MDSLoss
+
+            self.density_criterion = MDSLoss(
+                lambda_acpl=float(getattr(mds_cfg, "lambda_acpl", 1.0)),
+                lambda_gsf=float(getattr(mds_cfg, "lambda_gsf", 0.5)),
+                lambda_ot=float(getattr(mds_cfg, "lambda_ot", 0.3)),
+                alpha=float(getattr(mds_cfg, "alpha", 4.0)),
+                beta=float(getattr(mds_cfg, "beta", 1.0)),
+                huber_delta_floor=float(getattr(mds_cfg, "huber_delta_floor", 1e-3)),
+                ssim_window_size=int(getattr(mds_cfg, "ssim_window_size", 7)),
+                ssim_sigma=float(getattr(mds_cfg, "ssim_sigma", 1.5)),
+                warmup_epochs=int(getattr(mds_cfg, "warmup_epochs", 10)),
+            ).to(self.device)
+            logger.info(
+                "Using MDS-Loss density criterion "
+                "(L_ACPL + warmup\u00b7(L_GSF + L_OT)); retune "
+                "density_loss_weight (typical 0.1-1.0 vs MSE 0.01)."
             )
         elif bool(getattr(asacl_cfg, "enabled", False)):
             from crowdcount.plugins.asacl_loss import (
@@ -345,6 +374,11 @@ class Trainer:
             moe_module = getattr(self.model, "moe", None)
             if self.use_moe and moe_module is not None:
                 moe_module.update_noise_scale(epoch / cfg.epochs)
+
+            # Inject epoch into density criteria that support it (e.g. MDS warmup)
+            _set_epoch = getattr(self.density_criterion, "set_epoch", None)
+            if callable(_set_epoch):
+                _set_epoch(epoch)
 
             t1 = time.time()
             stat = train_one_epoch(

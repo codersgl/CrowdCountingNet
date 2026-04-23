@@ -14,6 +14,7 @@ from crowdcount.models.head import (
     Density_pred,
     Density_pred_V3,
     EnhancedDensityAttention,
+    GatedDensityAttention,
     RegressionModel,
     SharedPredictionTrunk,
 )
@@ -351,3 +352,66 @@ def test_enhanced_density_attention_sobel_not_learnable():
     buffer_names = {n for n, _ in module.named_buffers()}
     assert "sobel_x" in buffer_names
     assert "sobel_y" in buffer_names
+
+
+# ---------------------------------------------------------------------------
+# GatedDensityAttention
+# ---------------------------------------------------------------------------
+
+
+def test_gated_density_attention_shape():
+    module = GatedDensityAttention(feature_channels=256, hidden_channels=16)
+    density = torch.randn(2, 1, 16, 16)
+    feature = torch.randn(2, 256, 16, 16)
+    out = module(density, feature)
+    assert out.shape == feature.shape
+
+
+def test_gated_density_attention_grad():
+    module = GatedDensityAttention(feature_channels=64, hidden_channels=8)
+    density = torch.randn(2, 1, 8, 8, requires_grad=True)
+    feature = torch.randn(2, 64, 8, 8, requires_grad=True)
+    out = module(density, feature)
+    out.sum().backward()
+    for name, p in module.named_parameters():
+        assert p.grad is not None, f"param {name} has no grad"
+        assert torch.isfinite(p.grad).all(), f"param {name} grad has non-finite"
+
+
+def test_gated_density_attention_init_near_identity():
+    """With gate_init_bias=-2.0 the module should start close to identity."""
+    torch.manual_seed(0)
+    module = GatedDensityAttention(
+        feature_channels=32, hidden_channels=8, gate_init_bias=-2.0
+    )
+    density = torch.randn(2, 1, 8, 8).abs()
+    feature = torch.randn(2, 32, 8, 8)
+    with torch.no_grad():
+        out = module(density, feature)
+    rel_err = (out - feature).abs().mean() / (feature.abs().mean() + 1e-8)
+    # gate ~ sigmoid(-2) ~ 0.12, so |out - feature| should be small
+    assert rel_err.item() < 0.3, f"rel_err={rel_err.item():.4f} too large at init"
+
+
+def test_gated_density_attention_zero_density():
+    """With zero density, d_attn = sigmoid(beta) = 0.5 by default.
+
+    out = feature * (1 - gate + gate * 0.5) = feature * (1 - 0.5 * gate)
+    Output should never be all-zero and should stay close to feature.
+    """
+    module = GatedDensityAttention(feature_channels=32, hidden_channels=8)
+    density = torch.zeros(1, 1, 8, 8)
+    feature = torch.ones(1, 32, 8, 8)
+    with torch.no_grad():
+        out = module(density, feature)
+    assert out.abs().sum() > 0
+    # 1 - 0.5 * sigmoid(any) ∈ [0.5, 1.0], so output ∈ [0.5, 1.0] for feature=1
+    assert (out >= 0.5 - 1e-6).all() and (out <= 1.0 + 1e-6).all()
+
+
+def test_gated_density_attention_param_budget():
+    module = GatedDensityAttention(feature_channels=256, hidden_channels=16)
+    total = sum(p.numel() for p in module.parameters())
+    # density_proj: 1*16*9 = 144; feature_proj: 256*16 = 4096;
+    # gate_conv: 32*1 + 1 = 33; alpha + beta = 2 → ~4275
+    assert total < 10_000, f"Parameter count {total} exceeds 10K budget"

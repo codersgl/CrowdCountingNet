@@ -169,6 +169,74 @@ class EnhancedDensityAttention(nn.Module):
         return feature * (self.base + sa) * ca
 
 
+class GatedDensityAttention(nn.Module):
+    """Feature-conditioned gated density attention.
+
+    Lets the feature itself decide how much density-driven modulation to accept,
+    via a per-pixel gate computed from both the density map and the feature
+    embedding. The output linearly interpolates between the unmodulated feature
+    (gate=0) and a sigmoid density attention applied feature (gate=1):
+
+        d_emb  = ReLU(Conv3x3(density,  hidden))
+        f_emb  = ReLU(Conv1x1(feature,  hidden))
+        gate   = sigmoid(Conv1x1(concat(d_emb, f_emb)))   # [B, 1, H, W]
+        d_attn = sigmoid(density * alpha + beta)           # [B, 1, H, W]
+        out    = feature * (1 - gate + gate * d_attn)
+
+    The final 1x1 conv producing ``gate`` has its bias initialised to
+    ``gate_init_bias`` (default -2.0, sigmoid ≈ 0.12) so that early in training
+    the module is close to identity and does not destabilise the baseline.
+
+    Args:
+        feature_channels: Number of channels in the feature tensor.
+        hidden_channels: Internal width of density / feature embeddings.
+        gate_init_bias: Initial bias for the gate logit conv (lower → closer to
+            identity at init).
+    """
+
+    def __init__(
+        self,
+        feature_channels: int = 256,
+        hidden_channels: int = 16,
+        gate_init_bias: float = -2.0,
+    ) -> None:
+        super().__init__()
+        self.feature_channels = feature_channels
+
+        self.density_proj = nn.Conv2d(
+            1, hidden_channels, kernel_size=3, padding=1, bias=False
+        )
+        self.feature_proj = nn.Conv2d(
+            feature_channels, hidden_channels, kernel_size=1, bias=False
+        )
+        self.gate_conv = nn.Conv2d(2 * hidden_channels, 1, kernel_size=1)
+        # Kaiming-init weights so gradients flow to density_proj / feature_proj
+        # from the very first step, while bias keeps the initial gate close to
+        # zero (sigmoid(-2.0) ≈ 0.12) for near-identity behaviour at init.
+        nn.init.kaiming_normal_(self.gate_conv.weight, nonlinearity="sigmoid")
+        nn.init.constant_(self.gate_conv.bias, gate_init_bias)
+
+        # Density prior parameters (mirrors DensityAttentionMask 'sigmoid' mode)
+        self.alpha = nn.Parameter(torch.tensor(1.0))
+        self.beta = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, density: torch.Tensor, feature: torch.Tensor) -> torch.Tensor:
+        """Apply feature-conditioned gated density modulation.
+
+        Args:
+            density: Density map ``[B, 1, H, W]`` (detach recommended).
+            feature: Feature tensor ``[B, C, H, W]`` to be modulated.
+
+        Returns:
+            Modulated features ``[B, C, H, W]``.
+        """
+        d_emb = F.relu(self.density_proj(density), inplace=True)
+        f_emb = F.relu(self.feature_proj(feature), inplace=True)
+        gate = torch.sigmoid(self.gate_conv(torch.cat([d_emb, f_emb], dim=1)))
+        d_attn = torch.sigmoid(density * self.alpha + self.beta)
+        return feature * (1.0 - gate + gate * d_attn)
+
+
 class SharedPredictionTrunk(nn.Module):
     """Shared 2-layer conv feature extractor for regression and classification heads.
 

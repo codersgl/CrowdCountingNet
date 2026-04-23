@@ -88,6 +88,12 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_dap_neck=getattr(cfg.model, "use_dap_neck", False),
         dap_neck_cfg=getattr(cfg.model, "dap_neck", None),
         use_deep_head=getattr(cfg.model, "use_deep_head", False),
+        use_density_adaptive_fusion=getattr(
+            cfg.model, "use_density_adaptive_fusion", False
+        ),
+        density_adaptive_fusion_cfg=getattr(
+            cfg.model, "density_adaptive_fusion", None
+        ),
     )
 
     if not training:

@@ -213,7 +213,7 @@ def test_gate_weight_is_valid_probability_distribution() -> None:
     assert torch.allclose(row_sums, torch.ones_like(row_sums), rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("mode", ["sigmoid", "learned"])
+@pytest.mark.parametrize("mode", ["sigmoid", "learned", "gated"])
 def test_density_attention_forward_shapes_match(mode: str) -> None:
     backbone = TinyVGGBackbone()
     model = DSGCnet(

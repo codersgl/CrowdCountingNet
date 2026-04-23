@@ -13,7 +13,7 @@ gm_input_dim: 256
 gm_hidden_dim: 128
 gm_spatial: true # true: per-pixel spatial gate | false: legacy global gate
 use_density_attention: false # Use density_out as a spatial attention mask on fused features
-density_attention_mode: sigmoid # sigmoid | learned | enhanced
+density_attention_mode: sigmoid # sigmoid | learned | enhanced | gated
 density_attention_pre_gcn: false # Also inject lightweight density attention before GCN
 density_attention_hidden: 32 # Hidden channels for enhanced mode (controls param budget)
 density_attention_base: 0.5 # Residual base for enhanced mode (prevents full suppression)
@@ -292,3 +292,12 @@ dap_neck:
   use_dcn: false # Use deformable conv in PEEM and FPN 3×3 convs
   acdr_large_kernel: 7 # ACDR context path kernel size
   acdr_dilation: 2 # ACDR context path dilation rate
+
+# Density-Adaptive Fusion (disabled by default)
+# Replaces static alpha / GateMechanism with density-conditioned per-pixel fusion.
+# When enabled in gcn_mode=fixed, alpha and gm are automatically disabled.
+# Dense regions → higher weight on density-GCN; sparse → higher on feature-GCN.
+use_density_adaptive_fusion: false
+density_adaptive_fusion:
+  density_embed_dim: 64 # internal channels for density pattern encoder
+  spatial: true # true: per-pixel [B,3,H,W] | false: per-image [B,3]

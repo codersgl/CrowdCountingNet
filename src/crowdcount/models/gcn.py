@@ -2,6 +2,7 @@
 
 Density-guided and feature-guided graph convolutional processors.
 Supports fixed-k, adaptive, uncertainty-guided, and super-node graph construction strategies.
+Also contains DensityAdaptiveFusion for density-conditioned multi-stream fusion.
 """
 
 import torch
@@ -952,3 +953,151 @@ class SuperNodeGCNProcessor(nn.Module):
         enhanced = pixels + self.gate.tanh() * pixel_update
 
         return enhanced.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+
+
+# ---------------------------------------------------------------------------
+# Density-Adaptive Fusion
+# ---------------------------------------------------------------------------
+
+
+class DensityAdaptiveFusion(nn.Module):
+    """Density-conditioned adaptive fusion for GCN dual-stream outputs.
+
+    Replaces static ``softmax(alpha)`` weights or simple :class:`GateMechanism`
+    with density-aware per-pixel (or per-image) fusion weights.  The key
+    insight is that different spatial regions benefit from different stream
+    emphases:
+
+    - Dense regions → density-GCN stream is more reliable (density similarity
+      captures crowd structure)
+    - Sparse regions → feature-GCN stream is more stable (feature
+      representation is discriminative when density signal is weak)
+    - The PA-FPN baseline stream provides a stable anchor
+
+    Architecture (``spatial=True``):
+
+        d_emb    = Conv3x3→BN→ReLU→Conv3x3→BN→ReLU(density)   # density encoding
+        combined = cat(feat_pa, density_gcn, feature_gcn, d_emb)
+        weights  = softmax(Conv1x1→BN→ReLU→Conv1x1(combined))  # [B, 3, H, W]
+        fused    = w0*feat_pa + w1*density_gcn + w2*feature_gcn
+
+    Architecture (``spatial=False``):
+
+        d_emb    = same density encoding
+        combined = cat(GAP(feat_pa), GAP(density_gcn), GAP(feature_gcn), GAP(d_emb))
+        weights  = softmax(MLP(combined))  # [B, 3]
+        fused    = w0*feat_pa + w1*density_gcn + w2*feature_gcn
+
+    The final Conv1x1 / Linear layer is zero-initialised so that the softmax
+    output starts at uniform [1/3, 1/3, 1/3], preserving the baseline at
+    training start.
+
+    Args:
+        in_channels: Feature channel dimension (default 256).
+        density_embed_dim: Internal channels for density encoding (default 64).
+        spatial: If ``True``, produce per-pixel spatial weights;
+            if ``False``, produce per-image global weights.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        density_embed_dim: int = 64,
+        spatial: bool = True,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.density_embed_dim = density_embed_dim
+        self.spatial = spatial
+
+        # Density encoder: multi-scale pattern extraction
+        self.density_encoder = nn.Sequential(
+            nn.Conv2d(1, density_embed_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(density_embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(density_embed_dim, density_embed_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(density_embed_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        if spatial:
+            # Per-pixel: concatenate all features + density embedding → 3-way softmax
+            combined_ch = 3 * in_channels + density_embed_dim
+            self.weight_proj = nn.Sequential(
+                nn.Conv2d(combined_ch, in_channels, 1, bias=False),
+                nn.BatchNorm2d(in_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_channels, 3, 1),  # 3 streams
+            )
+        else:
+            # Per-image: global average pooling → MLP → 3 weights
+            combined_ch = 3 * in_channels + density_embed_dim
+            self.gap = nn.AdaptiveAvgPool2d(1)
+            self.weight_mlp = nn.Sequential(
+                nn.Linear(combined_ch, in_channels),
+                nn.ReLU(inplace=True),
+                nn.Linear(in_channels, 3),
+            )
+
+        # Zero-init final layer → softmax starts at uniform [1/3, 1/3, 1/3]
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Zero-initialise the final projection so fusion starts uniform."""
+        if self.spatial:
+            nn.init.zeros_(self.weight_proj[-1].weight)
+            nn.init.zeros_(self.weight_proj[-1].bias)
+        else:
+            nn.init.zeros_(self.weight_mlp[-1].weight)
+            nn.init.zeros_(self.weight_mlp[-1].bias)
+
+    def forward(
+        self,
+        features_pa: torch.Tensor,
+        density_gcn_feat: torch.Tensor,
+        feature_gcn_feat: torch.Tensor,
+        density: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute density-adaptive fused features.
+
+        Args:
+            features_pa: [B, C, H, W] PA-FPN baseline features.
+            density_gcn_feat: [B, C, H, W] Density-GCN stream features.
+            feature_gcn_feat: [B, C, H, W] Feature-GCN stream features.
+            density: [B, 1, H, W] Density prediction (should be detached).
+
+        Returns:
+            [B, C, H, W] adaptively fused features.
+        """
+        d_emb = self.density_encoder(density)  # [B, D, H, W]
+
+        if self.spatial:
+            combined = torch.cat(
+                [features_pa, density_gcn_feat, feature_gcn_feat, d_emb], dim=1
+            )
+            weights = F.softmax(
+                self.weight_proj(combined), dim=1
+            )  # [B, 3, H, W]
+            fused = (
+                weights[:, 0:1] * features_pa
+                + weights[:, 1:2] * density_gcn_feat
+                + weights[:, 2:3] * feature_gcn_feat
+            )
+        else:
+            combined = torch.cat(
+                [
+                    self.gap(features_pa),
+                    self.gap(density_gcn_feat),
+                    self.gap(feature_gcn_feat),
+                    self.gap(d_emb),
+                ],
+                dim=1,
+            ).flatten(1)  # [B, 3C + D]
+            weights = F.softmax(self.weight_mlp(combined), dim=1)  # [B, 3]
+            fused = (
+                weights[:, 0].view(-1, 1, 1, 1) * features_pa
+                + weights[:, 1].view(-1, 1, 1, 1) * density_gcn_feat
+                + weights[:, 2].view(-1, 1, 1, 1) * feature_gcn_feat
+            )
+
+        return fused

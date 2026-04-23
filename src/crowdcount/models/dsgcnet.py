@@ -8,6 +8,7 @@ from omegaconf import DictConfig
 from crowdcount.models.anchor import AnchorPoints
 from crowdcount.models.gcn import (
     CrossStreamGCNProcessor,
+    DensityAdaptiveFusion,
     DensityGCNProcessor,
     FeatureGCNProcessor,
     SuperNodeGCNProcessor,
@@ -24,6 +25,7 @@ from crowdcount.models.head import (
     Density_pred_V3,
     EnhancedDensityAttention,
     ForegroundSuppressionBranch,
+    GatedDensityAttention,
     FreqDecoupledRouter,
     PointRefineModule,
     RegressionModel,
@@ -160,6 +162,8 @@ class DSGCnet(nn.Module):
         use_dap_neck: bool = False,
         dap_neck_cfg: DictConfig | None = None,
         use_deep_head: bool = False,
+        use_density_adaptive_fusion: bool = False,
+        density_adaptive_fusion_cfg: DictConfig | None = None,
     ):
         super().__init__()
         self.backbone = backbone
@@ -200,6 +204,7 @@ class DSGCnet(nn.Module):
         self.use_msca_neck = use_msca_neck
         self.use_rccformer_neck = use_rccformer_neck
         self.use_dap_neck = use_dap_neck
+        self.use_density_adaptive_fusion = use_density_adaptive_fusion
 
         _neck_flags = sum(
             [use_msca_neck, use_msca_decoder, use_rccformer_neck, use_dap_neck]
@@ -342,13 +347,23 @@ class DSGCnet(nn.Module):
                     256, 512, 512, use_dcn=use_dcn, fpn_attention=fpn_attention
                 )
             self.density_pred = Density_pred()
-        self.density_attention: DensityAttentionMask | EnhancedDensityAttention | None
+        self.density_attention: (
+            DensityAttentionMask
+            | EnhancedDensityAttention
+            | GatedDensityAttention
+            | None
+        )
         if use_density_attention:
             if density_attention_mode == "enhanced":
                 self.density_attention = EnhancedDensityAttention(
                     feature_channels=256,
                     hidden_channels=density_attention_hidden,
                     base_init=density_attention_base,
+                )
+            elif density_attention_mode == "gated":
+                self.density_attention = GatedDensityAttention(
+                    feature_channels=256,
+                    hidden_channels=density_attention_hidden,
                 )
             else:
                 self.density_attention = DensityAttentionMask(
@@ -628,6 +643,32 @@ class DSGCnet(nn.Module):
                     )
             else:
                 self.gm = None
+
+            # Density-Adaptive Fusion: replaces alpha / gm when enabled
+            if use_density_adaptive_fusion and gcn_mode == "fixed":
+                _daf_cfg = density_adaptive_fusion_cfg
+                _daf_embed = (
+                    int(getattr(_daf_cfg, "density_embed_dim", 64))
+                    if _daf_cfg is not None
+                    else 64
+                )
+                _daf_spatial = (
+                    bool(getattr(_daf_cfg, "spatial", True))
+                    if _daf_cfg is not None
+                    else True
+                )
+                self.density_adaptive_fusion: DensityAdaptiveFusion | None = (
+                    DensityAdaptiveFusion(
+                        in_channels=256,
+                        density_embed_dim=_daf_embed,
+                        spatial=_daf_spatial,
+                    )
+                )
+                # When density-adaptive fusion is active, disable alpha and gm
+                self.alpha = None
+                self.gm = None
+            else:
+                self.density_adaptive_fusion = None
             self.esca = None
             self.moe = None
             self.graph_attn_moe = None
@@ -1179,6 +1220,12 @@ class DSGCnet(nn.Module):
                     feature_fl = self.msaa_gate(
                         features_pa, density_gcn_feature, feature_gcn_feature
                     )
+                elif self.density_adaptive_fusion is not None:
+                    # Density-Adaptive Fusion: density-conditioned per-pixel weights
+                    feature_fl = self.density_adaptive_fusion(
+                        features_pa, density_gcn_feature, feature_gcn_feature,
+                        density.detach(),
+                    )
                 elif self.gm is not None:
                     gate_weight = self.gm(features_pa)
                     if gate_weight.dim() == 4:
@@ -1218,7 +1265,10 @@ class DSGCnet(nn.Module):
 
         # Post-GCN density attention: spatial+channel modulation of fused features
         if self.density_attention is not None:
-            if isinstance(self.density_attention, EnhancedDensityAttention):
+            if isinstance(
+                self.density_attention,
+                (EnhancedDensityAttention, GatedDensityAttention),
+            ):
                 feature_fl = self.density_attention(density.detach(), feature_fl)
             else:
                 attention_mask = self.density_attention(density.detach()).to(

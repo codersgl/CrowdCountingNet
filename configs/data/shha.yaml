@@ -26,6 +26,13 @@ augmentation:
     enabled: true
     prob: 0.1 # probability of converting image to grayscale
 
+  # A4: Random Gaussian Blur (applied after normalisation, before scaling)
+  gaussian_blur:
+    enabled: true
+    prob: 0.1 # probability of applying per sample
+    kernel_size: 5 # Gaussian kernel size (must be odd; 5 captures sigma as low as 0.3)
+    sigma_range: [0.3, 1.5] # uniform sigma sampling range (min, max)
+
   # Random scaling (A3: widen via scale_min: 0.5, scale_max: 1.6 for more diversity)
   random_scale:
     enabled: true
@@ -57,3 +64,14 @@ augmentation:
 depth_blur:
   kernel_size: 15 # Gaussian blur kernel size (must be odd)
   sigma: 5.0 # Gaussian blur sigma for smoothing depth edges
+
+# === Density Map Generation ===
+density_generation:
+  # When true, use depth-derived perspective maps to modulate per-pedestrian
+  # Gaussian kernel widths (sigma = max(beta * perspective, min_sigma)).
+  # When false (default), the k-NN geometry-adaptive kernel is used.
+  perspective_guided: false
+
+  beta: 1.0      # sigma scaling factor applied to perspective value
+  min_sigma: 4.6 # minimum sigma floor in pixels
+  disparity_input: true  # DepthAnythingV2 outputs disparity (larger=closer)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import random
 
+import pytest
 import torch
 
 from crowdcount.data.collate import (
@@ -424,3 +425,122 @@ def test_shha_integration_default_off_still_works(tmp_path):
     # New aug must default to disabled.
     assert ds.random_erasing_enabled is False
     assert ds.multi_scale_patch_enabled is False
+
+
+# ---------------------------------------------------------------------------
+# A4: RandomGaussianBlur tests
+# ---------------------------------------------------------------------------
+
+
+class TestRandomGaussianBlur:
+    """Tests for the RandomGaussianBlur augmentation class."""
+
+    def test_shape_preserved(self):
+        """Output shape must equal input shape."""
+        from crowdcount.data.transforms import RandomGaussianBlur
+
+        blur = RandomGaussianBlur(prob=1.0, kernel_size=3, sigma_range=(1.0, 1.0))
+        img = torch.randn(3, 64, 64)
+        out = blur(img)
+        assert out.shape == img.shape
+
+    def test_no_effect_when_prob_zero(self):
+        """With prob=0 the image must be returned unchanged."""
+        from crowdcount.data.transforms import RandomGaussianBlur
+
+        blur = RandomGaussianBlur(prob=0.0, kernel_size=3, sigma_range=(0.5, 2.0))
+        img = torch.randn(3, 32, 32)
+        out = blur(img)
+        assert torch.equal(out, img)
+
+    def test_blur_smooths_image(self):
+        """A deterministic blur (prob=1, fixed sigma) must reduce high-freq energy."""
+        from crowdcount.data.transforms import RandomGaussianBlur
+
+        blur = RandomGaussianBlur(prob=1.0, kernel_size=5, sigma_range=(2.0, 2.0))
+        # Create a checkerboard pattern (lots of high-freq energy)
+        img = torch.zeros(3, 64, 64)
+        for i in range(64):
+            for j in range(64):
+                img[:, i, j] = 1.0 if (i + j) % 2 == 0 else 0.0
+        out = blur(img)
+        # Blurred output should have smaller variance (less contrast)
+        assert out.var() < img.var()
+
+    def test_kernel_normalised(self):
+        """The Gaussian kernel must sum to 1."""
+        from crowdcount.data.transforms import RandomGaussianBlur
+
+        kernel = RandomGaussianBlur._make_kernel(5, 1.5)
+        assert abs(kernel.sum().item() - 1.0) < 1e-5
+
+    def test_invalid_prob_raises(self):
+        from crowdcount.data.transforms import RandomGaussianBlur
+
+        with pytest.raises(ValueError, match="prob"):
+            RandomGaussianBlur(prob=-0.1)
+        with pytest.raises(ValueError, match="prob"):
+            RandomGaussianBlur(prob=1.1)
+
+    def test_invalid_kernel_size_raises(self):
+        from crowdcount.data.transforms import RandomGaussianBlur
+
+        with pytest.raises(ValueError, match="kernel_size"):
+            RandomGaussianBlur(kernel_size=4)
+        with pytest.raises(ValueError, match="kernel_size"):
+            RandomGaussianBlur(kernel_size=0)
+
+    def test_invalid_sigma_range_raises(self):
+        from crowdcount.data.transforms import RandomGaussianBlur
+
+        with pytest.raises(ValueError, match="sigma_range"):
+            RandomGaussianBlur(sigma_range=(0.0, 1.0))
+        with pytest.raises(ValueError, match="sigma_range"):
+            RandomGaussianBlur(sigma_range=(2.0, 1.0))
+
+    def test_different_channel_counts(self):
+        """Should work for 1-channel and 3-channel inputs."""
+        from crowdcount.data.transforms import RandomGaussianBlur
+
+        blur = RandomGaussianBlur(prob=1.0, kernel_size=3, sigma_range=(1.0, 1.0))
+        for c in (1, 3):
+            img = torch.randn(c, 32, 32)
+            out = blur(img)
+            assert out.shape == img.shape
+
+    def test_dataset_integration_enabled(self, tmp_path):
+        """SHHA dataset with gaussian_blur enabled should produce valid output."""
+        from crowdcount.data.dataset import SHHA
+
+        _build_fake_shha(tmp_path)
+        aug_cfg = {"gaussian_blur": {"enabled": True, "prob": 1.0, "kernel_size": 3, "sigma_range": [0.5, 1.5]}}
+        ds = SHHA(
+            str(tmp_path),
+            train=True,
+            transform=_shha_transform(),
+            patch=True,
+            patch_size=128,
+            flip=False,
+            num_patches=4,
+            aug_cfg=aug_cfg,
+        )
+        assert ds.gaussian_blur_enabled is True
+        img, target, density = ds[0]
+        assert img.shape == (4, 3, 128, 128)
+        assert density.shape == (4, 1, 16, 16)
+
+    def test_dataset_default_disabled(self, tmp_path):
+        """Gaussian blur must be disabled by default (no config)."""
+        from crowdcount.data.dataset import SHHA
+
+        _build_fake_shha(tmp_path)
+        ds = SHHA(
+            str(tmp_path),
+            train=True,
+            transform=_shha_transform(),
+            patch=True,
+            patch_size=128,
+            flip=False,
+            num_patches=4,
+        )
+        assert ds.gaussian_blur_enabled is False

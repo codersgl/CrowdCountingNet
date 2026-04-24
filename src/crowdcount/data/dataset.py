@@ -35,10 +35,22 @@ class SHHA(Dataset):
         flip_prob: float = 0.5,
         num_patches: int = 4,
         depth_blur_cfg=None,
+        density_gen_cfg=None,
     ):
         self.root_path = data_root
-        self.gt_density = "gt_density_maps"
         self.use_depth = use_depth
+
+        # Parse density generation config
+        if density_gen_cfg is None:
+            density_gen_cfg = {}
+        self.perspective_guided = bool(
+            density_gen_cfg.get("perspective_guided", False)
+        )
+        self.persp_beta = float(density_gen_cfg.get("beta", 0.3))
+        self.persp_min_sigma = float(density_gen_cfg.get("min_sigma", 1.0))
+        self.persp_disparity_input = bool(
+            density_gen_cfg.get("disparity_input", True)
+        )
         if patch_size <= 0 or patch_size % 8 != 0:
             raise ValueError(
                 f"patch_size must be a positive multiple of 8, got {patch_size}"
@@ -101,6 +113,17 @@ class SHHA(Dataset):
                     )
         self.multi_scale_patch_choices = [int(c) for c in _choices]
 
+        # A4: Random Gaussian Blur config
+        blur_cfg = aug_cfg.get("gaussian_blur", {})
+        self.gaussian_blur_enabled = bool(blur_cfg.get("enabled", False))
+        self.gaussian_blur_prob = float(blur_cfg.get("prob", 0.1))
+        self.gaussian_blur_kernel_size = int(blur_cfg.get("kernel_size", 5))
+        _blur_sigma = blur_cfg.get("sigma_range", [0.3, 1.5])
+        self.gaussian_blur_sigma_range = (
+            float(_blur_sigma[0]),
+            float(_blur_sigma[1]),
+        )
+
         # Flip probability
         self.flip_prob = flip_prob
 
@@ -125,12 +148,22 @@ class SHHA(Dataset):
             raise ValueError(f"scale_min must be positive, got {self.scale_min}")
 
         if train:
-            self.gt_dmap_root = os.path.join(self.root_path, self.gt_density, "train")
+            density_dir_name = (
+                "gt_density_maps_persp" if self.perspective_guided else "gt_density_maps"
+            )
+            self.gt_dmap_root = os.path.join(self.root_path, density_dir_name, "train")
             # Auto-generate density maps on first run
             if not os.path.isdir(self.gt_dmap_root) or not os.listdir(
                 self.gt_dmap_root
             ):
-                generate_density_maps(data_root, split="train")
+                generate_density_maps(
+                    data_root,
+                    split="train",
+                    perspective_guided=self.perspective_guided,
+                    beta=self.persp_beta,
+                    min_sigma=self.persp_min_sigma,
+                    disparity_input=self.persp_disparity_input,
+                )
 
         if use_depth:
             depth_split = "train" if train else "test"
@@ -227,6 +260,17 @@ class SHHA(Dataset):
 
         if self.transform is not None:
             img = self.transform(img)
+
+        # A4: Random Gaussian Blur (applied on normalised tensor, before scaling)
+        if self.train and self.gaussian_blur_enabled:
+            from crowdcount.data.transforms import RandomGaussianBlur
+
+            _blurrer = RandomGaussianBlur(
+                prob=self.gaussian_blur_prob,
+                kernel_size=self.gaussian_blur_kernel_size,
+                sigma_range=self.gaussian_blur_sigma_range,
+            )
+            img = _blurrer(img)
 
         if self.train and self.scale_enabled:
             min_size = min(img.shape[1:])

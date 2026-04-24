@@ -257,3 +257,83 @@ def density_paste_(
     """
     _, h8, w8 = src_density.shape
     dst_density[:, dst_y8 : dst_y8 + h8, dst_x8 : dst_x8 + w8] = src_density
+
+
+# ---------------------------------------------------------------------------
+# A4: RandomGaussianBlur
+# ---------------------------------------------------------------------------
+
+
+class RandomGaussianBlur:
+    """Apply random Gaussian blur to the image tensor.
+
+    Only blurs the RGB image channels; density and depth maps are left untouched
+    so that count annotations remain exact.
+
+    This augmentation simulates out-of-focus images and improves robustness
+    to varying image quality in real-world crowd scenes.
+    """
+
+    def __init__(
+        self,
+        prob: float = 0.1,
+        kernel_size: int = 5,
+        sigma_range: Sequence[float] = (0.3, 1.5),
+    ):
+        """Args:
+            prob: probability of applying the blur.
+            kernel_size: size of the Gaussian kernel (must be odd).
+            sigma_range: ``(min, max)`` range for uniform sigma sampling.
+        """
+        if not 0.0 <= prob <= 1.0:
+            raise ValueError(f"prob must be in [0,1], got {prob}")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(
+                f"kernel_size must be a positive odd number, got {kernel_size}"
+            )
+        if len(sigma_range) != 2 or sigma_range[0] <= 0 or sigma_range[0] > sigma_range[1]:
+            raise ValueError(f"sigma_range must be (min, max) with 0 < min <= max, got {sigma_range}")
+        self.prob = float(prob)
+        self.kernel_size = int(kernel_size)
+        self.sigma_range = (float(sigma_range[0]), float(sigma_range[1]))
+
+    # ------------------------------------------------------------------
+    # Kernel construction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_kernel(size: int, sigma: float, device=None, dtype=torch.float32) -> torch.Tensor:
+        """Build a 2D Gaussian kernel of shape ``[1, 1, size, size]``."""
+        coords = torch.arange(size, device=device, dtype=dtype) - (size - 1) / 2.0
+        g = torch.exp(-(coords**2) / (2.0 * sigma**2))
+        kernel = torch.outer(g, g)
+        kernel = kernel / kernel.sum()
+        return kernel.unsqueeze(0).unsqueeze(0)  # [1, 1, k, k]
+
+    # ------------------------------------------------------------------
+    # Callable
+    # ------------------------------------------------------------------
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        """Apply Gaussian blur to ``[C, H, W]`` image tensor.
+
+        Args:
+            img: normalised image tensor ``[C, H, W]``.
+
+        Returns:
+            Blurred image tensor (same shape). When the augmentation is
+            skipped (random draw), the original tensor is returned unchanged.
+        """
+        if random.random() > self.prob:
+            return img
+        sigma = random.uniform(*self.sigma_range)
+        kernel = self._make_kernel(self.kernel_size, sigma, device=img.device, dtype=img.dtype)
+        C = img.shape[0]
+        # ``groups=C`` applies a separate (identical) kernel per channel,
+        # which is equivalent to conv2d with a [C, 1, k, k] weight.
+        pad = self.kernel_size // 2
+        blurred = torch.nn.functional.conv2d(
+            img.unsqueeze(0), kernel.expand(C, -1, -1, -1),
+            padding=pad, groups=C,
+        ).squeeze(0)
+        return blurred

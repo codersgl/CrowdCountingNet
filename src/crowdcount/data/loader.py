@@ -52,6 +52,7 @@ def build_dataset(cfg: DictConfig):
     flip_prob = float(cfg.data.get("flip_prob", 0.5))
     num_patches = int(cfg.data.get("num_patches", 4))
     depth_blur_cfg = cfg.data.get("depth_blur", None)
+    density_gen_cfg = cfg.data.get("density_generation", None)
 
     train_set = SHHA(
         data_root,
@@ -66,6 +67,7 @@ def build_dataset(cfg: DictConfig):
         flip_prob=flip_prob,
         num_patches=num_patches,
         depth_blur_cfg=depth_blur_cfg,
+        density_gen_cfg=density_gen_cfg,
     )
     val_set = SHHA(
         data_root,
@@ -77,5 +79,6 @@ def build_dataset(cfg: DictConfig):
         flip_prob=flip_prob,
         num_patches=num_patches,
         depth_blur_cfg=depth_blur_cfg,
+        density_gen_cfg=density_gen_cfg,
     )
     return train_set, val_set

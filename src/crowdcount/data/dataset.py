@@ -17,7 +17,7 @@ import torchvision.transforms as transforms
 from PIL import Image
 from torch.utils.data import Dataset
 
-from crowdcount.data.prepare import generate_density_maps
+from crowdcount.data.prepare import _resolve_density_cache_dir, generate_density_maps
 
 
 class SHHA(Dataset):
@@ -43,14 +43,13 @@ class SHHA(Dataset):
         # Parse density generation config
         if density_gen_cfg is None:
             density_gen_cfg = {}
-        self.perspective_guided = bool(
-            density_gen_cfg.get("perspective_guided", False)
-        )
+        self.perspective_guided = bool(density_gen_cfg.get("perspective_guided", False))
         self.persp_beta = float(density_gen_cfg.get("beta", 0.3))
         self.persp_min_sigma = float(density_gen_cfg.get("min_sigma", 1.0))
-        self.persp_disparity_input = bool(
-            density_gen_cfg.get("disparity_input", True)
-        )
+        self.persp_sigma_base = float(density_gen_cfg.get("sigma_base", 1.0))
+        _pms = density_gen_cfg.get("persp_max_sigma", None)
+        self.persp_max_sigma = float(_pms) if _pms is not None else None
+        self.persp_disparity_input = bool(density_gen_cfg.get("disparity_input", True))
         self.hybrid = bool(density_gen_cfg.get("hybrid", False))
         self.hybrid_min_sigma = float(density_gen_cfg.get("hybrid_min_sigma", 1.5))
         _hms = density_gen_cfg.get("hybrid_max_sigma", None)
@@ -110,7 +109,9 @@ class SHHA(Dataset):
         _choices = list(msp_cfg.get("patch_size_choices", [96, 128, 192]))
         if self.multi_scale_patch_enabled:
             if len(_choices) == 0:
-                raise ValueError("multi_scale_patch.patch_size_choices must be non-empty")
+                raise ValueError(
+                    "multi_scale_patch.patch_size_choices must be non-empty"
+                )
             for c in _choices:
                 if int(c) <= 0 or int(c) % 8 != 0:
                     raise ValueError(
@@ -153,17 +154,28 @@ class SHHA(Dataset):
             raise ValueError(f"scale_min must be positive, got {self.scale_min}")
 
         if train:
-            if self.hybrid:
-                density_dir_name = "gt_density_maps_hybrid"
-            elif self.perspective_guided:
-                density_dir_name = "gt_density_maps_persp"
-            else:
-                density_dir_name = "gt_density_maps"
-            self.gt_dmap_root = os.path.join(self.root_path, density_dir_name, "train")
-            # Auto-generate density maps on first run
-            if not os.path.isdir(self.gt_dmap_root) or not os.listdir(
-                self.gt_dmap_root
-            ):
+            cache_dir = _resolve_density_cache_dir(
+                self.root_path,
+                "train",
+                perspective_guided=self.perspective_guided,
+                hybrid=self.hybrid,
+                beta=self.persp_beta,
+                min_sigma=self.persp_min_sigma,
+                sigma_base=self.persp_sigma_base,
+                persp_max_sigma=self.persp_max_sigma,
+                hybrid_min_sigma=self.hybrid_min_sigma,
+                hybrid_max_sigma=self.hybrid_max_sigma,
+                hybrid_alpha=self.hybrid_alpha,
+            )
+            self.gt_dmap_root = str(cache_dir)
+            # Auto-generate density maps on first run (or when params changed,
+            # which produces a fresh cache directory).
+            existing = (
+                [p for p in os.listdir(self.gt_dmap_root) if p.endswith(".npy")]
+                if os.path.isdir(self.gt_dmap_root)
+                else []
+            )
+            if not existing:
                 generate_density_maps(
                     data_root,
                     split="train",
@@ -175,6 +187,8 @@ class SHHA(Dataset):
                     hybrid_max_sigma=self.hybrid_max_sigma,
                     hybrid_alpha=self.hybrid_alpha,
                     disparity_input=self.persp_disparity_input,
+                    sigma_base=self.persp_sigma_base,
+                    persp_max_sigma=self.persp_max_sigma,
                 )
 
         if use_depth:
@@ -368,18 +382,18 @@ class SHHA(Dataset):
                     2 if self.use_depth else 1
                 )
                 density_ch_end = density_ch_start + 1
-                orig_sums = img_with_density[
-                    :, density_ch_start:density_ch_end
-                ].sum(dim=(2, 3), keepdim=True)
+                orig_sums = img_with_density[:, density_ch_start:density_ch_end].sum(
+                    dim=(2, 3), keepdim=True
+                )
                 img_with_density = torch.nn.functional.interpolate(
                     img_with_density,
                     size=(self.patch_size, self.patch_size),
                     mode="bilinear",
                     align_corners=False,
                 )
-                new_sums = img_with_density[
-                    :, density_ch_start:density_ch_end
-                ].sum(dim=(2, 3), keepdim=True)
+                new_sums = img_with_density[:, density_ch_start:density_ch_end].sum(
+                    dim=(2, 3), keepdim=True
+                )
                 factor = orig_sums / new_sums.clamp(min=1e-9)
                 img_with_density[:, density_ch_start:density_ch_end] *= factor
                 pt_scale = float(self.patch_size) / float(crop_size)
@@ -445,9 +459,7 @@ class SHHA(Dataset):
                     den_i = density[i]  # [1, H, W]
                     dep_i = depth[i] if self.use_depth else None
                     pts_i = point[i]
-                    img_i, pts_i, den_i, dep_i = eraser(
-                        img_i, pts_i, den_i, dep_i
-                    )
+                    img_i, pts_i, den_i, dep_i = eraser(img_i, pts_i, den_i, dep_i)
                     img[i] = img_i
                     density[i] = den_i
                     if self.use_depth:

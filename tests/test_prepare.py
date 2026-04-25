@@ -12,6 +12,7 @@ import pytest
 
 from crowdcount.data.prepare import (
     _depth_to_perspective,
+    _resolve_density_cache_dir,
     gaussian_filter_density,
     perspective_gaussian_filter_density,
 )
@@ -344,3 +345,65 @@ def test_perspective_min_sigma_non_positive_raises() -> None:
 
     with pytest.raises(ValueError, match="min_sigma must be positive"):
         perspective_gaussian_filter_density(img, points, persp_map, min_sigma=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Param-aware cache directory naming
+# ---------------------------------------------------------------------------
+
+
+def test_cache_dir_geometry_default_unchanged(tmp_path) -> None:
+    """Geometry-adaptive mode keeps the legacy ``gt_density_maps`` directory
+    so existing on-disk caches are not invalidated."""
+    out = _resolve_density_cache_dir(tmp_path, "train")
+    assert out == tmp_path / "gt_density_maps" / "train"
+
+
+def test_cache_dir_persp_encodes_params(tmp_path) -> None:
+    """Different perspective-guided params must yield different cache dirs."""
+    a = _resolve_density_cache_dir(
+        tmp_path, "train", perspective_guided=True, beta=0.3, min_sigma=1.0
+    )
+    b = _resolve_density_cache_dir(
+        tmp_path, "train", perspective_guided=True, beta=0.5, min_sigma=1.0
+    )
+    c = _resolve_density_cache_dir(
+        tmp_path, "train", perspective_guided=True, beta=0.3, sigma_base=4.0
+    )
+    assert a != b, "beta change must produce a different cache dir"
+    assert a != c, "sigma_base change must produce a different cache dir"
+    assert "persp" in a.parent.name
+
+
+def test_cache_dir_hybrid_alpha_change_invalidates_cache(tmp_path) -> None:
+    """The original silent-cache-hit pitfall: changing hybrid_alpha must
+    route to a fresh cache directory."""
+    a = _resolve_density_cache_dir(tmp_path, "train", hybrid=True, hybrid_alpha=0.3)
+    b = _resolve_density_cache_dir(tmp_path, "train", hybrid=True, hybrid_alpha=0.7)
+    assert a != b
+    assert "hybrid" in a.parent.name
+
+
+# ---------------------------------------------------------------------------
+# Fast renderer numerical equivalence to scipy.gaussian_filter
+# ---------------------------------------------------------------------------
+
+
+def test_fast_renderer_matches_scipy() -> None:
+    """The local-patch renderer used by *_density functions must match the
+    legacy ``gaussian_filter`` impulse-response convention closely enough."""
+    from scipy.ndimage import gaussian_filter as _gf
+
+    from crowdcount.data.prepare import _render_point_gaussian
+
+    H, W = 64, 64
+    sigma = 2.5
+    y, x = 30, 32
+    fast = np.zeros((H, W), dtype=np.float32)
+    _render_point_gaussian(fast, y, x, sigma)
+
+    impulse = np.zeros((H, W), dtype=np.float32)
+    impulse[y, x] = 1.0
+    ref = _gf(impulse, sigma, mode="constant", truncate=4.0)
+
+    np.testing.assert_allclose(fast, ref, atol=1e-5)

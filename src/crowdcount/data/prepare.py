@@ -28,12 +28,65 @@ Generated maps are cached to::
 
 from __future__ import annotations
 
+import json
+import math
 from pathlib import Path
 
 import numpy as np
 import scipy.spatial
 from loguru import logger
-from scipy.ndimage import gaussian_filter
+
+# scipy's default truncate radius for gaussian_filter; matches the implicit
+# truncation used by the legacy full-image rendering path.
+_GAUSS_TRUNCATE = 4.0
+
+
+def _render_point_gaussian(
+    density: np.ndarray,
+    y: int,
+    x: int,
+    sigma: float,
+    truncate: float = _GAUSS_TRUNCATE,
+) -> None:
+    """Add an isotropic Gaussian centred at (y, x) into ``density`` in-place.
+
+    Numerically equivalent (within float32 rounding) to::
+
+        impulse = np.zeros_like(density)
+        impulse[y, x] = 1.0
+        density += gaussian_filter(impulse, sigma, mode='constant',
+                                   truncate=truncate)
+
+    but only writes to a ``(2r+1) x (2r+1)`` patch with ``r = ceil(truncate*sigma)``,
+    cutting cost from O(H*W) to O(sigma**2) per point.
+
+    Boundary handling matches ``mode='constant'`` (kernel mass that falls off
+    the image is implicitly discarded — i.e. NOT renormalised).
+    """
+    H, W = density.shape
+    if sigma <= 0:
+        if 0 <= y < H and 0 <= x < W:
+            density[y, x] += 1.0
+        return
+    r = int(math.ceil(truncate * sigma))
+    y0, y1 = max(0, y - r), min(H - 1, y + r)
+    x0, x1 = max(0, x - r), min(W - 1, x + r)
+    if y0 > y1 or x0 > x1:
+        return
+    ys = np.arange(y0, y1 + 1, dtype=np.float64) - y
+    xs = np.arange(x0, x1 + 1, dtype=np.float64) - x
+    inv_two_sig2 = 1.0 / (2.0 * sigma * sigma)
+    ky = np.exp(-(ys * ys) * inv_two_sig2)
+    kx = np.exp(-(xs * xs) * inv_two_sig2)
+    # Normalise the *full* (untruncated) 1-D kernels so the resulting 2-D
+    # kernel integrates to ~1 before boundary clipping (same convention as
+    # scipy.ndimage.gaussian_filter on an impulse).
+    full_ys = np.arange(-r, r + 1, dtype=np.float64)
+    norm = np.exp(-(full_ys * full_ys) * inv_two_sig2).sum()
+    ky = ky / norm
+    kx = kx / norm
+    patch = np.outer(ky, kx).astype(density.dtype, copy=False)
+    density[y0 : y1 + 1, x0 : x1 + 1] += patch
 
 
 def _depth_to_perspective(
@@ -115,8 +168,6 @@ def gaussian_filter_density(img: np.ndarray, points: np.ndarray) -> np.ndarray:
         distances = distances[:, np.newaxis]
 
     for i in range(gt_count):
-        pt2d = np.zeros(img_shape, dtype=np.float32)
-        pt2d[rounded[i, 1], rounded[i, 0]] = 1.0
         if gt_count >= 4:
             sigma = (distances[i][1] + distances[i][2] + distances[i][3]) * 0.1
         elif gt_count >= 2:
@@ -126,7 +177,9 @@ def gaussian_filter_density(img: np.ndarray, points: np.ndarray) -> np.ndarray:
         else:
             # Single point: no neighbours available, fall back to image-size heuristic
             sigma = np.average(np.array(img_shape)) / 2.0 / 2.0
-        density += gaussian_filter(pt2d, sigma, mode="constant")
+        _render_point_gaussian(
+            density, int(rounded[i, 1]), int(rounded[i, 0]), float(sigma)
+        )
     return density
 
 
@@ -136,23 +189,33 @@ def perspective_gaussian_filter_density(
     perspective_map: np.ndarray,
     beta: float = 0.3,
     min_sigma: float = 1.0,
+    max_sigma: float | None = None,
+    sigma_base: float = 1.0,
 ) -> np.ndarray:
     """Generate a density map using a depth-derived perspective map for sigma.
 
     For each annotated point at (x, y), the Gaussian kernel sigma is::
 
-        sigma_i = max(beta * perspective_map[y, x], min_sigma)
+        sigma_i = clip(beta * sigma_base * perspective_map[y, x],
+                       min_sigma, max_sigma)
 
-    This replaces k-NN geometry-adaptive sigmas with perspective-aware widths
-    where closer pedestrians (larger perspective values) receive wider kernels.
+    ``perspective_map`` is typically median-normalised (median = 1.0), so it
+    is dimensionless. ``sigma_base`` lets the caller anchor the sigma at the
+    *median depth* in pixels (e.g. set to the expected head-radius at the
+    image's median depth). With ``sigma_base=1.0`` (default) the legacy
+    behaviour ``sigma = beta * persp`` is preserved.
+
+    Closer pedestrians (larger perspective values) receive wider kernels.
 
     Args:
         img: H×W (or H×W×C) image array — only shape is used.
         points: N×2 array of (x, y) ground-truth point annotations.
-        perspective_map: H×W float32, median-normalised perspective values
-            (typically 1/depth per image).
-        beta: Scaling factor applied to perspective value for sigma.
+        perspective_map: H×W float32, median-normalised perspective values.
+        beta: Multiplicative scaling factor on perspective.
         min_sigma: Minimum sigma floor (pixels).
+        max_sigma: Optional sigma ceiling (pixels); ``None`` for no limit.
+        sigma_base: Pixel-scale anchor at median depth (default 1.0 for
+            backward compatibility).
 
     Returns:
         density: H×W float32 density map.
@@ -161,6 +224,10 @@ def perspective_gaussian_filter_density(
         raise ValueError(f"beta must be positive, got {beta}")
     if min_sigma <= 0:
         raise ValueError(f"min_sigma must be positive, got {min_sigma}")
+    if max_sigma is not None and max_sigma <= 0:
+        raise ValueError(f"max_sigma must be positive, got {max_sigma}")
+    if sigma_base <= 0:
+        raise ValueError(f"sigma_base must be positive, got {sigma_base}")
 
     img_shape = [img.shape[0], img.shape[1]]
     if perspective_map.shape[:2] != tuple(img_shape):
@@ -187,15 +254,14 @@ def perspective_gaussian_filter_density(
     if gt_count == 0:
         return density
 
+    ceil = max_sigma if max_sigma is not None else np.inf
     for i in range(gt_count):
-        pt2d = np.zeros(img_shape, dtype=np.float32)
-        yi, xi = rounded[i, 1], rounded[i, 0]
-        pt2d[yi, xi] = 1.0
+        yi, xi = int(rounded[i, 1]), int(rounded[i, 0])
         pval = float(perspective_map[yi, xi])
         if np.isnan(pval) or np.isinf(pval):
             pval = 0.0
-        sigma = max(beta * pval, min_sigma)
-        density += gaussian_filter(pt2d, sigma, mode="constant")
+        sigma = float(np.clip(beta * sigma_base * pval, min_sigma, ceil))
+        _render_point_gaussian(density, yi, xi, sigma)
     return density
 
 
@@ -206,31 +272,46 @@ def hybrid_density(
     min_sigma: float = 1.5,
     max_sigma: float | None = None,
     alpha: float = 0.5,
+    sigma_base: float = 1.0,
 ) -> np.ndarray:
     """Generate a density map combining geometry-adaptive k-NN with perspective.
 
-    The formula treats *perspective as the foundation* (head-size prior) and
-    uses the density component of *geo_sigma* as a modulation::
+    Algebraically the formula is the *weighted geometric mean* of the two
+    sigma sources, with a ``sigma_base`` (px) anchor restoring dimensional
+    consistency::
 
-        sigma_i = clip(persp_i × (geo_sigma_i / persp_i) ^ alpha,
-                       min_sigma, max_sigma)
+        head_radius_i = sigma_base * persp_i           # pixels (head size at point i)
+        sigma_i       = clip(head_radius_i ** (1 - alpha) * geo_sigma_i ** alpha,
+                             min_sigma, max_sigma)
 
-    - ``persp_i``: median-normalised perspective — the "brush size"
-      (head size in pixels, ∝ 1/depth).
-    - ``geo_sigma_i``: k-NN geometry-adaptive sigma, which encodes both
-      local crowd density AND implicit perspective (∝ 1/depth).
-    - ``geo_sigma_i / persp_i``: cancels the shared 1/depth factor from
-      *geo_sigma*, leaving an approximate "pure density" signal.
+    Two equivalent intuitions:
 
-    The parameter ``alpha ∈ [0, 1]`` controls the density-modulation weight:
+    - **Perspective as foundation, density as modulation** ::
+
+          sigma_i = persp_i * (geo_sigma_i / persp_i) ** alpha
+
+      where ``persp_i / median(persp) ≈ 1/depth`` (dimensionless) acts as a
+      relative head-size prior, and ``geo_sigma_i / persp_i`` removes the
+      shared 1/depth factor from k-NN, leaving an approximate "pure density"
+      signal.
+
+    - **Geometric blend on a log scale** ::
+
+          log(sigma_i) = (1 - alpha) * log(persp_i) + alpha * log(geo_sigma_i)
+
+    The parameter ``alpha ∈ [0, 1]`` controls the geometry-adaptive weight:
 
     ========  ==============================================
-    alpha=0   ``sigma = persp`` — pure head-size prior
-    alpha=0.5 ``sigma = sqrt(persp × geo_sigma)`` — balanced
+    alpha=0   ``sigma = sigma_base * persp`` — pure head-radius prior
+    alpha=0.5 ``sigma = sqrt(sigma_base * persp × geo_sigma)`` — balanced
     alpha=1   ``sigma = geo_sigma`` — pure geometry-adaptive
     ========  ==============================================
 
-    At median depth (persp = 1.0), ``sigma = geo_sigma ^ alpha``.
+    NOTE on units: ``perspective_map`` is median-normalised (≈1.0 at median
+    depth) and dimensionless. Multiplying by ``sigma_base`` (pixels) turns it
+    into an estimated head radius, so the geometric mean with ``geo_sigma``
+    (also pixels) is dimensionally consistent. Pick ``sigma_base`` close to
+    the typical head radius at the dataset's median depth (e.g. 4 px on SHHA).
 
     Args:
         img: H×W (or H×W×C) image array — only shape is used.
@@ -250,6 +331,8 @@ def hybrid_density(
         raise ValueError(f"max_sigma must be positive, got {max_sigma}")
     if not 0 <= alpha <= 1:
         raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+    if sigma_base <= 0:
+        raise ValueError(f"sigma_base must be positive, got {sigma_base}")
 
     img_shape = [img.shape[0], img.shape[1]]
     if perspective_map.shape[:2] != tuple(img_shape):
@@ -294,24 +377,28 @@ def hybrid_density(
         geo_sigmas[:] = float(np.average(np.array(img_shape))) / 2.0 / 2.0
 
     # --- Density modulation on perspective foundation ---
-    # persp = head-size prior (brush size); geo_sigma/persp ≈ pure density
+    # head_radius_i = sigma_base * persp_i (pixels) is the head-size prior.
+    # geo_sigma is in pixels too, so the weighted geometric mean is
+    # dimensionally consistent for any alpha in [0, 1].
     persp_values = perspective_map[rounded[:, 1], rounded[:, 0]]
     persp_values = np.nan_to_num(persp_values, nan=1.0, posinf=1.0, neginf=1.0)
-    persp = persp_values.astype(np.float64)
+    head_radius = sigma_base * persp_values.astype(np.float64)
+    head_radius = np.maximum(head_radius, 1e-6)
+    geo_safe = np.maximum(geo_sigmas, 1e-6)
 
-    density_factor = np.ones_like(persp)
-    if alpha > 0:
-        ratio = np.maximum(geo_sigmas, 1e-6) / np.maximum(persp, 1e-6)
-        density_factor = ratio ** alpha
-
-    sigmas = persp * density_factor
+    if alpha <= 0:
+        sigmas = head_radius
+    elif alpha >= 1:
+        sigmas = geo_safe
+    else:
+        sigmas = (head_radius ** (1.0 - alpha)) * (geo_safe**alpha)
     sigmas = np.clip(sigmas, min_sigma, max_sigma or np.inf)
 
     # --- Render ---
     for i in range(gt_count):
-        pt2d = np.zeros(img_shape, dtype=np.float32)
-        pt2d[rounded[i, 1], rounded[i, 0]] = 1.0
-        density += gaussian_filter(pt2d, sigmas[i], mode="constant")
+        _render_point_gaussian(
+            density, int(rounded[i, 1]), int(rounded[i, 0]), float(sigmas[i])
+        )
     return density
 
 
@@ -399,6 +486,112 @@ def _find_image_gt_pairs(data_root: Path, split: str) -> list[tuple[Path, Path]]
     return pairs
 
 
+def _format_param_tag(value: float | None) -> str:
+    """Compact, filename-safe tag for a numeric param (e.g. 0.5 -> '0p50', None -> 'inf')."""
+    if value is None:
+        return "inf"
+    return f"{value:.2f}".replace(".", "p")
+
+
+def _density_cache_dir(
+    data_root: Path,
+    split: str,
+    *,
+    perspective_guided: bool,
+    hybrid: bool,
+    beta: float,
+    min_sigma: float,
+    sigma_base: float,
+    persp_max_sigma: float | None,
+    hybrid_min_sigma: float,
+    hybrid_max_sigma: float | None,
+    hybrid_alpha: float,
+) -> tuple[Path, str, dict]:
+    """Build a parameter-aware cache directory for density maps.
+
+    Encoding the relevant hyperparameters in the directory name avoids the
+    silent-cache-hit pitfall where switching e.g. ``hybrid_alpha`` would
+    otherwise reuse stale ``.npy`` files. A ``meta.json`` is also written
+    inside the directory for human-readable provenance.
+
+    Returns:
+        (out_dir, mode_label, meta_dict)
+    """
+    if hybrid:
+        tag = (
+            f"a{_format_param_tag(hybrid_alpha)}"
+            f"_sb{_format_param_tag(sigma_base)}"
+            f"_min{_format_param_tag(hybrid_min_sigma)}"
+            f"_max{_format_param_tag(hybrid_max_sigma)}"
+        )
+        out_dir = data_root / f"gt_density_maps_hybrid_{tag}" / split
+        mode_label = "hybrid (geo \u00d7 persp)"
+        meta = {
+            "mode": "hybrid",
+            "alpha": hybrid_alpha,
+            "sigma_base": sigma_base,
+            "min_sigma": hybrid_min_sigma,
+            "max_sigma": hybrid_max_sigma,
+        }
+    elif perspective_guided:
+        tag = (
+            f"b{_format_param_tag(beta)}"
+            f"_sb{_format_param_tag(sigma_base)}"
+            f"_min{_format_param_tag(min_sigma)}"
+            f"_max{_format_param_tag(persp_max_sigma)}"
+        )
+        out_dir = data_root / f"gt_density_maps_persp_{tag}" / split
+        mode_label = "perspective-guided"
+        meta = {
+            "mode": "perspective_guided",
+            "beta": beta,
+            "sigma_base": sigma_base,
+            "min_sigma": min_sigma,
+            "max_sigma": persp_max_sigma,
+        }
+    else:
+        out_dir = data_root / "gt_density_maps" / split
+        mode_label = "geometry-adaptive"
+        meta = {"mode": "geometry_adaptive"}
+    return out_dir, mode_label, meta
+
+
+def _resolve_density_cache_dir(
+    data_root: str | Path,
+    split: str,
+    *,
+    perspective_guided: bool = False,
+    hybrid: bool = False,
+    beta: float = 0.3,
+    min_sigma: float = 1.0,
+    sigma_base: float = 1.0,
+    persp_max_sigma: float | None = None,
+    hybrid_min_sigma: float = 1.5,
+    hybrid_max_sigma: float | None = None,
+    hybrid_alpha: float = 0.5,
+) -> Path:
+    """Public helper: returns the cache directory consumers should read from.
+
+    Mirrors the directory-naming logic of :func:`generate_density_maps` so
+    callers (e.g. the dataset class) can locate the correct ``.npy`` files
+    for a given hyperparameter set without re-implementing the convention.
+    """
+    out_dir, _, _ = _density_cache_dir(
+        Path(data_root),
+        split,
+        perspective_guided=perspective_guided,
+        hybrid=hybrid,
+        beta=beta,
+        min_sigma=min_sigma,
+        sigma_base=sigma_base,
+        persp_max_sigma=persp_max_sigma,
+        hybrid_min_sigma=hybrid_min_sigma,
+        hybrid_max_sigma=hybrid_max_sigma,
+        hybrid_alpha=hybrid_alpha,
+    )
+    return out_dir
+
+
 def generate_density_maps(
     data_root: str | Path,
     split: str = "train",
@@ -410,6 +603,8 @@ def generate_density_maps(
     hybrid_max_sigma: float | None = None,
     hybrid_alpha: float = 0.5,
     disparity_input: bool = True,
+    sigma_base: float = 1.0,
+    persp_max_sigma: float | None = None,
 ) -> None:
     """Generate density maps (.npy) for all images in a dataset split.
 
@@ -419,19 +614,25 @@ def generate_density_maps(
     Three generation modes (mutually exclusive; *hybrid* takes priority)::
 
         *geometry-adaptive* (default) — k-NN based sigma.
-        *perspective-guided* — ``sigma = max(beta × perspective, min_sigma)``.
-        *hybrid* — ``sigma = clip(persp × (geo_sigma/persp)^alpha, min, max)``.
+        *perspective-guided* — ``sigma = clip(beta·sigma_base·persp, min, max)``.
+        *hybrid* — ``sigma = clip(persp^(1-α) · geo_sigma^α, min, max)``.
+
+    Hyperparameters that affect the rendered density are encoded in the
+    output directory name (e.g. ``gt_density_maps_hybrid_a0p50_min1p50_maxinf``)
+    so that switching parameters does not silently reuse a stale cache.
 
     Args:
         data_root: Dataset root directory.
         split: Dataset split ('train' or 'test').
         perspective_guided: If True, use perspective-guided sigma.
         hybrid: If True, use geometry × perspective hybrid (takes priority).
-        beta: Sigma scaling factor (only used when perspective_guided=True).
-        min_sigma: Minimum sigma floor (only used when perspective_guided=True).
+        beta: Sigma scaling factor (perspective_guided mode).
+        min_sigma: Minimum sigma floor (perspective_guided mode).
+        sigma_base: Pixel-scale anchor at median depth (perspective_guided).
+        persp_max_sigma: Optional sigma ceiling (perspective_guided).
         hybrid_min_sigma: Floor for hybrid mode (default 1.5).
         hybrid_max_sigma: Optional ceiling for hybrid mode.
-        hybrid_alpha: Density-modulation weight for hybrid mode (default 0.5).
+        hybrid_alpha: Geometry-adaptive weight for hybrid mode (default 0.5).
         disparity_input: True if depth maps are disparity (DepthAnythingV2).
     """
     import cv2
@@ -441,22 +642,34 @@ def generate_density_maps(
 
     # Resolve perspective directory (needed for perspective_guided and hybrid)
     _need_persp = perspective_guided or hybrid
+    persp_dir: Path | None = None
     if _need_persp:
         persp_dir = data_root / "gt_perspective" / split
         if not persp_dir.is_dir() or not any(persp_dir.iterdir()):
             logger.info("Perspective maps not found, generating from depth maps...")
             generate_perspective_maps(data_root, split, disparity_input=disparity_input)
 
-    if hybrid:
-        out_dir = data_root / "gt_density_maps_hybrid" / split
-        mode_label = "hybrid (geo × persp)"
-    elif perspective_guided:
-        out_dir = data_root / "gt_density_maps_persp" / split
-        mode_label = "perspective-guided"
-    else:
-        out_dir = data_root / "gt_density_maps" / split
-        mode_label = "geometry-adaptive"
+    out_dir, mode_label, meta = _density_cache_dir(
+        data_root,
+        split,
+        perspective_guided=perspective_guided,
+        hybrid=hybrid,
+        beta=beta,
+        min_sigma=min_sigma,
+        sigma_base=sigma_base,
+        persp_max_sigma=persp_max_sigma,
+        hybrid_min_sigma=hybrid_min_sigma,
+        hybrid_max_sigma=hybrid_max_sigma,
+        hybrid_alpha=hybrid_alpha,
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Drop a meta.json with the exact params used for this cache (overwrites
+    # are fine \u2014 cache dirs are pinned to params via their name).
+    meta.update({"split": split, "disparity_input": disparity_input})
+    try:
+        (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    except OSError as e:
+        logger.warning(f"Could not write {out_dir / 'meta.json'}: {e}")
 
     pairs = _find_image_gt_pairs(data_root, split)
     logger.info(
@@ -477,25 +690,36 @@ def generate_density_maps(
         points = _load_points(gt_path)
 
         if hybrid:
+            assert persp_dir is not None
             persp_path = persp_dir / f"{img_path.stem}.npy"
             if not persp_path.exists():
                 logger.warning(f"Perspective map missing: {persp_path}, skipping")
                 continue
             persp_map = np.load(str(persp_path))
             density = hybrid_density(
-                img, points, persp_map,
+                img,
+                points,
+                persp_map,
                 min_sigma=hybrid_min_sigma,
                 max_sigma=hybrid_max_sigma,
                 alpha=hybrid_alpha,
+                sigma_base=sigma_base,
             )
         elif perspective_guided:
+            assert persp_dir is not None
             persp_path = persp_dir / f"{img_path.stem}.npy"
             if not persp_path.exists():
                 logger.warning(f"Perspective map missing: {persp_path}, skipping")
                 continue
             persp_map = np.load(str(persp_path))
             density = perspective_gaussian_filter_density(
-                img, points, persp_map, beta=beta, min_sigma=min_sigma
+                img,
+                points,
+                persp_map,
+                beta=beta,
+                min_sigma=min_sigma,
+                sigma_base=sigma_base,
+                max_sigma=persp_max_sigma,
             )
         else:
             density = gaussian_filter_density(img, points)

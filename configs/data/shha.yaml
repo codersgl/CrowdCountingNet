@@ -72,14 +72,16 @@ density_generation:
   # perspective_guided: sigma = max(beta * perspective, min_sigma).
   # hybrid: sigma = clip(geo_sigma * perspective, hybrid_min_sigma, hybrid_max_sigma).
   perspective_guided: false
-  hybrid: false   # geometry × perspective hybrid
+  hybrid: false # geometry × perspective hybrid
 
   # ---- perspective_guided parameters ----
-  beta: 1.0      # sigma scaling factor applied to perspective value
+  beta: 1.0 # sigma scaling factor applied to perspective value
   min_sigma: 4.6 # minimum sigma floor in pixels
 
   # ---- hybrid parameters ----
-  hybrid_min_sigma: 1.5   # floor to prevent degenerate spikes for far points
-  hybrid_max_sigma: null  # optional ceiling; null = no upper bound
-  hybrid_alpha: 0.5       # density-modulation weight in [0,1]; 0=persp-only, 1=geo-only
-  disparity_input: true   # DepthAnythingV2 outputs disparity (larger=closer)
+  hybrid_min_sigma: 1.5 # floor to prevent degenerate spikes for far points
+  hybrid_max_sigma: null # optional ceiling; null = no upper bound
+  hybrid_alpha: 0.7 # density-modulation weight in [0,1]; 0=persp-only, 1=geo-only
+  sigma_base: 4.0 # head-radius base scale (px) used by persp/hybrid modes
+  persp_max_sigma: null # optional upper bound for perspective_guided mode
+  disparity_input: true # DepthAnythingV2 outputs disparity (larger=closer)

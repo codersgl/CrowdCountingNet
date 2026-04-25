@@ -28,15 +28,49 @@ parser = argparse.ArgumentParser(
 parser.add_argument("data_root", type=str, help="ShanghaiTech dataset root")
 parser.add_argument("--image", type=str, default=None, help="Image stem, e.g. IMG_1")
 parser.add_argument("--split", type=str, default="train", choices=["train", "test"])
-parser.add_argument("--index", type=int, default=0, help="Which image to show (0-based)")
-parser.add_argument("--beta", type=float, default=0.3, help="Perspective sigma scaling")
-parser.add_argument("--min-sigma", type=float, default=1.0, help="Minimum sigma floor")
-parser.add_argument("--hybrid-min-sigma", type=float, default=1.5, help="Hybrid min sigma floor")
-parser.add_argument("--hybrid-max-sigma", type=float, default=None, help="Hybrid max sigma ceiling")
-parser.add_argument("--hybrid-alpha", type=float, default=0.5, help="Density-modulation weight in [0,1]; 0=persp-only, 1=geo-only")
+parser.add_argument(
+    "--index", type=int, default=0, help="Which image to show (0-based)"
+)
+parser.add_argument("--beta", type=float, default=1.0, help="Perspective sigma scaling")
+parser.add_argument(
+    "--min-sigma",
+    type=float,
+    default=1.0,
+    help="Minimum sigma floor (perspective_guided)",
+)
+parser.add_argument(
+    "--max-sigma",
+    type=float,
+    default=None,
+    help="Maximum sigma ceiling (perspective_guided)",
+)
+parser.add_argument(
+    "--sigma-base",
+    type=float,
+    default=4.0,
+    help="Head-radius base scale (px) at median depth; used by persp & hybrid",
+)
+parser.add_argument(
+    "--hybrid-min-sigma", type=float, default=1.5, help="Hybrid min sigma floor"
+)
+parser.add_argument(
+    "--hybrid-max-sigma", type=float, default=None, help="Hybrid max sigma ceiling"
+)
+parser.add_argument(
+    "--hybrid-alpha",
+    type=float,
+    default=0.7,
+    help="Density-modulation weight in [0,1]; 0=persp-only, 1=geo-only",
+)
 parser.add_argument("--output", type=str, default=None, help="Save figure to path")
-parser.add_argument("--encoder", type=str, default="vitb", choices=["vits", "vitb", "vitl"])
-parser.add_argument("--no-depth-model", action="store_true", help="Skip DepthAnythingV2; require pre-generated depth maps")
+parser.add_argument(
+    "--encoder", type=str, default="vitb", choices=["vits", "vitb", "vitl"]
+)
+parser.add_argument(
+    "--no-depth-model",
+    action="store_true",
+    help="Skip DepthAnythingV2; require pre-generated depth maps",
+)
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -63,7 +97,9 @@ if not pairs:
 if args.image:
     selected = [(ip, gp) for ip, gp in pairs if ip.stem == args.image]
     if not selected:
-        sys.exit(f"Image '{args.image}' not found. Available: {[p[0].stem for p in pairs[:10]]}...")
+        sys.exit(
+            f"Image '{args.image}' not found. Available: {[p[0].stem for p in pairs[:10]]}..."
+        )
     img_path, gt_path = selected[0]
 else:
     idx = min(args.index, len(pairs) - 1)
@@ -75,7 +111,9 @@ if img is None:
 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 H, W = img.shape[:2]
 points = _load_points(gt_path)
-in_bounds = (points[:, 0] >= 0) & (points[:, 0] < W) & (points[:, 1] >= 0) & (points[:, 1] < H)
+in_bounds = (
+    (points[:, 0] >= 0) & (points[:, 0] < W) & (points[:, 1] >= 0) & (points[:, 1] < H)
+)
 n_total = len(points)
 n_valid = int(in_bounds.sum())
 print(f"Image: {img_path.name}  ({W}x{H})")
@@ -105,8 +143,16 @@ elif not args.no_depth_model:
 
     encoder_configs = {
         "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
-        "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
-        "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+        "vitb": {
+            "encoder": "vitb",
+            "features": 128,
+            "out_channels": [96, 192, 384, 768],
+        },
+        "vitl": {
+            "encoder": "vitl",
+            "features": 256,
+            "out_channels": [256, 512, 1024, 1024],
+        },
     }
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DepthAnythingV2(**encoder_configs[args.encoder])
@@ -130,20 +176,32 @@ else:
 print("Generating geometry-adaptive density map...")
 dens_geo = gaussian_filter_density(img, points)
 
-print(f"Generating perspective-guided density map (beta={args.beta}, min_sigma={args.min_sigma})...")
+print(
+    f"Generating perspective-guided density map (beta={args.beta}, "
+    f"sigma_base={args.sigma_base}, min_sigma={args.min_sigma}, max_sigma={args.max_sigma})..."
+)
 dens_persp = perspective_gaussian_filter_density(
-    img, points, persp_map, beta=args.beta, min_sigma=args.min_sigma
+    img,
+    points,
+    persp_map,
+    beta=args.beta,
+    min_sigma=args.min_sigma,
+    max_sigma=args.max_sigma,
+    sigma_base=args.sigma_base,
 )
 
-hms_str = f"alpha={args.hybrid_alpha}, min_sigma={args.hybrid_min_sigma}"
+hms_str = f"alpha={args.hybrid_alpha}, sigma_base={args.sigma_base}, min_sigma={args.hybrid_min_sigma}"
 if args.hybrid_max_sigma is not None:
     hms_str += f", max_sigma={args.hybrid_max_sigma}"
 print(f"Generating hybrid density map ({hms_str})...")
 dens_hybrid = hybrid_density(
-    img, points, persp_map,
+    img,
+    points,
+    persp_map,
     min_sigma=args.hybrid_min_sigma,
     max_sigma=args.hybrid_max_sigma,
     alpha=args.hybrid_alpha,
+    sigma_base=args.sigma_base,
 )
 
 # ---------------------------------------------------------------------------
@@ -152,8 +210,10 @@ dens_hybrid = hybrid_density(
 fig, axes = plt.subplots(3, 3, figsize=(20, 18))
 fig.suptitle(
     f"{img_path.stem} — {n_total} GT points ({n_valid} in-bounds)\n"
-    f"persp-guided: beta={args.beta}, min_sigma={args.min_sigma}  |  "
-    f"hybrid: alpha={args.hybrid_alpha}, min_sigma={args.hybrid_min_sigma}, max_sigma={args.hybrid_max_sigma}",
+    f"persp-guided: beta={args.beta}, sigma_base={args.sigma_base}, "
+    f"min_sigma={args.min_sigma}, max_sigma={args.max_sigma}  |  "
+    f"hybrid: alpha={args.hybrid_alpha}, sigma_base={args.sigma_base}, "
+    f"min_sigma={args.hybrid_min_sigma}, max_sigma={args.hybrid_max_sigma}",
     fontsize=11,
 )
 
@@ -170,14 +230,18 @@ ax_img.axis("off")
 # [0,1] Geometry-Adaptive
 ax_geo = axes[0, 1]
 im_geo = ax_geo.imshow(dens_geo, cmap="jet")
-ax_geo.set_title(f"Geometry-Adaptive\nsum={dens_geo.sum():.1f}, max={dens_geo.max():.4f}")
+ax_geo.set_title(
+    f"Geometry-Adaptive\nsum={dens_geo.sum():.1f}, max={dens_geo.max():.4f}"
+)
 ax_geo.axis("off")
 plt.colorbar(im_geo, ax=ax_geo, fraction=0.046)
 
 # [0,2] Perspective-Guided
 ax_persp = axes[0, 2]
 im_persp = ax_persp.imshow(dens_persp, cmap="jet")
-ax_persp.set_title(f"Perspective-Guided\nsum={dens_persp.sum():.1f}, max={dens_persp.max():.4f}")
+ax_persp.set_title(
+    f"Perspective-Guided\nsum={dens_persp.sum():.1f}, max={dens_persp.max():.4f}"
+)
 ax_persp.axis("off")
 plt.colorbar(im_persp, ax=ax_persp, fraction=0.046)
 
@@ -192,7 +256,10 @@ plt.colorbar(im_pmap, ax=ax_pmap, fraction=0.046)
 # [1,1] Hybrid
 ax_hybrid = axes[1, 1]
 im_hybrid = ax_hybrid.imshow(dens_hybrid, cmap="jet")
-ax_hybrid.set_title(f"Hybrid (persp·(geo/persp)^α)\nsum={dens_hybrid.sum():.1f}, max={dens_hybrid.max():.4f}")
+ax_hybrid.set_title(
+    f"Hybrid (head_radius^(1-α)·geo^α)\n"
+    f"sum={dens_hybrid.sum():.1f}, max={dens_hybrid.max():.4f}"
+)
 ax_hybrid.axis("off")
 plt.colorbar(im_hybrid, ax=ax_hybrid, fraction=0.046)
 
@@ -201,7 +268,9 @@ diff_gh = dens_geo - dens_hybrid
 vmax_gh = max(abs(diff_gh.min()), abs(diff_gh.max()), 1e-9)
 ax_diff_gh = axes[1, 2]
 im_diff_gh = ax_diff_gh.imshow(diff_gh, cmap="coolwarm", vmin=-vmax_gh, vmax=vmax_gh)
-ax_diff_gh.set_title(f"Diff (Geo − Hybrid)\nsum={diff_gh.sum():.3f}, max|diff|={vmax_gh:.4f}")
+ax_diff_gh.set_title(
+    f"Diff (Geo − Hybrid)\nsum={diff_gh.sum():.3f}, max|diff|={vmax_gh:.4f}"
+)
 ax_diff_gh.axis("off")
 plt.colorbar(im_diff_gh, ax=ax_diff_gh, fraction=0.046)
 
@@ -211,7 +280,9 @@ diff_pg = dens_persp - dens_geo
 vmax_pg = max(abs(diff_pg.min()), abs(diff_pg.max()), 1e-9)
 ax_diff_pg = axes[2, 0]
 im_diff_pg = ax_diff_pg.imshow(diff_pg, cmap="coolwarm", vmin=-vmax_pg, vmax=vmax_pg)
-ax_diff_pg.set_title(f"Diff (Persp − Geo)\nsum={diff_pg.sum():.3f}, max|diff|={vmax_pg:.4f}")
+ax_diff_pg.set_title(
+    f"Diff (Persp − Geo)\nsum={diff_pg.sum():.3f}, max|diff|={vmax_pg:.4f}"
+)
 ax_diff_pg.axis("off")
 plt.colorbar(im_diff_pg, ax=ax_diff_pg, fraction=0.046)
 
@@ -220,7 +291,9 @@ diff_hp = dens_hybrid - dens_persp
 vmax_hp = max(abs(diff_hp.min()), abs(diff_hp.max()), 1e-9)
 ax_diff_hp = axes[2, 1]
 im_diff_hp = ax_diff_hp.imshow(diff_hp, cmap="coolwarm", vmin=-vmax_hp, vmax=vmax_hp)
-ax_diff_hp.set_title(f"Diff (Hybrid − Persp)\nsum={diff_hp.sum():.3f}, max|diff|={vmax_hp:.4f}")
+ax_diff_hp.set_title(
+    f"Diff (Hybrid − Persp)\nsum={diff_hp.sum():.3f}, max|diff|={vmax_hp:.4f}"
+)
 ax_diff_hp.axis("off")
 plt.colorbar(im_diff_hp, ax=ax_diff_hp, fraction=0.046)
 

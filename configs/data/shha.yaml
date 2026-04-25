@@ -67,11 +67,19 @@ depth_blur:
 
 # === Density Map Generation ===
 density_generation:
-  # When true, use depth-derived perspective maps to modulate per-pedestrian
-  # Gaussian kernel widths (sigma = max(beta * perspective, min_sigma)).
-  # When false (default), the k-NN geometry-adaptive kernel is used.
+  # ---- Mode selection (mutually exclusive; hybrid takes priority) ----
+  # geometry-adaptive (default): per-point sigma from k-NN distances.
+  # perspective_guided: sigma = max(beta * perspective, min_sigma).
+  # hybrid: sigma = clip(geo_sigma * perspective, hybrid_min_sigma, hybrid_max_sigma).
   perspective_guided: false
+  hybrid: false   # geometry × perspective hybrid
 
+  # ---- perspective_guided parameters ----
   beta: 1.0      # sigma scaling factor applied to perspective value
   min_sigma: 4.6 # minimum sigma floor in pixels
-  disparity_input: true  # DepthAnythingV2 outputs disparity (larger=closer)
+
+  # ---- hybrid parameters ----
+  hybrid_min_sigma: 1.5   # floor to prevent degenerate spikes for far points
+  hybrid_max_sigma: null  # optional ceiling; null = no upper bound
+  hybrid_alpha: 0.5       # density-modulation weight in [0,1]; 0=persp-only, 1=geo-only
+  disparity_input: true   # DepthAnythingV2 outputs disparity (larger=closer)

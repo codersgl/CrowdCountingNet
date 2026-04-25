@@ -51,6 +51,11 @@ class SHHA(Dataset):
         self.persp_disparity_input = bool(
             density_gen_cfg.get("disparity_input", True)
         )
+        self.hybrid = bool(density_gen_cfg.get("hybrid", False))
+        self.hybrid_min_sigma = float(density_gen_cfg.get("hybrid_min_sigma", 1.5))
+        _hms = density_gen_cfg.get("hybrid_max_sigma", None)
+        self.hybrid_max_sigma = float(_hms) if _hms is not None else None
+        self.hybrid_alpha = float(density_gen_cfg.get("hybrid_alpha", 0.5))
         if patch_size <= 0 or patch_size % 8 != 0:
             raise ValueError(
                 f"patch_size must be a positive multiple of 8, got {patch_size}"
@@ -148,9 +153,12 @@ class SHHA(Dataset):
             raise ValueError(f"scale_min must be positive, got {self.scale_min}")
 
         if train:
-            density_dir_name = (
-                "gt_density_maps_persp" if self.perspective_guided else "gt_density_maps"
-            )
+            if self.hybrid:
+                density_dir_name = "gt_density_maps_hybrid"
+            elif self.perspective_guided:
+                density_dir_name = "gt_density_maps_persp"
+            else:
+                density_dir_name = "gt_density_maps"
             self.gt_dmap_root = os.path.join(self.root_path, density_dir_name, "train")
             # Auto-generate density maps on first run
             if not os.path.isdir(self.gt_dmap_root) or not os.listdir(
@@ -160,8 +168,12 @@ class SHHA(Dataset):
                     data_root,
                     split="train",
                     perspective_guided=self.perspective_guided,
+                    hybrid=self.hybrid,
                     beta=self.persp_beta,
                     min_sigma=self.persp_min_sigma,
+                    hybrid_min_sigma=self.hybrid_min_sigma,
+                    hybrid_max_sigma=self.hybrid_max_sigma,
+                    hybrid_alpha=self.hybrid_alpha,
                     disparity_input=self.persp_disparity_input,
                 )
 

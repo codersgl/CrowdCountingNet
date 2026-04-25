@@ -199,6 +199,122 @@ def perspective_gaussian_filter_density(
     return density
 
 
+def hybrid_density(
+    img: np.ndarray,
+    points: np.ndarray,
+    perspective_map: np.ndarray,
+    min_sigma: float = 1.5,
+    max_sigma: float | None = None,
+    alpha: float = 0.5,
+) -> np.ndarray:
+    """Generate a density map combining geometry-adaptive k-NN with perspective.
+
+    The formula treats *perspective as the foundation* (head-size prior) and
+    uses the density component of *geo_sigma* as a modulation::
+
+        sigma_i = clip(persp_i × (geo_sigma_i / persp_i) ^ alpha,
+                       min_sigma, max_sigma)
+
+    - ``persp_i``: median-normalised perspective — the "brush size"
+      (head size in pixels, ∝ 1/depth).
+    - ``geo_sigma_i``: k-NN geometry-adaptive sigma, which encodes both
+      local crowd density AND implicit perspective (∝ 1/depth).
+    - ``geo_sigma_i / persp_i``: cancels the shared 1/depth factor from
+      *geo_sigma*, leaving an approximate "pure density" signal.
+
+    The parameter ``alpha ∈ [0, 1]`` controls the density-modulation weight:
+
+    ========  ==============================================
+    alpha=0   ``sigma = persp`` — pure head-size prior
+    alpha=0.5 ``sigma = sqrt(persp × geo_sigma)`` — balanced
+    alpha=1   ``sigma = geo_sigma`` — pure geometry-adaptive
+    ========  ==============================================
+
+    At median depth (persp = 1.0), ``sigma = geo_sigma ^ alpha``.
+
+    Args:
+        img: H×W (or H×W×C) image array — only shape is used.
+        points: N×2 array of (x, y) ground-truth point annotations.
+        perspective_map: H×W float32, median-normalised perspective values.
+        min_sigma: Minimum sigma floor in pixels (prevents degenerate
+            spikes for very distant points).
+        max_sigma: Optional upper bound; ``None`` for no limit.
+        alpha: Density-modulation weight in [0, 1] (default 0.5).
+
+    Returns:
+        density: H×W float32 density map.
+    """
+    if min_sigma <= 0:
+        raise ValueError(f"min_sigma must be positive, got {min_sigma}")
+    if max_sigma is not None and max_sigma <= 0:
+        raise ValueError(f"max_sigma must be positive, got {max_sigma}")
+    if not 0 <= alpha <= 1:
+        raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+
+    img_shape = [img.shape[0], img.shape[1]]
+    if perspective_map.shape[:2] != tuple(img_shape):
+        raise ValueError(
+            f"perspective_map shape {perspective_map.shape[:2]} "
+            f"does not match image shape {tuple(img_shape)}"
+        )
+
+    density = np.zeros(img_shape, dtype=np.float32)
+    if len(points) == 0:
+        return density
+
+    # Filter out-of-bound points
+    rounded = np.round(points).astype(np.int64)
+    in_bounds = (
+        (rounded[:, 0] >= 0)
+        & (rounded[:, 0] < img_shape[1])
+        & (rounded[:, 1] >= 0)
+        & (rounded[:, 1] < img_shape[0])
+    )
+    points = points[in_bounds]
+    rounded = rounded[in_bounds]
+    gt_count = len(points)
+    if gt_count == 0:
+        return density
+
+    # --- Geometry-adaptive sigmas (same logic as gaussian_filter_density) ---
+    leafsize = 2048
+    tree = scipy.spatial.KDTree(points.copy(), leafsize=leafsize)
+    k_query = min(4, gt_count)
+    distances, _ = tree.query(points, k=k_query)
+    if distances.ndim == 1:
+        distances = distances[:, np.newaxis]
+
+    geo_sigmas = np.empty(gt_count, dtype=np.float64)
+    if gt_count >= 4:
+        geo_sigmas = (distances[:, 1] + distances[:, 2] + distances[:, 3]) * 0.1
+    elif gt_count >= 2:
+        valid_dists = distances[:, 1:]
+        geo_sigmas = np.mean(valid_dists, axis=1) * 0.3
+    else:
+        geo_sigmas[:] = float(np.average(np.array(img_shape))) / 2.0 / 2.0
+
+    # --- Density modulation on perspective foundation ---
+    # persp = head-size prior (brush size); geo_sigma/persp ≈ pure density
+    persp_values = perspective_map[rounded[:, 1], rounded[:, 0]]
+    persp_values = np.nan_to_num(persp_values, nan=1.0, posinf=1.0, neginf=1.0)
+    persp = persp_values.astype(np.float64)
+
+    density_factor = np.ones_like(persp)
+    if alpha > 0:
+        ratio = np.maximum(geo_sigmas, 1e-6) / np.maximum(persp, 1e-6)
+        density_factor = ratio ** alpha
+
+    sigmas = persp * density_factor
+    sigmas = np.clip(sigmas, min_sigma, max_sigma or np.inf)
+
+    # --- Render ---
+    for i in range(gt_count):
+        pt2d = np.zeros(img_shape, dtype=np.float32)
+        pt2d[rounded[i, 1], rounded[i, 0]] = 1.0
+        density += gaussian_filter(pt2d, sigmas[i], mode="constant")
+    return density
+
+
 def _load_points(gt_path: Path) -> np.ndarray:
     """Load point annotations from a .mat or .txt ground-truth file.
 
@@ -287,8 +403,12 @@ def generate_density_maps(
     data_root: str | Path,
     split: str = "train",
     perspective_guided: bool = False,
+    hybrid: bool = False,
     beta: float = 0.3,
     min_sigma: float = 1.0,
+    hybrid_min_sigma: float = 1.5,
+    hybrid_max_sigma: float | None = None,
+    hybrid_alpha: float = 0.5,
     disparity_input: bool = True,
 ) -> None:
     """Generate density maps (.npy) for all images in a dataset split.
@@ -296,18 +416,22 @@ def generate_density_maps(
     No list file required — images and GT files are discovered automatically
     from the directory structure (see module docstring).
 
-    When ``perspective_guided=True``, density maps are saved to
-    ``data_root/gt_density_maps_persp/<split>/`` and generated using
-    depth-derived perspective maps for per-point sigma estimation.
-    Otherwise the default k-NN geometry-adaptive kernel is used.
+    Three generation modes (mutually exclusive; *hybrid* takes priority)::
+
+        *geometry-adaptive* (default) — k-NN based sigma.
+        *perspective-guided* — ``sigma = max(beta × perspective, min_sigma)``.
+        *hybrid* — ``sigma = clip(persp × (geo_sigma/persp)^alpha, min, max)``.
 
     Args:
         data_root: Dataset root directory.
         split: Dataset split ('train' or 'test').
         perspective_guided: If True, use perspective-guided sigma.
+        hybrid: If True, use geometry × perspective hybrid (takes priority).
         beta: Sigma scaling factor (only used when perspective_guided=True).
-        min_sigma: Minimum sigma floor in pixels (only used when
-            perspective_guided=True).
+        min_sigma: Minimum sigma floor (only used when perspective_guided=True).
+        hybrid_min_sigma: Floor for hybrid mode (default 1.5).
+        hybrid_max_sigma: Optional ceiling for hybrid mode.
+        hybrid_alpha: Density-modulation weight for hybrid mode (default 0.5).
         disparity_input: True if depth maps are disparity (DepthAnythingV2).
     """
     import cv2
@@ -315,18 +439,26 @@ def generate_density_maps(
 
     data_root = Path(data_root)
 
-    if perspective_guided:
-        out_dir = data_root / "gt_density_maps_persp" / split
+    # Resolve perspective directory (needed for perspective_guided and hybrid)
+    _need_persp = perspective_guided or hybrid
+    if _need_persp:
         persp_dir = data_root / "gt_perspective" / split
         if not persp_dir.is_dir() or not any(persp_dir.iterdir()):
             logger.info("Perspective maps not found, generating from depth maps...")
             generate_perspective_maps(data_root, split, disparity_input=disparity_input)
+
+    if hybrid:
+        out_dir = data_root / "gt_density_maps_hybrid" / split
+        mode_label = "hybrid (geo × persp)"
+    elif perspective_guided:
+        out_dir = data_root / "gt_density_maps_persp" / split
+        mode_label = "perspective-guided"
     else:
         out_dir = data_root / "gt_density_maps" / split
+        mode_label = "geometry-adaptive"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pairs = _find_image_gt_pairs(data_root, split)
-    mode_label = "perspective-guided" if perspective_guided else "geometry-adaptive"
     logger.info(
         f"Generating {mode_label} density maps for split='{split}' "
         f"({len(pairs)} images)..."
@@ -344,7 +476,19 @@ def generate_density_maps(
 
         points = _load_points(gt_path)
 
-        if perspective_guided:
+        if hybrid:
+            persp_path = persp_dir / f"{img_path.stem}.npy"
+            if not persp_path.exists():
+                logger.warning(f"Perspective map missing: {persp_path}, skipping")
+                continue
+            persp_map = np.load(str(persp_path))
+            density = hybrid_density(
+                img, points, persp_map,
+                min_sigma=hybrid_min_sigma,
+                max_sigma=hybrid_max_sigma,
+                alpha=hybrid_alpha,
+            )
+        elif perspective_guided:
             persp_path = persp_dir / f"{img_path.stem}.npy"
             if not persp_path.exists():
                 logger.warning(f"Perspective map missing: {persp_path}, skipping")

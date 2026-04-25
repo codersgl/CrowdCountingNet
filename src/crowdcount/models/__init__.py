@@ -50,6 +50,9 @@ def build_model(cfg: DictConfig, training: bool = False):
         gcn_k_max=getattr(cfg.model, "gcn_k_max", 8),
         gcn_density_scale=getattr(cfg.model, "gcn_density_scale", 4.0),
         gcn_sim_threshold=getattr(cfg.model, "gcn_sim_threshold", 0.5),
+        gcn_spatial_prior=getattr(cfg.model, "gcn_spatial_prior", False),
+        gcn_spatial_alpha=float(getattr(cfg.model, "gcn_spatial_alpha", 1.0)),
+        gcn_spatial_beta=float(getattr(cfg.model, "gcn_spatial_beta", 1.0)),
         cfg=cfg,  # Pass config for multi-scale density prediction
         use_dcn=getattr(cfg.model, "use_dcn", False),
         use_refine=getattr(cfg.model, "use_refine", False),
@@ -91,9 +94,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_density_adaptive_fusion=getattr(
             cfg.model, "use_density_adaptive_fusion", False
         ),
-        density_adaptive_fusion_cfg=getattr(
-            cfg.model, "density_adaptive_fusion", None
-        ),
+        density_adaptive_fusion_cfg=getattr(cfg.model, "density_adaptive_fusion", None),
     )
 
     if not training:

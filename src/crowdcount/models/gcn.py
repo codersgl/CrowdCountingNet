@@ -77,6 +77,78 @@ class DensityGraphBuilder:
         return edge_index, edge_attr, num_nodes_total, H, W
 
 
+class SpatialPriorDensityGraphBuilder:
+    """Density k-NN graph with spatial-distance regularisation.
+
+    Edge cost: ``alpha * |Δd| / scale_d  +  beta * ‖Δp‖ / sigma_p``,
+    where ``scale_d`` is the per-image median pairwise density distance and
+    ``sigma_p`` is the median pairwise spatial distance on the feature grid.
+    The spatial term suppresses semantically-spurious long-range edges that
+    plain density k-NN tends to produce when many cells share similar
+    densities (Diag A: long-range edges 67.8% → 0.1% on SHA test).
+    The output schema (``edge_index, edge_attr, num_nodes_total, H, W``)
+    matches ``DensityGraphBuilder`` so the rest of the pipeline is
+    unchanged.
+    """
+
+    def __init__(self, k: int = 4, alpha: float = 1.0, beta: float = 1.0):
+        self.k = k
+        self.alpha = alpha
+        self.beta = beta
+
+    def build_batch_graph(self, density_maps: torch.Tensor):
+        B, _C, H, W = density_maps.shape
+        num_nodes = H * W
+        device = density_maps.device
+        dtype = density_maps.dtype
+        flat_density = density_maps.view(B, -1)  # [B, N]
+
+        # Spatial coordinates on the feature grid (shared across the batch)
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device=device, dtype=dtype),
+            torch.arange(W, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        coords = torch.stack([xs.reshape(-1), ys.reshape(-1)], dim=-1)  # [N, 2]
+        p_dist = torch.cdist(coords, coords, p=2.0)  # [N, N]
+        sigma_p = p_dist.median().clamp_min(1e-6)
+
+        # Per-image density distance and its scale
+        d_dist = (
+            flat_density.unsqueeze(2) - flat_density.unsqueeze(1)
+        ).abs()  # [B, N, N]
+        # Robust per-image scale: median across all pairs, broadcast back.
+        d_scale = d_dist.reshape(B, -1).median(dim=1).values.view(B, 1, 1) + 1e-6
+
+        cost = self.alpha * d_dist / d_scale + self.beta * (
+            p_dist.unsqueeze(0) / sigma_p
+        )  # [B, N, N]
+        sorted_indices = torch.argsort(cost, dim=2)[:, :, 1 : self.k + 1]  # [B, N, k]
+
+        # Edge attribute uses density distance (consistent with the baseline
+        # builder), so downstream GCN sees the same edge-weight semantics.
+        edge_d = torch.gather(d_dist, 2, sorted_indices)  # [B, N, k]
+        edge_attr = torch.exp(-edge_d).reshape(-1, 1)  # [B*N*k, 1]
+
+        src_nodes = (
+            torch.arange(num_nodes, device=device)
+            .view(1, num_nodes, 1)
+            .expand(B, num_nodes, self.k)
+        )
+        tgt_nodes = sorted_indices
+
+        batch_offset = torch.arange(B, device=device).view(B, 1, 1) * num_nodes
+        src_nodes = (src_nodes + batch_offset).reshape(-1)
+        tgt_nodes = (tgt_nodes + batch_offset).reshape(-1)
+        edge_index = torch.stack([src_nodes, tgt_nodes], dim=0)
+
+        num_nodes_total = B * num_nodes
+        edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes_total)
+        self_loop_attr = torch.ones(num_nodes_total, 1, device=device)
+        edge_attr = torch.cat([edge_attr, self_loop_attr], dim=0)
+        return edge_index, edge_attr, num_nodes_total, H, W
+
+
 class AdaptiveDensityGraphBuilder:
     """Density-guided adaptive graph builder.
 
@@ -510,6 +582,9 @@ class DensityGCNProcessor(nn.Module):
         uncertainty_scale: float = 6.0,
         anisotropic: bool = False,
         conv_type: str = "gcn",
+        spatial_prior: bool = False,
+        spatial_alpha: float = 1.0,
+        spatial_beta: float = 1.0,
     ):
         super().__init__()
         self._use_uncertainty = use_uncertainty
@@ -526,6 +601,10 @@ class DensityGCNProcessor(nn.Module):
         elif adaptive:
             self.graph_builder = AdaptiveDensityGraphBuilder(
                 k_base=k, k_min=k_min, k_max=k_max, density_scale=density_scale
+            )
+        elif spatial_prior:
+            self.graph_builder = SpatialPriorDensityGraphBuilder(
+                k=k, alpha=spatial_alpha, beta=spatial_beta
             )
         else:
             self.graph_builder = DensityGraphBuilder(k)
@@ -1075,9 +1154,7 @@ class DensityAdaptiveFusion(nn.Module):
             combined = torch.cat(
                 [features_pa, density_gcn_feat, feature_gcn_feat, d_emb], dim=1
             )
-            weights = F.softmax(
-                self.weight_proj(combined), dim=1
-            )  # [B, 3, H, W]
+            weights = F.softmax(self.weight_proj(combined), dim=1)  # [B, 3, H, W]
             fused = (
                 weights[:, 0:1] * features_pa
                 + weights[:, 1:2] * density_gcn_feat

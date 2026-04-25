@@ -52,6 +52,14 @@ gcn_k_max: 8 # adaptive mode: maximum neighbours per node
 gcn_density_scale: 4.0 # adaptive DensityGCN: scale factor for density → k mapping
 gcn_sim_threshold: 0.5 # adaptive FeatureGCN: cosine similarity threshold
 
+# Spatial-prior density graph (Diag A finding):
+# Adds a spatial-distance regulariser to the density k-NN cost so that
+# semantically-spurious long-range edges are suppressed. Only used when
+# gcn_mode=fixed and gcn_adaptive=false. Cost = alpha*|Δd|/scale_d + beta*‖Δp‖/sigma_p.
+gcn_spatial_prior: false
+gcn_spatial_alpha: 1.0
+gcn_spatial_beta: 1.0
+
 # Uncertainty-Guided Adaptive GCN (disabled by default)
 # Computes pixel-wise uncertainty from the density head and uses it to:
 # 1) modulate per-node k in the graph builder (high uncertainty → more neighbours)

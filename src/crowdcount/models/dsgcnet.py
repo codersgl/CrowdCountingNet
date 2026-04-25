@@ -128,6 +128,9 @@ class DSGCnet(nn.Module):
         gcn_k_max: int = 8,
         gcn_density_scale: float = 4.0,
         gcn_sim_threshold: float = 0.5,
+        gcn_spatial_prior: bool = False,
+        gcn_spatial_alpha: float = 1.0,
+        gcn_spatial_beta: float = 1.0,
         gcn_mode: str = "fixed",
         gcn_num_supernodes: int = 8,
         gcn_supernode_heads: int = 4,
@@ -619,6 +622,9 @@ class DSGCnet(nn.Module):
                     uncertainty_scale=uncertainty_scale,
                     anisotropic=gcn_aniso,
                     conv_type=gcn_conv_type,
+                    spatial_prior=gcn_spatial_prior,
+                    spatial_alpha=gcn_spatial_alpha,
+                    spatial_beta=gcn_spatial_beta,
                 )
                 self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(
                     k=gcn_k,
@@ -1223,7 +1229,9 @@ class DSGCnet(nn.Module):
                 elif self.density_adaptive_fusion is not None:
                     # Density-Adaptive Fusion: density-conditioned per-pixel weights
                     feature_fl = self.density_adaptive_fusion(
-                        features_pa, density_gcn_feature, feature_gcn_feature,
+                        features_pa,
+                        density_gcn_feature,
+                        feature_gcn_feature,
                         density.detach(),
                     )
                 elif self.gm is not None:

@@ -19,6 +19,7 @@ from crowdcount.models.gcn import (
     FeatureGraphBuilder,
     GATv2Model,
     GCNModel,
+    SpatialPriorDensityGraphBuilder,
     UncertaintyAdaptiveDensityGraphBuilder,
     compute_uncertainty,
 )
@@ -88,6 +89,58 @@ def test_adaptive_feature_graph_builder(small_feature_map):
     num_edges_no_self = edge_index.shape[1] - num_nodes_total
     total_nodes = 2 * 8 * 8
     assert num_edges_no_self >= total_nodes * 2
+
+
+def test_spatial_prior_density_graph_builder(small_density_map):
+    builder = SpatialPriorDensityGraphBuilder(k=2, alpha=1.0, beta=1.0)
+    edge_index, edge_attr, num_nodes_total, H, W = builder.build_batch_graph(
+        small_density_map
+    )
+    assert edge_index.shape[0] == 2
+    assert edge_attr.shape == (edge_index.shape[1], 1)
+    assert num_nodes_total == 2 * 8 * 8
+    # k * num_nodes neighbour edges + num_nodes self-loop edges
+    assert edge_index.shape[1] == 2 * 8 * 8 * (2 + 1)
+
+
+def test_spatial_prior_density_graph_builder_shorter_edges():
+    """The spatial prior should reduce mean edge length vs. plain density k-NN."""
+    torch.manual_seed(0)
+    # Random density map so density k-NN tends to wander.
+    density = torch.rand(1, 1, 16, 16)
+    plain = DensityGraphBuilder(k=4)
+    spatial = SpatialPriorDensityGraphBuilder(k=4, alpha=1.0, beta=1.0)
+
+    H, W = 16, 16
+    ys, xs = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32),
+        torch.arange(W, dtype=torch.float32),
+        indexing="ij",
+    )
+    coords = torch.stack([xs.reshape(-1), ys.reshape(-1)], dim=-1)
+
+    def mean_edge_dist(builder):
+        ei, _, num_nodes_total, _, _ = builder.build_batch_graph(density)
+        # Drop the self-loops (last num_nodes_total entries)
+        ei = ei[:, : ei.shape[1] - num_nodes_total]
+        return (coords[ei[0]] - coords[ei[1]]).norm(dim=-1).mean().item()
+
+    assert mean_edge_dist(spatial) < mean_edge_dist(plain) * 0.5
+
+
+def test_density_gcn_processor_with_spatial_prior(small_feature_map, small_density_map):
+    proc = DensityGCNProcessor(
+        k=2,
+        in_channels=256,
+        hidden_channels=128,
+        out_channels=256,
+        spatial_prior=True,
+        spatial_alpha=1.0,
+        spatial_beta=1.0,
+    )
+    assert isinstance(proc.graph_builder, SpatialPriorDensityGraphBuilder)
+    out = proc(small_density_map, small_feature_map)
+    assert out.shape == small_feature_map.shape
 
 
 def test_adaptive_density_graph_builder_uniform_density():

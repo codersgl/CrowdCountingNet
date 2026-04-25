@@ -3,6 +3,7 @@
 Usage:
     python visual_scripts/view_density.py data/shanghaitech/part_A_final
     python visual_scripts/view_density.py DATA_ROOT --image IMG_1 --persp
+    python visual_scripts/view_density.py DATA_ROOT --image IMG_1 --hybrid
     python visual_scripts/view_density.py DATA_ROOT --split test --index 5 -o out.png
 """
 
@@ -24,6 +25,7 @@ parser.add_argument("--image", type=str, default=None, help="Image stem, e.g. IM
 parser.add_argument("--split", type=str, default="train", choices=["train", "test"])
 parser.add_argument("--index", type=int, default=0, help="0-based image index")
 parser.add_argument("--persp", action="store_true", help="Show perspective-guided density maps")
+parser.add_argument("--hybrid", action="store_true", help="Show hybrid (persp × geo/persp) density maps")
 parser.add_argument("--no-points", action="store_true", help="Hide GT point overlay")
 parser.add_argument("-o", "--output", type=str, default=None, help="Output PNG path (auto-generated if omitted)")
 args = parser.parse_args()
@@ -34,10 +36,17 @@ from crowdcount.data.prepare import _find_image_gt_pairs, _load_points
 # Determine density map directory
 # ---------------------------------------------------------------------------
 data_root = Path(args.data_root)
-dens_key = "gt_density_maps_persp" if args.persp else "gt_density_maps"
+if args.hybrid:
+    dens_key = "gt_density_maps_hybrid"
+    mode = "hybrid"
+elif args.persp:
+    dens_key = "gt_density_maps_persp"
+    mode = "perspective-guided"
+else:
+    dens_key = "gt_density_maps"
+    mode = "geometry-adaptive"
 dens_dir = data_root / dens_key / args.split
 if not dens_dir.is_dir() or not any(dens_dir.iterdir()):
-    mode = "perspective-guided" if args.persp else "geometry-adaptive"
     sys.exit(f"No {mode} density maps found at {dens_dir}")
 
 # ---------------------------------------------------------------------------
@@ -130,6 +139,7 @@ if canvas.shape[1] > max_display_w:
 # ---------------------------------------------------------------------------
 # Save
 # ---------------------------------------------------------------------------
-out_path = args.output or f"density_{img_path.stem}_{'persp' if args.persp else 'geo'}_{args.split}.png"
+_mode_tag = "hybrid" if args.hybrid else ("persp" if args.persp else "geo")
+out_path = args.output or f"density_{img_path.stem}_{_mode_tag}_{args.split}.png"
 cv2.imwrite(out_path, canvas)
 print(f"Saved to {out_path}")

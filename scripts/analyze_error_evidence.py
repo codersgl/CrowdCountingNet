@@ -258,7 +258,9 @@ def _counts_after_nms(
     counts = np.zeros(len(records), dtype=np.float64)
     for index, record in enumerate(records):
         mask = record.scores > threshold
-        counts[index] = int(_greedy_nms(record.scores[mask], record.points[mask], radius).sum())
+        counts[index] = int(
+            _greedy_nms(record.scores[mask], record.points[mask], radius).sum()
+        )
     return counts
 
 
@@ -361,7 +363,9 @@ def _matching_sensitivity_rows(
                     if int(result.nearest_gt_idx[pred_idx]) in matched_gt_set:
                         high_fp_near_matched_gt += 1
                 if np.any(high_fp_mask):
-                    nearest_high_fp.extend(result.nearest_gt_dist[high_fp_mask].tolist())
+                    nearest_high_fp.extend(
+                        result.nearest_gt_dist[high_fp_mask].tolist()
+                    )
 
                 fn_near_score05 = 0
                 fn_near_any_score = 0
@@ -435,7 +439,9 @@ def _nearest_unmatched_gt_candidates(
     near_any = 0
     if len(record.gt_points) == 0 or len(record.points) == 0:
         return {"near_threshold": near_threshold, "near_any": near_any}
-    distances = np.linalg.norm(record.gt_points[:, None, :] - record.points[None, :, :], axis=2)
+    distances = np.linalg.norm(
+        record.gt_points[:, None, :] - record.points[None, :, :], axis=2
+    )
     for gt_idx in np.flatnonzero(~result.matched_gt):
         gt_dist = distances[int(gt_idx)]
         near_mask = gt_dist <= match_distance
@@ -462,14 +468,24 @@ def _score_band_rows(
         candidate_mask = record.scores > threshold
         scores = record.scores[candidate_mask]
         points = record.points[candidate_mask]
-        result = _match_predictions(scores, points, record.gt_points, match_distance, matcher)
+        result = _match_predictions(
+            scores, points, record.gt_points, match_distance, matcher
+        )
         matched_gt_set = set(np.flatnonzero(result.matched_gt).tolist())
         for band_idx in range(len(bands) - 1):
             low = float(bands[band_idx])
             high = float(bands[band_idx + 1])
-            band_mask = (scores >= low) & (scores <= high) if band_idx == len(bands) - 2 else (scores >= low) & (scores < high)
+            band_mask = (
+                (scores >= low) & (scores <= high)
+                if band_idx == len(bands) - 2
+                else (scores >= low) & (scores < high)
+            )
             fp_mask = band_mask & (~result.matched_pred)
-            near_gt_mask = fp_mask & (result.nearest_gt_idx >= 0) & (result.nearest_gt_dist <= match_distance)
+            near_gt_mask = (
+                fp_mask
+                & (result.nearest_gt_idx >= 0)
+                & (result.nearest_gt_dist <= match_distance)
+            )
             near_matched = 0
             for pred_idx in np.flatnonzero(near_gt_mask):
                 if int(result.nearest_gt_idx[pred_idx]) in matched_gt_set:
@@ -518,19 +534,27 @@ def _collect_records(
         scores = torch.softmax(logits, dim=-1)[:, 1].numpy().astype(np.float64)
         target = targets[0]
         image_id = int(target["image_id"].item()) if "image_id" in target else index
-        image_path = str(Path(data_root) / "test_data" / "images" / f"IMG_{image_id}.jpg")
+        image_path = str(
+            Path(data_root) / "test_data" / "images" / f"IMG_{image_id}.jpg"
+        )
         records.append(
             EvidenceRecord(
                 image_id=image_id,
                 image_path=image_path,
                 gt_count=int(target["point"].shape[0]),
                 scores=scores,
-                points=outputs["pred_points"][0].detach().cpu().numpy().astype(np.float64),
+                points=outputs["pred_points"][0]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64),
                 gt_points=target["point"].detach().cpu().numpy().astype(np.float64),
             )
         )
         if (index + 1) % 25 == 0:
-            logger.info(f"Collected predictions for {index + 1}/{len(data_loader.dataset)} images")
+            logger.info(
+                f"Collected predictions for {index + 1}/{len(data_loader.dataset)} images"
+            )
     return records
 
 
@@ -546,19 +570,25 @@ def _visualize_top_images(
     vis_dir = output_dir / "visualizations"
     vis_dir.mkdir(parents=True, exist_ok=True)
     record_by_id = {record.image_id: record for record in records}
-    selected = sorted(per_image_rows, key=lambda row: int(row["high_fp"]), reverse=True)[:max_images]
+    selected = sorted(
+        per_image_rows, key=lambda row: int(row["high_fp"]), reverse=True
+    )[:max_images]
     saved: list[dict[str, Any]] = []
     for row in selected:
         record = record_by_id[int(row["image_id"])]
         image = cv2.imread(record.image_path)
         if image is None:
-            logger.warning(f"Could not read image for visualization: {record.image_path}")
+            logger.warning(
+                f"Could not read image for visualization: {record.image_path}"
+            )
             continue
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         candidate_mask = record.scores > threshold
         scores = record.scores[candidate_mask]
         points = record.points[candidate_mask]
-        result = _match_predictions(scores, points, record.gt_points, match_distance, "greedy")
+        result = _match_predictions(
+            scores, points, record.gt_points, match_distance, "greedy"
+        )
         fp_mask = ~result.matched_pred
         high_fp_mask = fp_mask & (scores >= high_score)
         fn_gt = record.gt_points[~result.matched_gt]
@@ -566,15 +596,45 @@ def _visualize_top_images(
         plt.figure(figsize=(10, 8))
         plt.imshow(image)
         if len(record.gt_points):
-            plt.scatter(record.gt_points[:, 0], record.gt_points[:, 1], s=18, c="lime", marker="+", label="GT")
+            plt.scatter(
+                record.gt_points[:, 0],
+                record.gt_points[:, 1],
+                s=18,
+                c="lime",
+                marker="+",
+                label="GT",
+            )
         if np.any(result.matched_pred):
-            plt.scatter(points[result.matched_pred, 0], points[result.matched_pred, 1], s=8, c="cyan", label="TP")
+            plt.scatter(
+                points[result.matched_pred, 0],
+                points[result.matched_pred, 1],
+                s=8,
+                c="cyan",
+                label="TP",
+            )
         if np.any(fp_mask):
-            plt.scatter(points[fp_mask, 0], points[fp_mask, 1], s=10, c="red", alpha=0.55, label="FP")
+            plt.scatter(
+                points[fp_mask, 0],
+                points[fp_mask, 1],
+                s=10,
+                c="red",
+                alpha=0.55,
+                label="FP",
+            )
         if np.any(high_fp_mask):
-            plt.scatter(points[high_fp_mask, 0], points[high_fp_mask, 1], s=32, facecolors="none", edgecolors="magenta", linewidths=1.2, label="FP score>=0.9")
+            plt.scatter(
+                points[high_fp_mask, 0],
+                points[high_fp_mask, 1],
+                s=32,
+                facecolors="none",
+                edgecolors="magenta",
+                linewidths=1.2,
+                label="FP score>=0.9",
+            )
         if len(fn_gt):
-            plt.scatter(fn_gt[:, 0], fn_gt[:, 1], s=34, c="yellow", marker="x", label="FN GT")
+            plt.scatter(
+                fn_gt[:, 0], fn_gt[:, 1], s=34, c="yellow", marker="x", label="FN GT"
+            )
         plt.title(
             f"IMG_{record.image_id}: GT={record.gt_count}, pred={len(scores)}, FP={int(fp_mask.sum())}, highFP={int(high_fp_mask.sum())}"
         )
@@ -607,10 +667,15 @@ def _save_plots(
     band_rows: list[dict[str, float | int]],
 ) -> None:
     plt.figure(figsize=(7, 5))
-    plt.plot([row["threshold"] for row in threshold_rows], [row["mae"] for row in threshold_rows])
+    plt.plot(
+        [row["threshold"] for row in threshold_rows],
+        [row["mae"] for row in threshold_rows],
+    )
     best = min(threshold_rows, key=lambda row: row["mae"])
     plt.axvline(0.5, color="gray", linestyle="--", linewidth=1, label="0.5")
-    plt.axvline(best["threshold"], color="red", linestyle="--", linewidth=1, label="best")
+    plt.axvline(
+        best["threshold"], color="red", linestyle="--", linewidth=1, label="best"
+    )
     plt.xlabel("Score threshold")
     plt.ylabel("MAE")
     plt.legend()
@@ -636,7 +701,9 @@ def _save_plots(
     labels = [f"{row['bin_low']:.1f}-{row['bin_high']:.1f}" for row in band_rows]
     x = np.arange(len(labels))
     fp = np.asarray([row["fp"] for row in band_rows], dtype=np.float64)
-    near_matched = np.asarray([row["near_matched_gt_fp"] for row in band_rows], dtype=np.float64)
+    near_matched = np.asarray(
+        [row["near_matched_gt_fp"] for row in band_rows], dtype=np.float64
+    )
     plt.figure(figsize=(9, 5))
     plt.bar(x, fp, label="FP")
     plt.bar(x, near_matched, label="FP near matched GT")
@@ -673,7 +740,9 @@ def main(cfg: DictConfig) -> None:
     seed = int(_cfg_get(evidence_cfg, "seed", 42))
     max_visualizations = int(_cfg_get(evidence_cfg, "max_visualizations", 8))
     bands = np.arange(0.0, 1.0 + 0.05, 0.1)
-    thresholds = np.arange(threshold_min, threshold_max + threshold_step / 2, threshold_step)
+    thresholds = np.arange(
+        threshold_min, threshold_max + threshold_step / 2, threshold_step
+    )
 
     predict_cfg = OmegaConf.to_container(cfg, resolve=True).get("predict", {})
     weight_path = str(predict_cfg.get("weight_path", "weights/SHTechA.pth"))
@@ -685,7 +754,11 @@ def main(cfg: DictConfig) -> None:
     if not os.path.exists(weight_path):
         raise FileNotFoundError(f"Weight file not found: {weight_path}")
     checkpoint = torch.load(weight_path, map_location="cpu")
-    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    state_dict = (
+        checkpoint["model"]
+        if isinstance(checkpoint, dict) and "model" in checkpoint
+        else checkpoint
+    )
     model.load_state_dict(state_dict)
     logger.info(f"Loaded weights from {weight_path}")
 
@@ -700,7 +773,11 @@ def main(cfg: DictConfig) -> None:
         num_workers=cfg.num_workers,
     )
     records = _collect_records(
-        model, val_loader, device, use_depth=use_depth, data_root=str(cfg.data.data_root)
+        model,
+        val_loader,
+        device,
+        use_depth=use_depth,
+        data_root=str(cfg.data.data_root),
     )
     logger.info("Finished prediction collection; running statistical diagnostics")
     gt = np.asarray([record.gt_count for record in records], dtype=np.float64)
@@ -761,7 +838,9 @@ def main(cfg: DictConfig) -> None:
         "score_bands_greedy_8px": band_rows,
         "top_high_fp_images": visualizations,
     }
-    with (output_dir / "error_evidence_summary.json").open("w", encoding="utf-8") as file:
+    with (output_dir / "error_evidence_summary.json").open(
+        "w", encoding="utf-8"
+    ) as file:
         json.dump(summary, file, indent=2)
     _save_plots(output_dir, threshold_rows, nms_summary, band_rows)
 

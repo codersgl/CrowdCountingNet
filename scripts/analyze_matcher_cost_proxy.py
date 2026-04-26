@@ -120,7 +120,9 @@ def _assign_for_cost(
     matched_distances = np.full(gt_count, np.nan, dtype=np.float64)
     matched_costs = np.full(gt_count, np.nan, dtype=np.float64)
     if gt_count == 0 or len(record.scores) == 0:
-        return AssignmentRecord(gt_to_query, matched_scores, matched_distances, matched_costs)
+        return AssignmentRecord(
+            gt_to_query, matched_scores, matched_distances, matched_costs
+        )
 
     candidate_idx = _select_candidate_indices(
         record.scores,
@@ -142,7 +144,9 @@ def _assign_for_cost(
     matched_scores[gt_idx] = record.scores[full_query_idx]
     matched_distances[gt_idx] = distances[pred_idx, gt_idx]
     matched_costs[gt_idx] = costs[pred_idx, gt_idx]
-    return AssignmentRecord(gt_to_query, matched_scores, matched_distances, matched_costs)
+    return AssignmentRecord(
+        gt_to_query, matched_scores, matched_distances, matched_costs
+    )
 
 
 def _summarize_assignment(
@@ -167,10 +171,18 @@ def _summarize_assignment(
         "dist_median": _finite_median(distances),
         "dist_p90": _finite_quantile(distances, 0.90),
         "cost_mean": _finite_mean(costs),
-        "matched_score_gt_05": float(np.mean(scores > 0.5)) if scores.size else float("nan"),
-        "matched_score_gt_09": float(np.mean(scores >= 0.9)) if scores.size else float("nan"),
-        "matched_dist_gt_8": float(np.mean(distances > 8.0)) if distances.size else float("nan"),
-        "matched_dist_gt_12": float(np.mean(distances > 12.0)) if distances.size else float("nan"),
+        "matched_score_gt_05": float(np.mean(scores > 0.5))
+        if scores.size
+        else float("nan"),
+        "matched_score_gt_09": float(np.mean(scores >= 0.9))
+        if scores.size
+        else float("nan"),
+        "matched_dist_gt_8": float(np.mean(distances > 8.0))
+        if distances.size
+        else float("nan"),
+        "matched_dist_gt_12": float(np.mean(distances > 12.0))
+        if distances.size
+        else float("nan"),
     }
     if baseline_assignments is None:
         row.update(
@@ -195,8 +207,13 @@ def _summarize_assignment(
         if not np.any(valid_pair):
             continue
         same = assignment.gt_to_query[valid_pair] == baseline.gt_to_query[valid_pair]
-        score_delta = assignment.matched_scores[valid_pair] - baseline.matched_scores[valid_pair]
-        dist_delta = assignment.matched_distances[valid_pair] - baseline.matched_distances[valid_pair]
+        score_delta = (
+            assignment.matched_scores[valid_pair] - baseline.matched_scores[valid_pair]
+        )
+        dist_delta = (
+            assignment.matched_distances[valid_pair]
+            - baseline.matched_distances[valid_pair]
+        )
         same_flags.append(same)
         score_deltas.append(score_delta)
         dist_deltas.append(dist_delta)
@@ -215,7 +232,9 @@ def _summarize_assignment(
     )
     row.update(
         {
-            "same_gt_query_rate": float(np.mean(same_all)) if same_all.size else float("nan"),
+            "same_gt_query_rate": float(np.mean(same_all))
+            if same_all.size
+            else float("nan"),
             "score_delta_vs_base": _finite_mean(score_delta_all),
             "dist_delta_vs_base": _finite_mean(dist_delta_all),
             "changed_score_delta": _finite_mean(changed_score_all),
@@ -249,15 +268,23 @@ def _collect_records(
         target = targets[0]
         records.append(
             PredictionRecord(
-                image_id=int(target["image_id"].item()) if "image_id" in target else index,
+                image_id=int(target["image_id"].item())
+                if "image_id" in target
+                else index,
                 gt_count=int(target["point"].shape[0]),
                 scores=scores.numpy().astype(np.float64),
-                points=outputs["pred_points"][0].detach().cpu().numpy().astype(np.float64),
+                points=outputs["pred_points"][0]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64),
                 gt_points=target["point"].detach().cpu().numpy().astype(np.float64),
             )
         )
         if (index + 1) % 25 == 0:
-            logger.info(f"Collected predictions for {index + 1}/{len(data_loader.dataset)} images")
+            logger.info(
+                f"Collected predictions for {index + 1}/{len(data_loader.dataset)} images"
+            )
     return records
 
 
@@ -287,7 +314,9 @@ def _save_plots(output_dir: Path, rows: list[dict[str, float | int]]) -> None:
     plt.close()
 
     plt.figure(figsize=(7, 5))
-    plt.plot(costs, [float(row["score_mean"]) for row in rows], marker="o", label="mean")
+    plt.plot(
+        costs, [float(row["score_mean"]) for row in rows], marker="o", label="mean"
+    )
     plt.plot(costs, [float(row["score_p10"]) for row in rows], marker="o", label="p10")
     plt.xscale("log")
     plt.xlabel("Matcher cost_point")
@@ -320,7 +349,9 @@ def main(cfg: DictConfig) -> None:
     cost_points = _parse_float_list(
         _cfg_get(proxy_cfg, "cost_points", None), [0.025, 0.05, 0.1, 0.2, 0.4]
     )
-    baseline_cost_point = float(_cfg_get(proxy_cfg, "baseline_cost_point", cfg.model.set_cost_point))
+    baseline_cost_point = float(
+        _cfg_get(proxy_cfg, "baseline_cost_point", cfg.model.set_cost_point)
+    )
     cost_class = float(_cfg_get(proxy_cfg, "cost_class", cfg.model.set_cost_class))
     candidate_factor = float(_cfg_get(proxy_cfg, "candidate_factor", 3.0))
     candidate_extra = int(_cfg_get(proxy_cfg, "candidate_extra", 512))
@@ -339,7 +370,11 @@ def main(cfg: DictConfig) -> None:
     if not os.path.exists(weight_path):
         raise FileNotFoundError(f"Weight file not found: {weight_path}")
     checkpoint = torch.load(weight_path, map_location="cpu")
-    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    state_dict = (
+        checkpoint["model"]
+        if isinstance(checkpoint, dict) and "model" in checkpoint
+        else checkpoint
+    )
     model.load_state_dict(state_dict)
     logger.info(f"Loaded weights from {weight_path}")
 
@@ -397,7 +432,9 @@ def main(cfg: DictConfig) -> None:
         },
         "rows": rows,
     }
-    with (output_dir / "matcher_proxy_summary.json").open("w", encoding="utf-8") as file:
+    with (output_dir / "matcher_proxy_summary.json").open(
+        "w", encoding="utf-8"
+    ) as file:
         json.dump(summary, file, indent=2)
     _save_plots(output_dir, rows)
 

@@ -343,7 +343,9 @@ def _collect_records(
             )
         )
         if (index + 1) % 25 == 0:
-            logger.info(f"Collected predictions for {index + 1}/{len(data_loader.dataset)} images")
+            logger.info(
+                f"Collected predictions for {index + 1}/{len(data_loader.dataset)} images"
+            )
     return records
 
 
@@ -411,9 +413,7 @@ def _save_plots(
 def main(cfg: DictConfig) -> None:
     nms_cfg = getattr(cfg, "nms_diag", None)
     timestamp = datetime.now().strftime("%Y-%m-%d/%H-%M-%S")
-    output_dir = Path(
-        _cfg_get(nms_cfg, "output_dir", f"outputs/nms_dedup/{timestamp}")
-    )
+    output_dir = Path(_cfg_get(nms_cfg, "output_dir", f"outputs/nms_dedup/{timestamp}"))
     output_dir.mkdir(parents=True, exist_ok=True)
     setup_logger(log_dir=str(output_dir), log_file="nms_dedup.log")
 

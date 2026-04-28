@@ -463,3 +463,57 @@ def test_feature_gcn_processor_gatv2(small_feature_map):
     )
     out = proc(small_feature_map)
     assert out.shape == small_feature_map.shape
+
+
+# ---------------------------------------------------------------------------
+# Deformable Graph Attention (conv_type="deformable")
+# ---------------------------------------------------------------------------
+
+
+def test_density_gcn_processor_deformable(small_feature_map, small_density_map):
+    proc = DensityGCNProcessor(
+        k=4, in_channels=256, hidden_channels=128, out_channels=256, conv_type="deformable"
+    )
+    out = proc(small_density_map, small_feature_map)
+    assert out.shape == small_feature_map.shape
+    assert proc.graph_builder is None
+
+
+def test_feature_gcn_processor_deformable(small_feature_map):
+    proc = FeatureGCNProcessor(
+        k=4, in_channels=256, hidden_channels=128, out_channels=256, conv_type="deformable"
+    )
+    out = proc(small_feature_map)
+    assert out.shape == small_feature_map.shape
+    assert proc.graph_builder is None
+
+
+def test_density_gcn_processor_deformable_gradient_flow(small_feature_map, small_density_map):
+    """Verify the offset predictor in DeformableGraphAttention gets gradients."""
+    proc = DensityGCNProcessor(
+        k=4, in_channels=256, hidden_channels=128, out_channels=256, conv_type="deformable"
+    )
+    feature_maps = small_feature_map.clone().requires_grad_(True)
+    density_maps = small_density_map.clone()
+    out = proc(density_maps, feature_maps)
+    loss = out.sum()
+    loss.backward()
+    # The offset_pred[-1].weight should have non-zero grads (it was zero-initialised
+    # but the density_proj path provides a non-zero input)
+    offset_weight_grad = proc.gcn.offset_pred[-1].weight.grad
+    assert offset_weight_grad is not None
+    assert offset_weight_grad.abs().sum() > 0
+
+
+def test_feature_gcn_processor_deformable_gradient_flow(small_feature_map):
+    """Verify the offset predictor in FeatureGCN (no density) gets gradients."""
+    proc = FeatureGCNProcessor(
+        k=4, in_channels=256, hidden_channels=128, out_channels=256, conv_type="deformable"
+    )
+    feature_maps = small_feature_map.clone().requires_grad_(True)
+    out = proc(feature_maps)
+    loss = out.sum()
+    loss.backward()
+    offset_weight_grad = proc.gcn.offset_pred[-1].weight.grad
+    assert offset_weight_grad is not None
+    assert offset_weight_grad.abs().sum() > 0

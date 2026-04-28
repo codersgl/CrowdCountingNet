@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, GCNConv, MessagePassing
 from torch_geometric.utils import add_self_loops
 
+from crowdcount.plugins.sa_dgat import DeformableGraphAttention
+
 
 def compute_uncertainty(density: torch.Tensor) -> torch.Tensor:
     """Compute pixel-wise uncertainty from a density prediction.
@@ -596,35 +598,50 @@ class DensityGCNProcessor(nn.Module):
         spatial_prior: bool = False,
         spatial_alpha: float = 1.0,
         spatial_beta: float = 1.0,
+        deformable_heads: int = 4,
+        deformable_lambda: float = 1.0,
+        deformable_mu: float = 1.0,
+        deformable_dropout: float = 0.1,
     ):
         super().__init__()
         self._use_uncertainty = use_uncertainty
         self._anisotropic = anisotropic
         self._conv_type = conv_type
-        if use_uncertainty and adaptive:
-            self.graph_builder = UncertaintyAdaptiveDensityGraphBuilder(
-                k_base=k,
-                k_min=k_min,
-                k_max=k_max,
-                density_scale=density_scale,
-                uncertainty_scale=uncertainty_scale,
+        if conv_type == "deformable":
+            self.gcn = DeformableGraphAttention(
+                in_channels=in_channels,
+                num_neighbors=k,
+                num_heads=deformable_heads,
+                lambda_init=deformable_lambda,
+                mu_init=deformable_mu,
+                dropout=deformable_dropout,
             )
-        elif adaptive:
-            self.graph_builder = AdaptiveDensityGraphBuilder(
-                k_base=k, k_min=k_min, k_max=k_max, density_scale=density_scale
-            )
-        elif spatial_prior:
-            self.graph_builder = SpatialPriorDensityGraphBuilder(
-                k=k, alpha=spatial_alpha, beta=spatial_beta
-            )
+            self.graph_builder = None
         else:
-            self.graph_builder = DensityGraphBuilder(k)
-        if conv_type == "gatv2":
-            self.gcn = GATv2Model(in_channels, hidden_channels, out_channels)
-        elif anisotropic:
-            self.gcn = ECAGCNModel(in_channels, hidden_channels, out_channels)
-        else:
-            self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
+            if use_uncertainty and adaptive:
+                self.graph_builder = UncertaintyAdaptiveDensityGraphBuilder(
+                    k_base=k,
+                    k_min=k_min,
+                    k_max=k_max,
+                    density_scale=density_scale,
+                    uncertainty_scale=uncertainty_scale,
+                )
+            elif adaptive:
+                self.graph_builder = AdaptiveDensityGraphBuilder(
+                    k_base=k, k_min=k_min, k_max=k_max, density_scale=density_scale
+                )
+            elif spatial_prior:
+                self.graph_builder = SpatialPriorDensityGraphBuilder(
+                    k=k, alpha=spatial_alpha, beta=spatial_beta
+                )
+            else:
+                self.graph_builder = DensityGraphBuilder(k)
+            if conv_type == "gatv2":
+                self.gcn = GATv2Model(in_channels, hidden_channels, out_channels)
+            elif anisotropic:
+                self.gcn = ECAGCNModel(in_channels, hidden_channels, out_channels)
+            else:
+                self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
 
     def forward(
         self,
@@ -633,6 +650,10 @@ class DensityGCNProcessor(nn.Module):
         uncertainty: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, in_channels, H, W = feature_maps.shape
+
+        if self._conv_type == "deformable":
+            return self.gcn(feature_maps, scale_weights=None, density=density_maps)
+
         if self._use_uncertainty and isinstance(
             self.graph_builder, UncertaintyAdaptiveDensityGraphBuilder
         ):
@@ -666,25 +687,44 @@ class FeatureGCNProcessor(nn.Module):
         sim_threshold: float = 0.5,
         anisotropic: bool = False,
         conv_type: str = "gcn",
+        deformable_heads: int = 4,
+        deformable_lambda: float = 1.0,
+        deformable_mu: float = 1.0,
+        deformable_dropout: float = 0.1,
     ):
         super().__init__()
         self._anisotropic = anisotropic
         self._conv_type = conv_type
-        if adaptive:
-            self.graph_builder = AdaptiveFeatureGraphBuilder(
-                k_min=k_min, k_max=k_max, sim_threshold=sim_threshold
+        if conv_type == "deformable":
+            self.gcn = DeformableGraphAttention(
+                in_channels=in_channels,
+                num_neighbors=k,
+                num_heads=deformable_heads,
+                lambda_init=deformable_lambda,
+                mu_init=deformable_mu,
+                dropout=deformable_dropout,
             )
+            self.graph_builder = None
         else:
-            self.graph_builder = FeatureGraphBuilder(k)
-        if conv_type == "gatv2":
-            self.gcn = GATv2Model(in_channels, hidden_channels, out_channels)
-        elif anisotropic:
-            self.gcn = ECAGCNModel(in_channels, hidden_channels, out_channels)
-        else:
-            self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
+            if adaptive:
+                self.graph_builder = AdaptiveFeatureGraphBuilder(
+                    k_min=k_min, k_max=k_max, sim_threshold=sim_threshold
+                )
+            else:
+                self.graph_builder = FeatureGraphBuilder(k)
+            if conv_type == "gatv2":
+                self.gcn = GATv2Model(in_channels, hidden_channels, out_channels)
+            elif anisotropic:
+                self.gcn = ECAGCNModel(in_channels, hidden_channels, out_channels)
+            else:
+                self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
 
     def forward(self, feature_maps: torch.Tensor) -> torch.Tensor:
         B, C, H, W = feature_maps.shape
+
+        if self._conv_type == "deformable":
+            return self.gcn(feature_maps, scale_weights=None, density=None)
+
         edge_index, edge_attr, _, H, W = self.graph_builder.build_batch_graph(
             feature_maps
         )

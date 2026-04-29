@@ -14,6 +14,7 @@ from crowdcount.plugins.sa_dgat import (
     ScalePromptEmbedding,
     SubPixelDensityHead,
 )
+from crowdcount.plugins.sa_dgat.deformable_graph import _grid_offset_bias
 
 
 B, C, H, W = 2, 64, 16, 16  # Smaller dims for fast CPU tests
@@ -70,6 +71,23 @@ class TestDeformableGraphAttention:
         out = mod(feat, density=density)
         out.sum().backward()
         assert mod.offset_pred[-1].bias.grad is not None
+
+    @staticmethod
+    def test_grid_offset_bias_values():
+        b4 = _grid_offset_bias(4)
+        assert b4.shape == (8,)
+        assert (b4.abs() <= 1.0).all()
+        pairs = b4.view(-1, 2)
+        diffs = (pairs.unsqueeze(0) - pairs.unsqueeze(1)).abs().sum(-1)
+        assert (diffs > 0).sum() > 0  # not all pairs identical
+
+    def test_initial_offsets_nonzero(self, feat):
+        mod = DeformableGraphAttention(in_channels=C, num_neighbors=8, num_heads=4)
+        mod.eval()
+        with torch.no_grad():
+            _ = mod(feat)
+        coords = mod._cached_sample_coords  # [B, N, K, 2]
+        assert coords.std() > 0  # offsets spread neighbours apart
 
 
 # ── OcclusionAwareGAT ─────────────────────────────────────────────

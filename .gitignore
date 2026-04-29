@@ -21,3 +21,4 @@ wheels/
 *.zip
 *.pdf
 /*.png
+.superpowers/

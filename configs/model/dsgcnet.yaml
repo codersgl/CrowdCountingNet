@@ -80,11 +80,26 @@ gcn_aniso: false
 #   deformable — DeformableGraphAttention: learned offset sampling (no explicit graph)
 # When gcn_conv_type is set, it takes priority over gcn_aniso.
 gcn_conv_type: gcn
+# Feature stream convolution type (independent from gcn_conv_type).
+# When set to a non-default value, FeatureGCN uses this while DensityGCN
+# still uses gcn_conv_type. Default (gcn) means FeatureGCN follows gcn_conv_type.
+gcn_feature_conv_type: gcn
 
 # Deformable convolution hyperparameters (only used when gcn_conv_type: deformable)
 # Reuses gcn_k as the number of deformable neighbours (K).
 gcn_deformable_heads: 4     # multi-head attention heads
 gcn_deformable_lambda: 1.0  # distance penalty init (learnable)
+
+# Unified Deformable Spatial Attention — replaces dual-stream GCN entirely.
+# Activated via gcn_mode: unified_deformable.
+# Density map guides offset prediction; feature similarity drives attention.
+unified_deform_attn:
+  num_points: 4           # K sampling points per query (matches GCN k=4)
+  num_heads: 8            # multi-head attention heads
+  ffn_expansion: 4        # FFN hidden dim = d_model * ffn_expansion
+  dropout: 0.1
+  lambda_dist: 1.0        # spatial distance penalty init (learnable)
+  gamma_density: 0.0      # density-diff attention bias init (0=disabled; try 0.5)
 
 moe:
   top_k: 3 # all experts active (soft routing); kept for API compat

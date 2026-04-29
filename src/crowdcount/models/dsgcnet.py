@@ -14,6 +14,7 @@ from crowdcount.models.gcn import (
     SuperNodeGCNProcessor,
     compute_uncertainty,
 )
+from crowdcount.models.unified_deform_attn import UnifiedDeformableSpatialAttention
 from crowdcount.models.head import (
     ClassificationModel,
     DecoupledPredictionHead,
@@ -151,10 +152,12 @@ class DSGCnet(nn.Module):
         uncertainty_scale: float = 6.0,
         gcn_aniso: bool = False,
         gcn_conv_type: str = "gcn",
+        gcn_feature_conv_type: str = "gcn",
         gcn_deformable_heads: int = 4,
         gcn_deformable_lambda: float = 1.0,
         gcn_deformable_mu: float = 1.0,
         gcn_deformable_dropout: float = 0.1,
+        unified_deform_attn_cfg: DictConfig | None = None,
         use_fg_branch: bool = False,
         fg_branch_base: float = 0.5,
         fg_branch_scale: float = 0.5,
@@ -448,6 +451,7 @@ class DSGCnet(nn.Module):
             self.gm = None
             self.graph_attn_moe = None
             self.mamba_moe = None
+            self.unified_deform_attn = None
         elif self.use_graph_attn_moe:
             _gam = graph_attn_moe_cfg
             self.graph_attn_moe: GraphAwareMoE | None = GraphAwareMoE(
@@ -500,6 +504,7 @@ class DSGCnet(nn.Module):
             self.gm = None
             self.supernode_gcn = None
             self.cross_stream_gcn = None
+            self.unified_deform_attn = None
             self.mamba_moe = None
         elif self.use_mamba_moe:
             _mmm = mamba_moe_cfg
@@ -531,6 +536,7 @@ class DSGCnet(nn.Module):
             self.graph_attn_moe = None
             self.supernode_gcn = None
             self.cross_stream_gcn = None
+            self.unified_deform_attn = None
             self.sdd_moe = None
         elif self.use_sdd_moe:
             self.sdd_moe: SDDMoE | None = SDDMoE(
@@ -545,6 +551,7 @@ class DSGCnet(nn.Module):
             self.gm = None
             self.graph_attn_moe = None
             self.mamba_moe = None
+            self.unified_deform_attn = None
             self.supernode_gcn = None
             self.cross_stream_gcn = None
         elif self.use_sa_dgat:
@@ -581,6 +588,7 @@ class DSGCnet(nn.Module):
             self.gm = None
             self.graph_attn_moe = None
             self.mamba_moe = None
+            self.unified_deform_attn = None
             self.supernode_gcn = None
             self.cross_stream_gcn = None
         else:
@@ -596,6 +604,7 @@ class DSGCnet(nn.Module):
                 self.density_gcn = None
                 self.feature_gcn = None
                 self.alpha = None
+                self.unified_deform_attn = None
             elif gcn_mode == "cross_stream":
                 self.cross_stream_gcn: CrossStreamGCNProcessor | None = (
                     CrossStreamGCNProcessor(
@@ -613,9 +622,35 @@ class DSGCnet(nn.Module):
                 self.density_gcn = None
                 self.feature_gcn = None
                 self.alpha = None
+                self.unified_deform_attn = None
+            elif gcn_mode == "unified_deformable":
+                _uda = unified_deform_attn_cfg
+                self.unified_deform_attn: UnifiedDeformableSpatialAttention = (
+                    UnifiedDeformableSpatialAttention(
+                        d_model=256,
+                        num_heads=int(getattr(_uda, "num_heads", 8)) if _uda else 8,
+                        num_points=int(getattr(_uda, "num_points", 4)) if _uda else 4,
+                        ffn_expansion=int(getattr(_uda, "ffn_expansion", 4))
+                        if _uda
+                        else 4,
+                        dropout=float(getattr(_uda, "dropout", 0.1)) if _uda else 0.1,
+                        lambda_dist_init=float(getattr(_uda, "lambda_dist", 1.0))
+                        if _uda
+                        else 1.0,
+                        gamma_density_init=float(getattr(_uda, "gamma_density", 0.0))
+                        if _uda
+                        else 0.0,
+                    )
+                )
+                self.supernode_gcn = None
+                self.cross_stream_gcn = None
+                self.density_gcn = None
+                self.feature_gcn = None
+                self.alpha = None
             else:
                 self.supernode_gcn = None
                 self.cross_stream_gcn = None
+                self.unified_deform_attn = None
                 self.density_gcn: DensityGCNProcessor | None = DensityGCNProcessor(
                     k=gcn_k,
                     adaptive=gcn_adaptive,
@@ -641,7 +676,7 @@ class DSGCnet(nn.Module):
                     k_max=gcn_k_max,
                     sim_threshold=gcn_sim_threshold,
                     anisotropic=gcn_aniso,
-                    conv_type=gcn_conv_type,
+                    conv_type=gcn_feature_conv_type,
                     deformable_heads=gcn_deformable_heads,
                     deformable_lambda=gcn_deformable_lambda,
                     deformable_mu=gcn_deformable_mu,
@@ -650,7 +685,7 @@ class DSGCnet(nn.Module):
                 self.alpha: nn.Parameter | None = nn.Parameter(
                     torch.ones(3, dtype=torch.float32)
                 )
-            if use_gm and gcn_mode not in {"supernode", "cross_stream"}:
+            if use_gm and gcn_mode not in {"supernode", "cross_stream", "unified_deformable"}:
                 if gm_spatial:
                     self.gm: SpatialGateMechanism | GateMechanism | None = (
                         SpatialGateMechanism(input_dim=gm_input_dim)
@@ -1226,6 +1261,9 @@ class DSGCnet(nn.Module):
                 feature_fl = self.cross_stream_gcn(
                     density, features_pa, uncertainty=uncertainty
                 )
+            elif self._gcn_mode == "unified_deformable":
+                assert self.unified_deform_attn is not None
+                feature_fl = self.unified_deform_attn(features_pa, density)
             else:
                 assert self.density_gcn is not None
                 assert self.feature_gcn is not None

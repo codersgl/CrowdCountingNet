@@ -74,17 +74,11 @@ uncertainty_boost: 2.0 # Loss weighting: max multiplier for high-uncertainty poi
 gcn_aniso: false
 
 # GCN convolution type selector:
-#   gcn        — standard isotropic GCNConv (default)
-#   gatv2      — GATv2Conv with multi-head dynamic attention (recommended)
-#   aniso      — alias for gcn_aniso: true (ECA-GCN, edge-conditioned)
-#   deformable — DeformableGraphAttention: learned offset sampling (no explicit graph)
+#   gcn    — standard isotropic GCNConv (default)
+#   gatv2  — GATv2Conv with multi-head dynamic attention (recommended)
+#   aniso  — alias for gcn_aniso: true (ECA-GCN, edge-conditioned)
 # When gcn_conv_type is set, it takes priority over gcn_aniso.
 gcn_conv_type: gcn
-
-# Deformable convolution hyperparameters (only used when gcn_conv_type: deformable)
-# Reuses gcn_k as the number of deformable neighbours (K).
-gcn_deformable_heads: 4     # multi-head attention heads
-gcn_deformable_lambda: 1.0  # distance penalty init (learnable)
 
 moe:
   top_k: 3 # all experts active (soft routing); kept for API compat

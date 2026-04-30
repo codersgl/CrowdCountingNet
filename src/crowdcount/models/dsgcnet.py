@@ -151,10 +151,6 @@ class DSGCnet(nn.Module):
         uncertainty_scale: float = 6.0,
         gcn_aniso: bool = False,
         gcn_conv_type: str = "gcn",
-        gcn_deformable_heads: int = 4,
-        gcn_deformable_lambda: float = 1.0,
-        gcn_deformable_mu: float = 1.0,
-        gcn_deformable_dropout: float = 0.1,
         use_fg_branch: bool = False,
         fg_branch_base: float = 0.5,
         fg_branch_scale: float = 0.5,
@@ -629,10 +625,6 @@ class DSGCnet(nn.Module):
                     spatial_prior=gcn_spatial_prior,
                     spatial_alpha=gcn_spatial_alpha,
                     spatial_beta=gcn_spatial_beta,
-                    deformable_heads=gcn_deformable_heads,
-                    deformable_lambda=gcn_deformable_lambda,
-                    deformable_mu=gcn_deformable_mu,
-                    deformable_dropout=gcn_deformable_dropout,
                 )
                 self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(
                     k=gcn_k,
@@ -642,10 +634,6 @@ class DSGCnet(nn.Module):
                     sim_threshold=gcn_sim_threshold,
                     anisotropic=gcn_aniso,
                     conv_type=gcn_conv_type,
-                    deformable_heads=gcn_deformable_heads,
-                    deformable_lambda=gcn_deformable_lambda,
-                    deformable_mu=gcn_deformable_mu,
-                    deformable_dropout=gcn_deformable_dropout,
                 )
                 self.alpha: nn.Parameter | None = nn.Parameter(
                     torch.ones(3, dtype=torch.float32)

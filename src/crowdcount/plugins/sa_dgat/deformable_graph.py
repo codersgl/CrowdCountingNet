@@ -7,32 +7,9 @@ feature similarity, spatial distance penalty, and scale matching reward.
 
 from __future__ import annotations
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-def _grid_offset_bias(K: int, radius: float = 1.0) -> torch.Tensor:
-    """[2*K] bias (x0,y0,x1,y1,...) covering a compact spatial neighbourhood.
-
-    ``radius=1.0`` means each entry corresponds to roughly one pixel step
-    after the forward pass scales by ``2.0 / [W,H]`` to map into [-1,1].
-    """
-    side = max(3, int((K + 1) ** 0.5))
-    if side % 2 == 0:
-        side += 1
-    while side * side - 1 < K:
-        side += 2
-    half = side // 2
-    pts = [
-        (float(dx), float(dy))
-        for dy in range(-half, half + 1)
-        for dx in range(-half, half + 1)
-        if not (dx == 0 and dy == 0)
-    ]
-    flat = [c for pt in pts[:K] for c in pt]
-    return torch.tensor(flat).mul_(radius)
 
 
 class DeformableGraphAttention(nn.Module):
@@ -84,7 +61,7 @@ class DeformableGraphAttention(nn.Module):
         )
         # Initialize offsets to small values (near-identity)
         nn.init.zeros_(self.offset_pred[-1].weight)
-        self.offset_pred[-1].bias.data = _grid_offset_bias(num_neighbors)
+        nn.init.zeros_(self.offset_pred[-1].bias)
 
         # Query/Key/Value projections
         self.W_q = nn.Linear(in_channels, in_channels)

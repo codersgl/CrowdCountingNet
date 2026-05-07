@@ -69,17 +69,31 @@ uv sync --extra dev
 
 ### 1. Data Preparation
 
-Organise your dataset as follows and create `train.txt` / `test.txt` list files:
+ShanghaiTech-style datasets are discovered from the standard image and
+ground-truth folders:
 
 ```
 DATA_ROOT/
-  train.txt            ← "images/IMG_xxx.jpg gt/GT_xxx.txt" per line
-  test.txt
-  images/
-  gt/
+  train_data/images/
+  train_data/ground_truth/
+  test_data/images/
+  test_data/ground_truth/
   gt_density_maps/     ← generated automatically on first training run
     train/
 ```
+
+UCF-QNRF is also supported in its original ECCV 2018 layout:
+
+```
+data/UCF-QNRF_ECCV18/
+  Train/img_0001.jpg
+  Train/img_0001_ann.mat
+  Test/img_0001.jpg
+  Test/img_0001_ann.mat
+```
+
+Use `data=ucf_qnrf` to enable the paper-style long-side resize to 1408 pixels
+while preserving aspect ratio.
 
 > **Density maps are generated automatically** the first time training starts.  
 > They are cached to `DATA_ROOT/gt_density_maps/train/` and reused on subsequent runs.
@@ -103,6 +117,9 @@ python scripts/train.py \
 
 # Resume from checkpoint
 python scripts/train.py data.data_root=DATA_ROOT resume=checkpoints/latest.pth
+
+# Train on UCF-QNRF (long side capped at 1408 px by config)
+uv run python scripts/train.py data=ucf_qnrf data.data_root=data/UCF-QNRF_ECCV18
 
 # Use DINOv2 backbone
 python scripts/train.py data.data_root=DATA_ROOT model.backbone=dinov2_s model.backbone_type=dinov2

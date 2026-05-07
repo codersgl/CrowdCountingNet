@@ -1,4 +1,4 @@
-"""Density map generation for ShanghaiTech dataset.
+"""Density map generation for crowd-counting datasets.
 
 Generates ground-truth density maps using k-nearest-neighbor Gaussian kernels.
 This logic is adapted from density_data_preparation/k_nearest_gaussian_kernel.py.
@@ -20,6 +20,12 @@ Flat layout (alternative)::
     data_root/
       images/            ← IMG_xxx.jpg
       ground_truth/      ← GT_xxx.mat  (or .txt: "x y" per line)
+
+UCF-QNRF (ECCV 2018)::
+
+        data_root/
+            Train/             ← img_0001.jpg + img_0001_ann.mat
+            Test/              ← img_0001.jpg + img_0001_ann.mat
 
 Generated maps are cached to::
 
@@ -407,6 +413,8 @@ def _load_points(gt_path: Path) -> np.ndarray:
 
     .mat: ShanghaiTech format — ``mat['image_info'][0,0][0,0][0]`` gives an
           N×2 array of (x, y) coordinates.
+    .mat: UCF-QNRF format — ``mat['annPoints']`` gives an N×2 array of
+        (x, y) coordinates.
     .txt: plain text, one "x y" pair per line.
 
     Returns:
@@ -416,9 +424,17 @@ def _load_points(gt_path: Path) -> np.ndarray:
         import scipy.io
 
         mat = scipy.io.loadmat(str(gt_path))
-        # Standard ShanghaiTech field layout
-        pts = mat["image_info"][0, 0][0, 0][0].astype(np.float32)
-        return pts  # shape (N, 2)
+        if "annPoints" in mat:
+            pts = np.asarray(mat["annPoints"], dtype=np.float32)
+        elif "image_info" in mat:
+            pts = mat["image_info"][0, 0][0, 0][0].astype(np.float32)
+        else:
+            keys = sorted(k for k in mat.keys() if not k.startswith("__"))
+            raise KeyError(
+                f"Unsupported .mat annotation format in {gt_path}; "
+                f"expected 'image_info' or 'annPoints', got keys={keys}"
+            )
+        return pts.reshape(-1, 2)
     else:  # .txt fallback
         points = []
         with open(gt_path) as f:
@@ -435,25 +451,34 @@ def _find_image_gt_pairs(data_root: Path, split: str) -> list[tuple[Path, Path]]
     Tries the following candidate image directories in order:
       1. data_root/<split>_data/images/
       2. data_root/images/
+      3. data_root/Train or data_root/Test (UCF-QNRF)
 
-    GT files are located in the sibling ``ground_truth/`` directory and must
-    match the image stem via ShanghaiTech's naming convention
-    (``IMG_xxx.jpg`` ↔ ``GT_xxx.mat``) or share the same stem with a
-    ``.mat`` / ``.txt`` extension.
+    GT files are located either in the sibling ``ground_truth/`` directory or
+    next to the image (UCF-QNRF). They must match the image stem via supported
+    naming conventions such as ``IMG_xxx.jpg`` ↔ ``GT_IMG_xxx.mat`` or
+    ``img_xxxx.jpg`` ↔ ``img_xxxx_ann.mat``.
     """
-    # Candidate image directories
-    candidates = [
-        data_root / f"{split}_data" / "images",
-        data_root / "images",
+    split_lut = {"train": "Train", "test": "Test", "val": "Test"}
+    ucf_split = split_lut.get(split.lower(), split)
+    candidates: list[tuple[Path, Path]] = [
+        (
+            data_root / f"{split}_data" / "images",
+            data_root / f"{split}_data" / "ground_truth",
+        ),
+        (data_root / "images", data_root / "ground_truth"),
+        (data_root / ucf_split, data_root / ucf_split),
     ]
-    img_dir: Path | None = next((p for p in candidates if p.is_dir()), None)
+    found: tuple[Path, Path] | None = next(
+        ((img_p, gt_p) for img_p, gt_p in candidates if img_p.is_dir()), None
+    )
+    img_dir: Path | None = found[0] if found is not None else None
     if img_dir is None:
         raise FileNotFoundError(
             f"Cannot find images directory for split='{split}' under {data_root}. "
-            f"Tried: {candidates}"
+            f"Tried: {[p for p, _ in candidates]}"
         )
 
-    gt_dir = img_dir.parent / "ground_truth"
+    gt_dir = found[1]
     if not gt_dir.is_dir():
         raise FileNotFoundError(f"Expected ground_truth directory at {gt_dir}")
 
@@ -464,7 +489,13 @@ def _find_image_gt_pairs(data_root: Path, split: str) -> list[tuple[Path, Path]]
         #   IMG_xxx.jpg  <->  GT_IMG_xxx.mat   (Part-A / Part-B official)
         #   IMG_xxx.jpg  <->  GT_xxx.mat        (some re-packs)
         #   IMG_xxx.jpg  <->  GT_xxx.txt        (plain-text alternative)
-        candidate_stems = [f"GT_{stem}", stem.replace("IMG_", "GT_", 1)]
+        #   img_xxxx.jpg <->  img_xxxx_ann.mat  (UCF-QNRF official)
+        candidate_stems = [
+            f"{stem}_ann",
+            f"GT_{stem}",
+            stem.replace("IMG_", "GT_", 1),
+            stem,
+        ]
         # de-duplicate while preserving order
         seen: set[str] = set()
         candidate_stems = [s for s in candidate_stems if not (s in seen or seen.add(s))]

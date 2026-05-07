@@ -1,0 +1,80 @@
+dataset: UCF_QNRF
+data_root: "data/UCF-QNRF_ECCV18" # override: data.data_root=/path/to/UCF-QNRF_ECCV18
+batch_size: 8
+
+# === Spatial Transforms ===
+# UCF-QNRF images are large; the paper limits the long side to 1408 px while
+# preserving aspect ratio. Collation pads to 128 multiples after this resize.
+resize:
+  enabled: true
+  max_long_side: 1408
+  keep_aspect_ratio: true
+
+patch: true
+patch_size: 128 # spatial size of each random crop (must be divisible by 8)
+num_patches: 4 # number of patches to extract per sample during training
+
+flip: true
+flip_prob: 0.5
+
+# === Training Augmentation ===
+augmentation:
+  color_jitter:
+    enabled: true
+    apply_prob: 0.5
+    brightness: 0.4
+    contrast: 0.4
+    saturation: 0.4
+    hue: 0.1
+
+  random_grayscale:
+    enabled: true
+    prob: 0.1
+
+  gaussian_blur:
+    enabled: false
+    prob: 0.1
+    kernel_size: 5
+    sigma_range: [0.3, 1.5]
+
+  random_scale:
+    enabled: true
+    scale_min: 0.7
+    scale_max: 1.3
+
+  random_erasing:
+    enabled: false
+    prob: 0.5
+    scale_range: [0.02, 0.2]
+    ratio_range: [0.3, 3.3]
+    fill: 0.0
+
+  multi_scale_patch:
+    enabled: false
+    patch_size_choices: [96, 128, 192]
+
+  copy_paste_dense:
+    enabled: false
+    prob: 0.5
+    paste_size: 64
+    feather_sigma: 8.0
+
+# === Depth Map Processing ===
+depth_blur:
+  kernel_size: 15
+  sigma: 5.0
+
+# === Density Map Generation ===
+density_generation:
+  perspective_guided: false
+  hybrid: false
+
+  beta: 1.0
+  min_sigma: 4.6
+
+  hybrid_min_sigma: 1.5
+  hybrid_max_sigma: null
+  hybrid_alpha: 0.7
+  sigma_base: 4.0
+  persp_max_sigma: null
+  disparity_input: true

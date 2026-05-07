@@ -9,10 +9,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
+import scipy.io
 import torch
 import torchvision.transforms as transforms
 
 from crowdcount.data.dataset import SHHA, _load_data, _random_crop
+from crowdcount.data.prepare import _find_image_gt_pairs, _load_points
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +62,25 @@ def _make_fake_dataset(root: Path, n_train: int = 4, n_test: int = 2):
         np.save(
             str(dmap_dir / f"IMG_{i:04d}.npy"), np.zeros((128, 128), dtype=np.float32)
         )
+
+
+def _make_fake_ucf_qnrf(root: Path):
+    """Create a minimal UCF-QNRF-style directory with annPoints .mat files."""
+    train_points = np.array([[800.0, 400.0], [400.0, 200.0]], dtype=np.float32)
+    test_points = np.array([[100.0, 50.0]], dtype=np.float32)
+    for split, points in [("Train", train_points), ("Test", test_points)]:
+        split_dir = root / split
+        split_dir.mkdir(parents=True)
+        img = np.zeros((800, 1600, 3), dtype=np.uint8)
+        cv2.imwrite(str(split_dir / "img_0001.jpg"), img)
+        scipy.io.savemat(str(split_dir / "img_0001_ann.mat"), {"annPoints": points})
+
+    dmap = np.zeros((800, 1600), dtype=np.float32)
+    for x, y in train_points:
+        dmap[int(y), int(x)] = 1.0
+    dmap_dir = root / "gt_density_maps" / "train"
+    dmap_dir.mkdir(parents=True)
+    np.save(str(dmap_dir / "img_0001.npy"), dmap)
 
 
 # ---------------------------------------------------------------------------
@@ -354,3 +375,74 @@ def test_shha_augmentation_disabled_creates_no_transforms(fake_dataset_root):
     assert isinstance(img, torch.Tensor)
     assert isinstance(target, list)
     assert isinstance(density_images, torch.Tensor)
+
+
+def test_ucf_qnrf_layout_and_annpoints(tmp_path):
+    _make_fake_ucf_qnrf(tmp_path)
+
+    train_pairs = _find_image_gt_pairs(tmp_path, "train")
+    test_pairs = _find_image_gt_pairs(tmp_path, "test")
+
+    assert len(train_pairs) == 1
+    assert len(test_pairs) == 1
+    assert train_pairs[0][0].name == "img_0001.jpg"
+    assert train_pairs[0][1].name == "img_0001_ann.mat"
+
+    points = _load_points(train_pairs[0][1])
+    assert points.shape == (2, 2)
+    np.testing.assert_allclose(points[0], [800.0, 400.0])
+
+
+def test_ucf_qnrf_long_side_resize_train(tmp_path):
+    _make_fake_ucf_qnrf(tmp_path)
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    ds = SHHA(
+        str(tmp_path),
+        train=True,
+        transform=transform,
+        patch=False,
+        flip=False,
+        aug_cfg={"random_scale": {"enabled": False}},
+        resize_cfg={
+            "enabled": True,
+            "max_long_side": 1408,
+            "keep_aspect_ratio": True,
+        },
+    )
+
+    img, target, density_images = ds[0]
+
+    assert img.shape[-2:] == (704, 1408)
+    assert density_images.shape[-2:] == (88, 176)
+    np.testing.assert_allclose(target[0]["point"][0].numpy(), [704.0, 352.0])
+    assert float(density_images.sum()) == pytest.approx(2.0, rel=1e-5)
+
+
+def test_ucf_qnrf_long_side_resize_val(tmp_path):
+    _make_fake_ucf_qnrf(tmp_path)
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    ds = SHHA(
+        str(tmp_path),
+        train=False,
+        transform=transform,
+        resize_cfg={
+            "enabled": True,
+            "max_long_side": 1408,
+            "keep_aspect_ratio": True,
+        },
+    )
+
+    img, target = ds[0]
+
+    assert img.shape[-2:] == (704, 1408)
+    np.testing.assert_allclose(target[0]["point"][0].numpy(), [88.0, 44.0])

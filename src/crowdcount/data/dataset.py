@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import random
+import re
+import zlib
 from pathlib import Path
 
 import cv2
@@ -36,9 +38,26 @@ class SHHA(Dataset):
         num_patches: int = 4,
         depth_blur_cfg=None,
         density_gen_cfg=None,
+        resize_cfg=None,
     ):
         self.root_path = data_root
         self.use_depth = use_depth
+
+        if resize_cfg is None:
+            resize_cfg = {}
+        self.resize_enabled = bool(resize_cfg.get("enabled", False))
+        _max_long_side = resize_cfg.get("max_long_side", None)
+        self.max_long_side = int(_max_long_side) if _max_long_side is not None else None
+        self.keep_aspect_ratio = bool(resize_cfg.get("keep_aspect_ratio", True))
+        if self.resize_enabled:
+            if self.max_long_side is None or self.max_long_side <= 0:
+                raise ValueError(
+                    "resize.max_long_side must be a positive integer when resize is enabled"
+                )
+            if not self.keep_aspect_ratio:
+                raise ValueError(
+                    "Only keep_aspect_ratio=true is supported for dataset resize"
+                )
 
         # Parse density generation config
         if density_gen_cfg is None:
@@ -259,6 +278,24 @@ class SHHA(Dataset):
 
         img, point = _load_data((img_path, gt_path), self.train)
 
+        if self.resize_enabled:
+            img, point, resize_scale = _resize_image_and_points_long_side(
+                img, point, self.max_long_side
+            )
+            if self.train and resize_scale != 1.0:
+                gt_dmap1 = _resize_single_channel_preserve_sum(
+                    gt_dmap1,
+                    size=(img.height, img.width),
+                    target_sum=float(torch.sum(gt_dmap).item()),
+                )
+                if self.use_depth:
+                    gt_depth1 = torch.nn.functional.interpolate(
+                        gt_depth1.unsqueeze(0),
+                        size=(img.height, img.width),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
+
         if self.train:
             aug_list = []
             # Color jitter augmentation
@@ -404,6 +441,9 @@ class SHHA(Dataset):
                 # (PyTorch tensors do not support negative-step slicing).
                 img_with_density = img_with_density.numpy()
 
+        if self.train and not self.patch and not isinstance(point, list):
+            point = [torch.Tensor(point)]
+
         if random.random() < self.flip_prob and self.train and self.flip:
             if img_with_density.ndim == 4:
                 img_with_density = torch.Tensor(img_with_density[:, :, :, ::-1].copy())
@@ -482,12 +522,19 @@ class SHHA(Dataset):
                 if d_max - d_min > 1e-6:
                     depth_npy = (depth_npy - d_min) / (d_max - d_min)
                 depth = torch.from_numpy(depth_npy).unsqueeze(0)  # [1, H, W]
+                if self.resize_enabled:
+                    depth = torch.nn.functional.interpolate(
+                        depth.unsqueeze(0),
+                        size=(img.shape[-2], img.shape[-1]),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
 
         img = torch.Tensor(img)
         target = [{} for _ in range(len(point))]
         for i in range(len(point)):
             target[i]["point"] = torch.Tensor(point[i])
-            image_id = int(img_path.split("/")[-1].split(".")[0].split("_")[-1])
+            image_id = _image_id_from_path(img_path)
             target[i]["image_id"] = torch.Tensor([image_id]).long()
             target[i]["labels"] = torch.ones([point[i].shape[0]]).long()
 
@@ -517,6 +564,46 @@ def _load_data(img_gt_path, train: bool):
 
     points = _load_points(Path(gt_path))
     return img, points
+
+
+def _image_id_from_path(img_path: str) -> int:
+    stem = Path(img_path).stem
+    match = re.search(r"(\d+)$", stem)
+    if match is None:
+        return zlib.crc32(stem.encode("utf-8")) & 0x7FFFFFFF
+    return int(match.group(1))
+
+
+def _resize_image_and_points_long_side(
+    img: Image.Image, points: np.ndarray, max_long_side: int | None
+) -> tuple[Image.Image, np.ndarray, float]:
+    if max_long_side is None:
+        return img, points, 1.0
+    width, height = img.size
+    long_side = max(width, height)
+    if long_side <= max_long_side:
+        return img, points, 1.0
+    scale = float(max_long_side) / float(long_side)
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    img = img.resize((new_width, new_height), Image.BICUBIC)
+    points = points.astype(np.float32, copy=True) * scale
+    return img, points, scale
+
+
+def _resize_single_channel_preserve_sum(
+    tensor: torch.Tensor, size: tuple[int, int], target_sum: float
+) -> torch.Tensor:
+    resized = torch.nn.functional.interpolate(
+        tensor.unsqueeze(0),
+        size=size,
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
+    resized_sum = torch.sum(resized)
+    if resized_sum > 0:
+        resized = resized / resized_sum * target_sum
+    return resized
 
 
 def _random_crop(img, den, num_patch: int = 4, crop_size: int = 128):

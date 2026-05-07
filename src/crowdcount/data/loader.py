@@ -53,6 +53,7 @@ def build_dataset(cfg: DictConfig):
     num_patches = int(cfg.data.get("num_patches", 4))
     depth_blur_cfg = cfg.data.get("depth_blur", None)
     density_gen_cfg = cfg.data.get("density_generation", None)
+    resize_cfg = cfg.data.get("resize", None)
 
     train_set = SHHA(
         data_root,
@@ -68,6 +69,7 @@ def build_dataset(cfg: DictConfig):
         num_patches=num_patches,
         depth_blur_cfg=depth_blur_cfg,
         density_gen_cfg=density_gen_cfg,
+        resize_cfg=resize_cfg,
     )
     val_set = SHHA(
         data_root,
@@ -80,5 +82,6 @@ def build_dataset(cfg: DictConfig):
         num_patches=num_patches,
         depth_blur_cfg=depth_blur_cfg,
         density_gen_cfg=density_gen_cfg,
+        resize_cfg=resize_cfg,
     )
     return train_set, val_set

@@ -132,6 +132,8 @@ class SetCriterion_Crowd(nn.Module):
         use_qfl: bool = False,
         qfl_beta: float = 2.0,
         qfl_sigma: float = 10.0,
+        point_loss_type: str = "smooth_l1",
+        point_smooth_l1_beta: float = 1.0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -151,6 +153,15 @@ class SetCriterion_Crowd(nn.Module):
         self.use_qfl = use_qfl
         self.qfl_beta = qfl_beta
         self.qfl_sigma = qfl_sigma
+        point_loss_type = point_loss_type.lower()
+        if point_loss_type == "l2":
+            point_loss_type = "mse"
+        if point_loss_type not in {"smooth_l1", "mse"}:
+            raise ValueError(
+                "point_loss_type must be one of {'smooth_l1', 'mse', 'l2'}"
+            )
+        self.point_loss_type = point_loss_type
+        self.point_smooth_l1_beta = point_smooth_l1_beta
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[0] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
@@ -213,9 +224,15 @@ class SetCriterion_Crowd(nn.Module):
         target_points = torch.cat(
             [t["point"][i] for t, (_, i) in zip(targets, indices)], dim=0
         )
-        loss_bbox = F.smooth_l1_loss(
-            src_points, target_points, reduction="none", beta=1.0
-        )
+        if self.point_loss_type == "mse":
+            loss_bbox = F.mse_loss(src_points, target_points, reduction="none")
+        else:
+            loss_bbox = F.smooth_l1_loss(
+                src_points,
+                target_points,
+                reduction="none",
+                beta=self.point_smooth_l1_beta,
+            )
 
         # Uncertainty weighting: boost loss for points in high-uncertainty regions
         uncertainty_map = outputs.get("uncertainty_map")

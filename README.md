@@ -163,11 +163,20 @@ All defaults live in `configs/`. Override any field with Hydra dot-notation on t
 | model     | `backbone_type`   | `vgg`      | `vgg` or `dinov2`            |
 | model     | `row` / `line`    | 2 / 2      | Anchor grid size             |
 | model     | `point_loss_coef` | 0.0002     | Point regression loss weight |
+| model     | `point_loss_type` | `smooth_l1` | Point loss: `smooth_l1` or paper-aligned `mse` |
+| model     | `use_decoupled_head` | false   | Paper-original independent classification/regression head path |
 | optimizer | `lr`              | 1e-4       | Base LR                      |
 | optimizer | `lr_backbone`     | 1e-5       | Backbone LR                  |
 | scheduler | `lr_drop`         | 800        | StepLR step size             |
 | —         | `epochs`          | 2500       | Total training epochs        |
 | —         | `seed`            | 42         | Random seed                  |
+
+For a paper-aligned point-regression setup, enable the independent head path and
+the original MSE/L2 point loss:
+
+```bash
+uv run python scripts/train.py data.data_root=DATA_ROOT model.use_decoupled_head=true model.point_loss_type=mse
+```
 
 ## Friendly reminder😊
 The repository is gradually being improved. If you need further assistance, please contact us. Feedback and suggestions are also welcome.😀

@@ -9,16 +9,20 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import scipy.io
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
 
 from crowdcount.data.dataset import SHHA
-from crowdcount.models.dsgcnet import DSGCnet, _DepthEncoder
+from crowdcount.models.dsgcnet import (
+    DSGCnet,
+    _DepthEncoder,
+    _SharedBackboneDepthMix,
+)
 from crowdcount.plugins.isfm.depth_fusion import (
     DepthFusionModule,
-    HAS_MAMBA,
     _ISF_AVAILABLE,
 )
 
@@ -29,11 +33,25 @@ class TinyVGGBackbone(nn.Module):
     def forward(self, x: torch.Tensor):
         bsz, _c, h, w = x.shape
         return [
-            torch.zeros(bsz, 128, h // 2, w // 2),
-            torch.zeros(bsz, 256, h // 4, w // 4),
-            torch.zeros(bsz, 512, h // 8, w // 8),
-            torch.zeros(bsz, 512, h // 16, w // 16),
+            torch.zeros(bsz, 128, h // 2, w // 2, device=x.device, dtype=x.dtype),
+            torch.zeros(bsz, 256, h // 4, w // 4, device=x.device, dtype=x.dtype),
+            torch.zeros(bsz, 512, h // 8, w // 8, device=x.device, dtype=x.dtype),
+            torch.zeros(bsz, 512, h // 16, w // 16, device=x.device, dtype=x.dtype),
         ]
+
+
+class RecordingTinyVGGBackbone(TinyVGGBackbone):
+    """Tiny backbone that records forward calls and input shapes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.input_shapes: list[tuple[int, ...]] = []
+
+    def forward(self, x: torch.Tensor):
+        self.calls += 1
+        self.input_shapes.append(tuple(x.shape))
+        return super().forward(x)
 
 
 def test_depth_fusion_module_256ch():
@@ -95,11 +113,42 @@ def test_depth_encoder(depth_sample):
     assert d5.shape == (2, 512, 8, 8)
 
 
+def test_shared_backbone_depth_mix_weights_are_learnable():
+    module = _SharedBackboneDepthMix(init=1.5)
+    rgb_features = (
+        torch.ones(1, 256, 8, 8),
+        torch.ones(1, 512, 4, 4),
+        torch.ones(1, 512, 2, 2),
+    )
+    depth_features = tuple(torch.zeros_like(feat) for feat in rgb_features)
+
+    fused = module(rgb_features, depth_features)
+    mix = module.mix_factors.detach()
+
+    assert len(fused) == 3
+    assert module.mix_weights.requires_grad
+    assert mix.shape == (3,)
+    assert torch.all((mix > 0.0) & (mix < 1.0))
+    assert torch.all(mix > 0.5)
+    assert torch.allclose(mix + (1.0 - mix), torch.ones_like(mix))
+
+    loss = sum(feat.sum() for feat in fused)
+    loss.backward()
+    assert module.mix_weights.grad is not None
+    assert torch.all(module.mix_weights.grad != 0)
+
+
 def test_dsgcnet_forward_with_depth(sample_batch, depth_sample):
     backbone = TinyVGGBackbone()
-    depth_cfg = OmegaConf.create({"embed_dim": 128, "num_isf_layers": 1})
+    depth_cfg = OmegaConf.create({"mix_init": 1.5})
     model = DSGCnet(backbone, use_depth=True, depth_cfg=depth_cfg)
     model.eval()
+
+    assert model.depth_backbone is None
+    assert model.depth_fusion_c3 is None
+    assert model.depth_fusion_c4 is None
+    assert model.depth_fusion_c5 is None
+    assert model.shared_depth_mix is not None
 
     with torch.no_grad():
         out = model(sample_batch, depth_map=depth_sample)
@@ -107,6 +156,48 @@ def test_dsgcnet_forward_with_depth(sample_batch, depth_sample):
     assert out["pred_logits"].shape[0] == sample_batch.shape[0]
     assert out["pred_points"].shape[0] == sample_batch.shape[0]
     assert out["density_out"].shape[0] == sample_batch.shape[0]
+
+
+def test_dsgcnet_use_depth_runs_shared_backbone_twice(sample_batch, depth_sample):
+    backbone = RecordingTinyVGGBackbone()
+    model = DSGCnet(
+        backbone,
+        use_depth=True,
+        depth_cfg=OmegaConf.create({"mix_init": 1.5}),
+    )
+    model.eval()
+
+    with torch.no_grad():
+        model(sample_batch, depth_map=depth_sample)
+
+    assert backbone.calls == 2
+
+    backbone.calls = 0
+    backbone.input_shapes.clear()
+    with torch.no_grad():
+        model(sample_batch)
+
+    assert backbone.calls == 1
+
+
+def test_dsgcnet_shared_depth_resizes_and_repeats_depth(sample_batch):
+    backbone = RecordingTinyVGGBackbone()
+    model = DSGCnet(
+        backbone,
+        use_depth=True,
+        depth_cfg=OmegaConf.create({"mix_init": 1.5}),
+    )
+    model.eval()
+    depth_map = torch.randn(sample_batch.shape[0], 1, 64, 64)
+
+    with torch.no_grad():
+        out = model(sample_batch, depth_map=depth_map)
+
+    assert backbone.input_shapes == [
+        tuple(sample_batch.shape),
+        tuple(sample_batch.shape),
+    ]
+    assert out["pred_logits"].shape[0] == sample_batch.shape[0]
 
 
 def test_dsgcnet_forward_without_depth(sample_batch):
@@ -273,8 +364,6 @@ def test_depth_backbone_vgg_frozen_stages():
 
 def test_dsgcnet_forward_with_dual_vgg(sample_batch, depth_sample):
     """DSGCnet with use_depth_dual_vgg=True should produce correct output keys."""
-    from crowdcount.models.backbone import DepthBackbone_VGG
-
     backbone = TinyVGGBackbone()
     dual_vgg_cfg = OmegaConf.create(
         {"variant": "vgg16_bn", "pretrained": False, "frozen_stages": 0}
@@ -380,6 +469,67 @@ def test_depth_residual_gating_gradient_flow():
     assert module.gate.grad is not None
 
 
+def test_depth_residual_gating_v2_shape_and_identity():
+    """V2 must preserve shape and remain identity at its default gate init."""
+    from crowdcount.plugins.depth_residual_gating import DepthResidualGatingV2
+
+    depth = torch.randn(2, 1, 128, 128)
+    for ch, h, w in [(256, 32, 32), (512, 16, 16), (512, 8, 8)]:
+        module = DepthResidualGatingV2(ch, mid_ratio=4)
+        feat = torch.randn(2, ch, h, w)
+        out = module(feat, depth)
+        assert out.shape == (2, ch, h, w)
+        assert torch.allclose(out, feat, atol=1e-7)
+
+
+def test_depth_residual_gating_v2_bounded_gate():
+    """V2 optionally bounds the global residual gate with tanh."""
+    from crowdcount.plugins.depth_residual_gating import DepthResidualGatingV2
+
+    module = DepthResidualGatingV2(256, gate_init=5.0, use_tanh_gate=True)
+    assert module.gate.item() == 5.0
+    assert module.gate.tanh().item() < 1.0
+
+
+def test_depth_residual_gating_v2_depth_hw_input_and_constant_normalization():
+    """V2 accepts [B,H,W] depth and normalises constant maps to zeros."""
+    from crowdcount.plugins.depth_residual_gating import DepthResidualGatingV2
+
+    module = DepthResidualGatingV2(32, normalize_depth=True)
+    feat = torch.randn(2, 32, 8, 8)
+    depth = torch.full((2, 16, 16), 7.0)
+    prepared = module._prepare_depth(depth, feat)
+    assert prepared.shape == (2, 1, 8, 8)
+    assert torch.allclose(prepared, torch.zeros_like(prepared), atol=1e-6)
+
+
+def test_depth_residual_gating_v2_gradient_flow():
+    """When the residual gate is active, gradients flow through V2 depth path."""
+    from crowdcount.plugins.depth_residual_gating import DepthResidualGatingV2
+
+    module = DepthResidualGatingV2(64, mid_ratio=4)
+    with torch.no_grad():
+        module.gate.fill_(1.0)
+    feat = torch.randn(1, 64, 8, 8, requires_grad=True)
+    depth = torch.randn(1, 1, 32, 32, requires_grad=True)
+    out = module(feat, depth)
+    out.sum().backward()
+    assert feat.grad is not None
+    assert depth.grad is not None
+    assert module.gate.grad is not None
+
+
+def test_depth_residual_gating_v2_invalid_depth_shape_raises():
+    """V2 should fail clearly for non-single-channel depth tensors."""
+    from crowdcount.plugins.depth_residual_gating import DepthResidualGatingV2
+
+    module = DepthResidualGatingV2(64)
+    feat = torch.randn(1, 64, 8, 8)
+    bad_depth = torch.randn(1, 3, 32, 32)
+    with pytest.raises(ValueError, match="depth_map must have shape"):
+        module(feat, bad_depth)
+
+
 def test_dsgcnet_forward_with_depth_attn(sample_batch, depth_sample):
     """DSGCnet with use_depth_attn=True should produce correct output keys."""
     backbone = TinyVGGBackbone()
@@ -398,6 +548,32 @@ def test_dsgcnet_forward_with_depth_attn(sample_batch, depth_sample):
     assert out["density_out"].shape[0] == sample_batch.shape[0]
 
 
+def test_dsgcnet_forward_with_depth_attn_v2(sample_batch, depth_sample):
+    """DSGCnet should run with the improved depth_attn v2 path."""
+    backbone = TinyVGGBackbone()
+    depth_attn_cfg = OmegaConf.create(
+        {
+            "version": "v2",
+            "mid_ratio": 4,
+            "gate_init": 0.0,
+            "use_tanh_gate": True,
+            "spatial_gate": True,
+            "channel_gate": True,
+            "normalize_depth": True,
+            "require_depth": True,
+        }
+    )
+    model = DSGCnet(backbone, use_depth_attn=True, depth_attn_cfg=depth_attn_cfg)
+    model.eval()
+
+    with torch.no_grad():
+        out = model(sample_batch, depth_map=depth_sample)
+
+    assert out["pred_logits"].shape[0] == sample_batch.shape[0]
+    assert out["pred_points"].shape[0] == sample_batch.shape[0]
+    assert out["density_out"].shape[0] == sample_batch.shape[0]
+
+
 def test_dsgcnet_depth_attn_no_depthmap_runs(sample_batch):
     """When depth_map=None with depth_attn enabled, model should still run."""
     backbone = TinyVGGBackbone()
@@ -407,6 +583,30 @@ def test_dsgcnet_depth_attn_no_depthmap_runs(sample_batch):
 
     with torch.no_grad():
         out = model(sample_batch)  # no depth_map
+
+    assert out["pred_logits"].shape[0] == sample_batch.shape[0]
+
+
+def test_dsgcnet_depth_attn_v2_requires_depthmap(sample_batch):
+    """V2 defaults to strict missing-depth behaviour for real RGB-D runs."""
+    backbone = TinyVGGBackbone()
+    depth_attn_cfg = OmegaConf.create({"version": "v2", "require_depth": True})
+    model = DSGCnet(backbone, use_depth_attn=True, depth_attn_cfg=depth_attn_cfg)
+    model.eval()
+
+    with pytest.raises(ValueError, match="requires depth_map"):
+        model(sample_batch)
+
+
+def test_dsgcnet_depth_attn_v2_no_depthmap_fallback(sample_batch):
+    """The v2 path can still opt into RGB-only fallback for smoke tests."""
+    backbone = TinyVGGBackbone()
+    depth_attn_cfg = OmegaConf.create({"version": "v2", "require_depth": False})
+    model = DSGCnet(backbone, use_depth_attn=True, depth_attn_cfg=depth_attn_cfg)
+    model.eval()
+
+    with torch.no_grad():
+        out = model(sample_batch)
 
     assert out["pred_logits"].shape[0] == sample_batch.shape[0]
 

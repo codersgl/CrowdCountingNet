@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.ops import DeformConv2d
 
 
@@ -87,6 +88,237 @@ def _conv3x3_block(in_ch: int, out_ch: int, use_dcn: bool = False) -> nn.Module:
         nn.BatchNorm2d(out_ch),
         nn.ReLU(inplace=True),
     )
+
+
+class _DepthwiseSeparableConvBNReLU(nn.Module):
+    """Depthwise-separable 3×3 refinement used inside BiFPN nodes."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                groups=channels,
+                bias=False,
+            ),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+def _bifpn_refine(channels: int, use_depthwise: bool) -> nn.Module:
+    if use_depthwise:
+        return _DepthwiseSeparableConvBNReLU(channels)
+    return _conv3x3_block(channels, channels)
+
+
+def _resize_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    if x.shape[-2:] == ref.shape[-2:]:
+        return x
+    return F.interpolate(x, size=ref.shape[-2:], mode="nearest")
+
+
+class _FastNormalizedFusion(nn.Module):
+    """BiFPN fast normalized weighted fusion for same-shape tensors."""
+
+    def __init__(self, num_inputs: int, eps: float = 1e-4) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weights = nn.Parameter(torch.ones(num_inputs, dtype=torch.float32))
+
+    @property
+    def normalized_weights(self) -> torch.Tensor:
+        weights = torch.relu(self.weights)
+        return weights / (weights.sum() + self.eps)
+
+    def forward(self, inputs: list[torch.Tensor]) -> torch.Tensor:
+        if len(inputs) != self.weights.numel():
+            raise ValueError(
+                f"Expected {self.weights.numel()} fusion inputs, got {len(inputs)}"
+            )
+        weights = self.normalized_weights
+        out = torch.zeros_like(inputs[0])
+        for weight, x in zip(weights, inputs):
+            out = out + weight.to(device=x.device, dtype=x.dtype) * x
+        return out
+
+
+class _BiFPNDownsample(nn.Module):
+    """Downsample to a target size, optionally preserving detail with SPD."""
+
+    def __init__(self, channels: int, use_spd: bool = True) -> None:
+        super().__init__()
+        self.use_spd = use_spd
+        if use_spd:
+            self.op = nn.Sequential(
+                SPD(),
+                nn.Conv2d(4 * channels, channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.op = nn.Sequential(
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(inplace=True),
+            )
+
+    def forward(self, x: torch.Tensor, target_size: tuple[int, int]) -> torch.Tensor:
+        if x.shape[-2:] == target_size:
+            return x
+        if x.shape[-2] < target_size[0] or x.shape[-1] < target_size[1]:
+            return F.interpolate(x, size=target_size, mode="nearest")
+
+        if self.use_spd:
+            pad_h = x.shape[-2] % 2
+            pad_w = x.shape[-1] % 2
+            if pad_h or pad_w:
+                x = F.pad(x, (0, pad_w, 0, pad_h))
+        out = self.op(x)
+        if out.shape[-2:] != target_size:
+            out = F.interpolate(out, size=target_size, mode="nearest")
+        return out
+
+
+class SPDBiFPNBlock(nn.Module):
+    """Single SPD-BiFPN block over P3/P4/P5 feature levels."""
+
+    def __init__(
+        self,
+        feature_size: int = 256,
+        use_spd_downsample: bool = True,
+        use_depthwise_refine: bool = True,
+        eps: float = 1e-4,
+    ) -> None:
+        super().__init__()
+        self.p4_td_fusion = _FastNormalizedFusion(2, eps=eps)
+        self.p3_out_fusion = _FastNormalizedFusion(2, eps=eps)
+        self.p4_out_fusion = _FastNormalizedFusion(3, eps=eps)
+        self.p5_out_fusion = _FastNormalizedFusion(2, eps=eps)
+
+        self.p4_td_refine = _bifpn_refine(feature_size, use_depthwise_refine)
+        self.p3_out_refine = _bifpn_refine(feature_size, use_depthwise_refine)
+        self.p4_out_refine = _bifpn_refine(feature_size, use_depthwise_refine)
+        self.p5_out_refine = _bifpn_refine(feature_size, use_depthwise_refine)
+
+        self.p3_downsample = _BiFPNDownsample(feature_size, use_spd_downsample)
+        self.p4_downsample = _BiFPNDownsample(feature_size, use_spd_downsample)
+
+    def forward(
+        self, p3: torch.Tensor, p4: torch.Tensor, p5: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        p5_td = p5
+        p4_td = self.p4_td_refine(
+            self.p4_td_fusion([p4, _resize_like(p5_td, p4)])
+        )
+        p3_out = self.p3_out_refine(
+            self.p3_out_fusion([p3, _resize_like(p4_td, p3)])
+        )
+
+        p3_down = self.p3_downsample(p3_out, p4.shape[-2:])
+        p4_out = self.p4_out_refine(
+            self.p4_out_fusion([p4, p4_td, p3_down])
+        )
+
+        p4_down = self.p4_downsample(p4_out, p5.shape[-2:])
+        p5_out = self.p5_out_refine(self.p5_out_fusion([p5, p4_down]))
+        return p3_out, p4_out, p5_out
+
+
+class SPDBiFPNNeck(nn.Module):
+    """SPD-BiFPN drop-in replacement for the PA-FPN neck.
+
+    The neck keeps DSGCNet's downstream contract unchanged: it consumes
+    ``[C3, C4, C5]`` backbone features and returns a 256-channel stride-8
+    fused map.  C3 downsampling uses SPD by default to preserve local point
+    layout information for the regression branch.
+    """
+
+    def __init__(
+        self,
+        C3_size: int,
+        C4_size: int,
+        C5_size: int,
+        feature_size: int = 256,
+        num_blocks: int = 1,
+        use_spd_downsample: bool = True,
+        use_depthwise_refine: bool = True,
+        eps: float = 1e-4,
+    ) -> None:
+        super().__init__()
+        if num_blocks < 1:
+            raise ValueError("SPDBiFPNNeck requires num_blocks >= 1")
+        self.feature_size = feature_size
+
+        self.P3_1 = nn.Sequential(
+            nn.Conv2d(C3_size, feature_size, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feature_size),
+            nn.ReLU(inplace=True),
+        )
+        self.P4_1 = nn.Sequential(
+            nn.Conv2d(C4_size, feature_size, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feature_size),
+            nn.ReLU(inplace=True),
+        )
+        self.P5_1 = nn.Sequential(
+            nn.Conv2d(C5_size, feature_size, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feature_size),
+            nn.ReLU(inplace=True),
+        )
+
+        self.blocks = nn.ModuleList(
+            [
+                SPDBiFPNBlock(
+                    feature_size=feature_size,
+                    use_spd_downsample=use_spd_downsample,
+                    use_depthwise_refine=use_depthwise_refine,
+                    eps=eps,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+        self.final_p3_downsample = _BiFPNDownsample(feature_size, use_spd_downsample)
+        self.final_fusion = _FastNormalizedFusion(3, eps=eps)
+        self.final_refine = _bifpn_refine(feature_size, use_depthwise_refine)
+
+    def forward(
+        self,
+        inputs: list[torch.Tensor],
+        return_intermediates: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    ):
+        c3, c4, c5 = inputs
+        p3 = self.P3_1(c3)
+        p4 = self.P4_1(c4)
+        p5 = self.P5_1(c5)
+
+        for block in self.blocks:
+            p3, p4, p5 = block(p3, p4, p5)
+
+        p3_to_p4 = self.final_p3_downsample(p3, p4.shape[-2:])
+        p5_to_p4 = _resize_like(p5, p4)
+        out = self.final_refine(self.final_fusion([p3_to_p4, p4, p5_to_p4]))
+
+        if return_intermediates:
+            return out, (p3, p4, p5)
+        return out
 
 
 class Decoder_SPD_PAFPN(nn.Module):

@@ -20,6 +20,8 @@ def cfg():
                 "set_cost_point": 0.05,
                 "eos_coef": 0.5,
                 "point_loss_coef": 0.0002,
+                "point_loss_type": "smooth_l1",
+                "point_smooth_l1_beta": 1.0,
                 "count_loss_coef": 0.005,
             }
         }
@@ -158,6 +160,85 @@ def test_smooth_l1_vs_mse_on_outlier():
     smooth_l1 = F.smooth_l1_loss(src, tgt, reduction="sum", beta=1.0)
     mse = F.mse_loss(src, tgt, reduction="sum")
     assert smooth_l1 < mse, "Smooth L1 should be smaller than MSE for large errors"
+
+
+def test_point_loss_type_mse_matches_original_code_path(cfg):
+    """MSE point loss should match the original DSGC-Net/P2PNet implementation."""
+    matcher = build_matcher_crowd(cfg)
+    outputs = {
+        "pred_logits": torch.tensor([[[0.0, 1.0]]], dtype=torch.float32),
+        "pred_points": torch.tensor([[[3.0, 4.0]]], dtype=torch.float32),
+    }
+    targets = [
+        {
+            "labels": torch.ones(1, dtype=torch.long),
+            "point": torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+        }
+    ]
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_points": 1.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["points"],
+        point_loss_type="mse",
+    )
+    loss = criterion(outputs, targets)["loss_points"]
+    assert torch.allclose(loss, torch.tensor(25.0))
+
+
+def test_point_loss_type_smooth_l1_keeps_current_default(cfg):
+    """Smooth L1 remains available for reproducing existing local runs."""
+    matcher = build_matcher_crowd(cfg)
+    outputs = {
+        "pred_logits": torch.tensor([[[0.0, 1.0]]], dtype=torch.float32),
+        "pred_points": torch.tensor([[[3.0, 4.0]]], dtype=torch.float32),
+    }
+    targets = [
+        {
+            "labels": torch.ones(1, dtype=torch.long),
+            "point": torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+        }
+    ]
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_points": 1.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["points"],
+        point_loss_type="smooth_l1",
+        point_smooth_l1_beta=1.0,
+    )
+    loss = criterion(outputs, targets)["loss_points"]
+    assert torch.allclose(loss, torch.tensor(6.0))
+
+
+def test_point_loss_type_l2_aliases_mse(cfg):
+    """The l2 alias maps to the original squared-L2/MSE implementation."""
+    matcher = build_matcher_crowd(cfg)
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_points": 1.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["points"],
+        point_loss_type="l2",
+    )
+    assert criterion.point_loss_type == "mse"
+
+
+def test_point_loss_type_invalid_raises(cfg):
+    """Unsupported point regression losses should fail fast."""
+    matcher = build_matcher_crowd(cfg)
+    with pytest.raises(ValueError, match="point_loss_type"):
+        SetCriterion_Crowd(
+            num_classes=1,
+            matcher=matcher,
+            weight_dict={"loss_points": 1.0},
+            eos_coef=cfg.model.eos_coef,
+            losses=["points"],
+            point_loss_type="charbonnier",
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -35,13 +35,16 @@ from crowdcount.models.head import (
     DensityPred_Block4,
     DensityPred_Block5,
 )
-from crowdcount.models.dap_neck import DAPNeck
-from crowdcount.models.neck import Decoder_SPD_PAFPN
+from crowdcount.models.dap_neck import ACDR, DAPNeck
+from crowdcount.models.neck import Decoder_SPD_PAFPN, SPDBiFPNNeck
 from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
-from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
 from crowdcount.plugins.concat_gate_fusion import ConcatGateFusion
-from crowdcount.plugins.depth_residual_gating import DepthResidualGating
+from crowdcount.plugins.depth_cross_attention import DepthCrossAttentionFusion
+from crowdcount.plugins.depth_residual_gating import (
+    DepthResidualGating,
+    DepthResidualGatingV2,
+)
 from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
 from crowdcount.models.backbone import DepthBackbone_VGG
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
@@ -95,6 +98,51 @@ class _DepthEncoder(nn.Module):
         return d3, d4, d5
 
 
+class _SharedBackboneDepthMix(nn.Module):
+    """Layer-wise Mix fusion for shared-backbone RGB/depth features."""
+
+    def __init__(self, init: float = 1.5, num_scales: int = 3) -> None:
+        super().__init__()
+        self.mix_weights = nn.Parameter(
+            torch.full((num_scales,), float(init), dtype=torch.float32)
+        )
+        self.mix_block = nn.Sigmoid()
+
+    @property
+    def mix_factors(self) -> torch.Tensor:
+        return self.mix_block(self.mix_weights)
+
+    def forward(
+        self,
+        rgb_features: tuple[torch.Tensor, ...],
+        depth_features: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        if len(rgb_features) != len(depth_features):
+            raise ValueError(
+                "RGB and depth feature tuples must have the same number of scales"
+            )
+        if len(rgb_features) != self.mix_weights.numel():
+            raise ValueError(
+                f"Expected {self.mix_weights.numel()} feature scales, "
+                f"got {len(rgb_features)}"
+            )
+
+        fused_features: list[torch.Tensor] = []
+        for mix_factor, rgb_feat, depth_feat in zip(
+            self.mix_factors, rgb_features, depth_features
+        ):
+            if rgb_feat.shape != depth_feat.shape:
+                raise ValueError(
+                    "RGB and depth features must have matching shapes for Mix fusion; "
+                    f"got {tuple(rgb_feat.shape)} and {tuple(depth_feat.shape)}"
+                )
+            mix = mix_factor.to(device=rgb_feat.device, dtype=rgb_feat.dtype).view(
+                1, 1, 1, 1
+            )
+            fused_features.append(rgb_feat * mix + depth_feat * (1.0 - mix))
+        return tuple(fused_features)
+
+
 class DSGCnet(nn.Module):
     def __init__(
         self,
@@ -117,11 +165,14 @@ class DSGCnet(nn.Module):
         use_depth: bool = False,
         depth_cfg: DictConfig | None = None,
         use_depth_geo: bool = False,
+        use_depth_geo_post: bool = False,
         depth_geo_cfg: DictConfig | None = None,
         use_depth_dual_vgg: bool = False,
         depth_dual_vgg_cfg: DictConfig | None = None,
         use_depth_attn: bool = False,
         depth_attn_cfg: DictConfig | None = None,
+        use_depth_cross_attn: bool = False,
+        depth_cross_attn_cfg: DictConfig | None = None,
         gcn_adaptive: bool = False,
         gcn_k: int = 4,
         gcn_k_min: int = 2,
@@ -164,6 +215,9 @@ class DSGCnet(nn.Module):
         rccformer_deab_blocks: int = 2,
         use_dap_neck: bool = False,
         dap_neck_cfg: DictConfig | None = None,
+        use_bifpn_neck: bool = False,
+        bifpn_neck_cfg: DictConfig | None = None,
+        neck_acdr_cfg: DictConfig | None = None,
         use_deep_head: bool = False,
         use_density_adaptive_fusion: bool = False,
         density_adaptive_fusion_cfg: DictConfig | None = None,
@@ -183,19 +237,30 @@ class DSGCnet(nn.Module):
         self.sa_dgat_fusion: SADGATFusion | None = None
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
+        self.use_depth_geo_post = use_depth_geo_post
         self.use_depth_dual_vgg = use_depth_dual_vgg
         self.use_depth_attn = use_depth_attn
+        self.use_depth_cross_attn = use_depth_cross_attn
 
         # Mutual exclusion: only one depth fusion path at a time
         _depth_flags = sum(
-            [use_depth, use_depth_geo, use_depth_dual_vgg, use_depth_attn]
+            [
+                use_depth,
+                use_depth_geo,
+                use_depth_geo_post,
+                use_depth_dual_vgg,
+                use_depth_attn,
+                use_depth_cross_attn,
+            ]
         )
         if _depth_flags > 1:
             raise ValueError(
                 "At most one depth fusion path may be enabled. Got: "
                 f"use_depth={use_depth}, use_depth_geo={use_depth_geo}, "
+                f"use_depth_geo_post={use_depth_geo_post}, "
                 f"use_depth_dual_vgg={use_depth_dual_vgg}, "
-                f"use_depth_attn={use_depth_attn}"
+                f"use_depth_attn={use_depth_attn}, "
+                f"use_depth_cross_attn={use_depth_cross_attn}"
             )
         self.use_freq_head = use_freq_head
         self.use_density_attention = use_density_attention
@@ -207,16 +272,36 @@ class DSGCnet(nn.Module):
         self.use_msca_neck = use_msca_neck
         self.use_rccformer_neck = use_rccformer_neck
         self.use_dap_neck = use_dap_neck
+        self.use_bifpn_neck = use_bifpn_neck
         self.use_density_adaptive_fusion = use_density_adaptive_fusion
 
         _neck_flags = sum(
-            [use_msca_neck, use_msca_decoder, use_rccformer_neck, use_dap_neck]
+            [
+                use_msca_neck,
+                use_msca_decoder,
+                use_rccformer_neck,
+                use_dap_neck,
+                use_bifpn_neck,
+            ]
         )
         if _neck_flags > 1:
             raise ValueError(
                 "Neck options are mutually exclusive; enable at most one. Got: "
                 f"use_msca_neck={use_msca_neck}, use_msca_decoder={use_msca_decoder}, "
-                f"use_rccformer_neck={use_rccformer_neck}, use_dap_neck={use_dap_neck}"
+                f"use_rccformer_neck={use_rccformer_neck}, use_dap_neck={use_dap_neck}, "
+                f"use_bifpn_neck={use_bifpn_neck}"
+            )
+
+        if use_depth_cross_attn and use_msca_decoder:
+            raise ValueError(
+                "use_depth_cross_attn is not supported with use_msca_decoder because "
+                "MSCADecoder produces density before post-neck fusion."
+            )
+
+        if use_depth_geo_post and use_msca_decoder:
+            raise ValueError(
+                "use_depth_geo_post is not supported with use_msca_decoder because "
+                "MSCADecoder produces density before post-neck fusion."
             )
 
         if use_msca_neck and use_msca_decoder:
@@ -271,8 +356,74 @@ class DSGCnet(nn.Module):
             )
 
         self.anchor_points = AnchorPoints(pyramid_levels=[3], row=row, line=line)
+
+        def _build_standard_density_head() -> nn.Module:
+            model_cfg = getattr(cfg, "model", None) if cfg is not None else None
+            density_version = str(getattr(model_cfg, "density_head_version", "v1"))
+            if (
+                bool(getattr(model_cfg, "use_ms_density_head", False))
+                and density_version == "v1"
+            ):
+                density_version = "ms"
+            if density_version == "v3":
+                upsample = bool(getattr(model_cfg, "density_head_upsample", False))
+                return Density_pred_V3(upsample=upsample)
+            if density_version == "ms":
+                return Density_pred_MS()
+            return Density_pred()
+
+        def _neck_acdr_enabled() -> bool:
+            enabled = getattr(neck_acdr_cfg, "enabled", "auto")
+            if isinstance(enabled, str):
+                enabled = enabled.lower()
+                if enabled == "auto":
+                    return use_dap_neck
+                if enabled in {"true", "yes", "1"}:
+                    return True
+                if enabled in {"false", "no", "0"}:
+                    return False
+            return bool(enabled)
+
+        use_neck_acdr = _neck_acdr_enabled()
+        if use_msca_decoder and use_neck_acdr:
+            raise ValueError(
+                "neck_acdr is not supported with use_msca_decoder because "
+                "MSCADecoder owns both neck features and density prediction."
+            )
+
+        acdr_enabled_value = str(getattr(neck_acdr_cfg, "enabled", "auto")).lower()
+        if use_dap_neck and acdr_enabled_value == "auto":
+            acdr_large_kernel = int(
+                getattr(
+                    dap_neck_cfg,
+                    "acdr_large_kernel",
+                    getattr(neck_acdr_cfg, "large_kernel", 7),
+                )
+            )
+            acdr_dilation = int(
+                getattr(
+                    dap_neck_cfg,
+                    "acdr_dilation",
+                    getattr(neck_acdr_cfg, "dilation", 2),
+                )
+            )
+        else:
+            acdr_large_kernel = int(getattr(neck_acdr_cfg, "large_kernel", 7))
+            acdr_dilation = int(getattr(neck_acdr_cfg, "dilation", 2))
+        self.neck_acdr = (
+            ACDR(
+                channels=256,
+                large_kernel=acdr_large_kernel,
+                dilation=acdr_dilation,
+                hidden_ratio=int(getattr(neck_acdr_cfg, "hidden_ratio", 4)),
+                gate_init=float(getattr(neck_acdr_cfg, "gate_init", 0.0)),
+            )
+            if use_neck_acdr
+            else None
+        )
+
         if use_dap_neck:
-            # DAP-Neck v2: SPD-PAFPN + ACDR
+            # DAP-Neck v2 fusion backbone; ACDR is wired as post-neck module.
             self.msca_decoder = None
             _dn = dap_neck_cfg
             self.pa = DAPNeck(
@@ -283,25 +434,30 @@ class DSGCnet(nn.Module):
                 use_peem=bool(getattr(_dn, "use_peem", False)) if _dn else False,
                 freq_cutoff=float(getattr(_dn, "freq_cutoff", 0.25)) if _dn else 0.25,
                 use_dcn=bool(getattr(_dn, "use_dcn", False)) if _dn else False,
-                acdr_large_kernel=int(getattr(_dn, "acdr_large_kernel", 7))
-                if _dn
-                else 7,
-                acdr_dilation=int(getattr(_dn, "acdr_dilation", 2)) if _dn else 2,
+                use_acdr=False,
             )
-            density_version = str(getattr(cfg.model, "density_head_version", "v1"))
-            # Backward compat: use_ms_density_head=true upgrades v1→ms
-            if (
-                bool(getattr(cfg.model, "use_ms_density_head", False))
-                and density_version == "v1"
-            ):
-                density_version = "ms"
-            if density_version == "v3":
-                _upsample = bool(getattr(cfg.model, "density_head_upsample", False))
-                self.density_pred = Density_pred_V3(upsample=_upsample)
-            elif density_version == "ms":
-                self.density_pred = Density_pred_MS()
-            else:
-                self.density_pred = Density_pred()
+            self.density_pred = _build_standard_density_head()
+        elif use_bifpn_neck:
+            # SPD-BiFPN: weighted bidirectional fusion with detail-preserving SPD.
+            self.msca_decoder = None
+            _bn = bifpn_neck_cfg
+            self.pa = SPDBiFPNNeck(
+                C3_size=256,
+                C4_size=512,
+                C5_size=512,
+                feature_size=256,
+                num_blocks=int(getattr(_bn, "num_blocks", 1)) if _bn else 1,
+                use_spd_downsample=bool(getattr(_bn, "use_spd_downsample", True))
+                if _bn
+                else True,
+                use_depthwise_refine=bool(
+                    getattr(_bn, "use_depthwise_refine", True)
+                )
+                if _bn
+                else True,
+                eps=float(getattr(_bn, "eps", 1e-4)) if _bn else 1e-4,
+            )
+            self.density_pred = _build_standard_density_head()
         elif use_rccformer_neck:
             # RCCFormer MFFM neck + DEAB/ASAM density head
             self.msca_decoder = None
@@ -625,6 +781,11 @@ class DSGCnet(nn.Module):
                     spatial_prior=gcn_spatial_prior,
                     spatial_alpha=gcn_spatial_alpha,
                     spatial_beta=gcn_spatial_beta,
+                    depth_prior_cfg=(
+                        getattr(getattr(cfg, "model", cfg), "depth_graph_prior", None)
+                        if cfg is not None
+                        else None
+                    ),
                 )
                 self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(
                     k=gcn_k,
@@ -723,29 +884,22 @@ class DSGCnet(nn.Module):
             else None
         )
 
-        # Depth dual-stream fusion (optional, disabled by default)
+        # Depth shared-backbone Mix fusion (optional, disabled by default)
         if use_depth:
-            embed_dim = (
-                int(getattr(depth_cfg, "embed_dim", 128))
+            mix_init = (
+                float(getattr(depth_cfg, "mix_init", 1.5))
                 if depth_cfg is not None
-                else 128
+                else 1.5
             )
-            num_isf_layers = (
-                int(getattr(depth_cfg, "num_isf_layers", 1))
-                if depth_cfg is not None
-                else 1
+            self.shared_depth_mix: _SharedBackboneDepthMix | None = (
+                _SharedBackboneDepthMix(init=mix_init)
             )
-            self.depth_backbone: _DepthEncoder | None = _DepthEncoder()
-            self.depth_fusion_c3: DepthFusionModule | None = DepthFusionModule(
-                in_channels=256, embed_dim=embed_dim, num_isf_layers=num_isf_layers
-            )
-            self.depth_fusion_c4: DepthFusionModule | None = DepthFusionModule(
-                in_channels=512, embed_dim=embed_dim, num_isf_layers=num_isf_layers
-            )
-            self.depth_fusion_c5: DepthFusionModule | None = DepthFusionModule(
-                in_channels=512, embed_dim=embed_dim, num_isf_layers=num_isf_layers
-            )
+            self.depth_backbone: _DepthEncoder | None = None
+            self.depth_fusion_c3 = None
+            self.depth_fusion_c4 = None
+            self.depth_fusion_c5 = None
         else:
+            self.shared_depth_mix = None
             self.depth_backbone = None
             self.depth_fusion_c3 = None
             self.depth_fusion_c4 = None
@@ -791,7 +945,35 @@ class DSGCnet(nn.Module):
             self.geo_attn_c4 = None
             self.geo_attn_c5 = None
 
-        # Dual-VGG RGBD fusion (optional, alternative to use_depth / use_depth_geo)
+        # Post-neck DFormerv2-style geometry self-attention. This keeps the
+        # backbone/neck unchanged and injects depth as a geometry prior once on
+        # the shared 256-channel feature before density prediction and GCN.
+        if use_depth_geo_post:
+            geo_num_heads = (
+                int(getattr(depth_geo_cfg, "num_heads", 8))
+                if depth_geo_cfg is not None
+                else 8
+            )
+            geo_init_val = (
+                float(getattr(depth_geo_cfg, "initial_value", 2.0))
+                if depth_geo_cfg is not None
+                else 2.0
+            )
+            geo_hr = (
+                float(getattr(depth_geo_cfg, "heads_range", 4.0))
+                if depth_geo_cfg is not None
+                else 4.0
+            )
+            self.geo_attn_post: DepthGeoPriorAttention | None = DepthGeoPriorAttention(
+                256,
+                num_heads=geo_num_heads,
+                initial_value=geo_init_val,
+                heads_range=geo_hr,
+            )
+        else:
+            self.geo_attn_post = None
+
+        # Dual-VGG RGBD fusion (optional, alternative to use_depth / use_depth_geo / use_depth_geo_post)
         if use_depth_dual_vgg:
             _dvgg_variant = (
                 str(getattr(depth_dual_vgg_cfg, "variant", "vgg16_bn"))
@@ -823,25 +1005,146 @@ class DSGCnet(nn.Module):
             self.dvgg_fusion_c5 = None
 
         # Path 4: use_depth_attn — DepthResidualGating (lightweight residual gate)
+        self.depth_attn_require_depth = False
         if use_depth_attn:
+            _da_version = (
+                str(getattr(depth_attn_cfg, "version", "v1"))
+                if depth_attn_cfg is not None
+                else "v1"
+            ).lower()
+            if _da_version not in {"v1", "v2"}:
+                raise ValueError(
+                    f"depth_attn.version must be 'v1' or 'v2', got {_da_version!r}"
+                )
             _da_mid_ratio = (
                 int(getattr(depth_attn_cfg, "mid_ratio", 4))
                 if depth_attn_cfg is not None
                 else 4
             )
-            self.depth_attn_c3: DepthResidualGating | None = DepthResidualGating(
-                256, mid_ratio=_da_mid_ratio
-            )
-            self.depth_attn_c4: DepthResidualGating | None = DepthResidualGating(
-                512, mid_ratio=_da_mid_ratio
-            )
-            self.depth_attn_c5: DepthResidualGating | None = DepthResidualGating(
-                512, mid_ratio=_da_mid_ratio
-            )
+            if _da_version == "v1":
+                self.depth_attn_c3: DepthResidualGating | DepthResidualGatingV2 | None = DepthResidualGating(
+                    256, mid_ratio=_da_mid_ratio
+                )
+                self.depth_attn_c4: DepthResidualGating | DepthResidualGatingV2 | None = DepthResidualGating(
+                    512, mid_ratio=_da_mid_ratio
+                )
+                self.depth_attn_c5: DepthResidualGating | DepthResidualGatingV2 | None = DepthResidualGating(
+                    512, mid_ratio=_da_mid_ratio
+                )
+            else:
+                self.depth_attn_require_depth = (
+                    bool(getattr(depth_attn_cfg, "require_depth", True))
+                    if depth_attn_cfg is not None
+                    else True
+                )
+                _da_gate_init = (
+                    float(getattr(depth_attn_cfg, "gate_init", 0.0))
+                    if depth_attn_cfg is not None
+                    else 0.0
+                )
+                _da_use_tanh = (
+                    bool(getattr(depth_attn_cfg, "use_tanh_gate", True))
+                    if depth_attn_cfg is not None
+                    else True
+                )
+                _da_spatial_gate = (
+                    bool(getattr(depth_attn_cfg, "spatial_gate", True))
+                    if depth_attn_cfg is not None
+                    else True
+                )
+                _da_channel_gate = (
+                    bool(getattr(depth_attn_cfg, "channel_gate", True))
+                    if depth_attn_cfg is not None
+                    else True
+                )
+                _da_normalize = (
+                    bool(getattr(depth_attn_cfg, "normalize_depth", True))
+                    if depth_attn_cfg is not None
+                    else True
+                )
+                self.depth_attn_c3 = DepthResidualGatingV2(
+                    256,
+                    mid_ratio=_da_mid_ratio,
+                    gate_init=_da_gate_init,
+                    use_tanh_gate=_da_use_tanh,
+                    spatial_gate=_da_spatial_gate,
+                    channel_gate=_da_channel_gate,
+                    normalize_depth=_da_normalize,
+                )
+                self.depth_attn_c4 = DepthResidualGatingV2(
+                    512,
+                    mid_ratio=_da_mid_ratio,
+                    gate_init=_da_gate_init,
+                    use_tanh_gate=_da_use_tanh,
+                    spatial_gate=_da_spatial_gate,
+                    channel_gate=_da_channel_gate,
+                    normalize_depth=_da_normalize,
+                )
+                self.depth_attn_c5 = DepthResidualGatingV2(
+                    512,
+                    mid_ratio=_da_mid_ratio,
+                    gate_init=_da_gate_init,
+                    use_tanh_gate=_da_use_tanh,
+                    spatial_gate=_da_spatial_gate,
+                    channel_gate=_da_channel_gate,
+                    normalize_depth=_da_normalize,
+                )
         else:
             self.depth_attn_c3 = None
             self.depth_attn_c4 = None
             self.depth_attn_c5 = None
+
+        # Path 5: post-neck RGB-depth cross-attention (optional)
+        if use_depth_cross_attn:
+            _dca_embed_dim = (
+                int(getattr(depth_cross_attn_cfg, "embed_dim", 128))
+                if depth_cross_attn_cfg is not None
+                else 128
+            )
+            _dca_heads = (
+                int(getattr(depth_cross_attn_cfg, "num_heads", 4))
+                if depth_cross_attn_cfg is not None
+                else 4
+            )
+            _dca_window = (
+                int(getattr(depth_cross_attn_cfg, "window_size", 8))
+                if depth_cross_attn_cfg is not None
+                else 8
+            )
+            _dca_dropout = (
+                float(getattr(depth_cross_attn_cfg, "dropout", 0.0))
+                if depth_cross_attn_cfg is not None
+                else 0.0
+            )
+            _dca_gate = (
+                float(getattr(depth_cross_attn_cfg, "gate_init", 0.0))
+                if depth_cross_attn_cfg is not None
+                else 0.0
+            )
+            _dca_mid = (
+                int(getattr(depth_cross_attn_cfg, "depth_mid_channels", 64))
+                if depth_cross_attn_cfg is not None
+                else 64
+            )
+            _dca_mode = (
+                str(getattr(depth_cross_attn_cfg, "mode", "window"))
+                if depth_cross_attn_cfg is not None
+                else "window"
+            )
+            self.depth_cross_attn: DepthCrossAttentionFusion | None = (
+                DepthCrossAttentionFusion(
+                    in_channels=256,
+                    embed_dim=_dca_embed_dim,
+                    num_heads=_dca_heads,
+                    window_size=_dca_window,
+                    dropout=_dca_dropout,
+                    gate_init=_dca_gate,
+                    depth_mid_channels=_dca_mid,
+                    mode=_dca_mode,
+                )
+            )
+        else:
+            self.depth_cross_attn = None
 
         # DINOv2 semantic injection (optional, disabled by default)
         # cfg may be full hydra config (has .model) or flat model-level config from tests
@@ -1031,18 +1334,13 @@ class DSGCnet(nn.Module):
         # Convert dict to list format for compatibility with MSAA and PA-FPN
         features_list = [features[0], features[1], features[2], features[3]]
 
-        if self.msaa is not None:
-            features_list = self.msaa(features_list)
-
-        # Use stable list indices across VGG and DINO backbones:
-        # c3: 256ch, c4: 512ch, c5: 512ch
-        c3, c4, c5 = features_list[1], features_list[2], features_list[3]
-        c3_hr = c3  # Cache high-res features for optional sub-pixel refinement
-
-        # Depth dual-stream fusion: fuse each scale before PA-FPN
+        # Shared-backbone depth fusion: run depth through the same backbone and
+        # Mix c3/c4/c5 before downstream neck modules.
         if self.use_depth and depth_map is not None:
-            assert self.depth_backbone is not None
-            # Resize depth_map to match input spatial dims (may differ due to padding)
+            assert self.shared_depth_mix is not None
+            if depth_map.dim() == 3:
+                depth_map = depth_map.unsqueeze(1)
+            depth_map = depth_map.to(device=samples.device, dtype=samples.dtype)
             if depth_map.shape[-2:] != samples.shape[-2:]:
                 depth_map = F.interpolate(
                     depth_map,
@@ -1050,10 +1348,36 @@ class DSGCnet(nn.Module):
                     mode="bilinear",
                     align_corners=False,
                 )
-            d3, d4, d5 = self.depth_backbone(depth_map)
-            c3 = self.depth_fusion_c3(c3, d3)  # type: ignore[misc]
-            c4 = self.depth_fusion_c4(c4, d4)  # type: ignore[misc]
-            c5 = self.depth_fusion_c5(c5, d5)  # type: ignore[misc]
+            if depth_map.shape[1] == 1:
+                depth_samples = depth_map.repeat(1, samples.shape[1], 1, 1)
+            elif depth_map.shape[1] == samples.shape[1]:
+                depth_samples = depth_map
+            else:
+                raise ValueError(
+                    "depth_map must have either one channel or match sample channels; "
+                    f"got depth_map.shape={tuple(depth_map.shape)} and "
+                    f"samples.shape={tuple(samples.shape)}"
+                )
+            depth_features = self.backbone(depth_samples)
+            depth_features_list = [
+                depth_features[0],
+                depth_features[1],
+                depth_features[2],
+                depth_features[3],
+            ]
+            c3, c4, c5 = self.shared_depth_mix(
+                (features_list[1], features_list[2], features_list[3]),
+                (depth_features_list[1], depth_features_list[2], depth_features_list[3]),
+            )
+            features_list[1], features_list[2], features_list[3] = c3, c4, c5
+
+        if self.msaa is not None:
+            features_list = self.msaa(features_list)
+
+        # Use stable list indices across VGG and DINO backbones:
+        # c3: 256ch, c4: 512ch, c5: 512ch
+        c3, c4, c5 = features_list[1], features_list[2], features_list[3]
+        c3_hr = c3  # Cache high-res features for optional sub-pixel refinement
 
         if self.use_depth_geo and depth_map is not None:
             c3 = self.geo_attn_c3(c3, depth_map)  # type: ignore[misc]
@@ -1078,10 +1402,17 @@ class DSGCnet(nn.Module):
             c5 = self.dvgg_fusion_c5(c5, d_c5)  # type: ignore[misc]
 
         # Path 4: DepthResidualGating — lightweight residual gate per scale
-        if self.use_depth_attn and depth_map is not None:
-            c3 = self.depth_attn_c3(c3, depth_map)  # type: ignore[misc]
-            c4 = self.depth_attn_c4(c4, depth_map)  # type: ignore[misc]
-            c5 = self.depth_attn_c5(c5, depth_map)  # type: ignore[misc]
+        if self.use_depth_attn:
+            if depth_map is None:
+                if self.depth_attn_require_depth:
+                    raise ValueError(
+                        "use_depth_attn=True with depth_attn.version='v2' requires depth_map. "
+                        "Set model.depth_attn.require_depth=false to keep RGB-only fallback."
+                    )
+            else:
+                c3 = self.depth_attn_c3(c3, depth_map)  # type: ignore[misc]
+                c4 = self.depth_attn_c4(c4, depth_map)  # type: ignore[misc]
+                c5 = self.depth_attn_c5(c5, depth_map)  # type: ignore[misc]
 
         # --- MSCADecoder path: replaces PA-FPN + Density_pred, GCN runs downstream ---
         fpn_intermediates = None
@@ -1090,12 +1421,17 @@ class DSGCnet(nn.Module):
             feature_fl, density = self.msca_decoder([c3, c4, c5])
             features_pa = feature_fl  # alias for downstream consumers
         else:
+            assert self.pa is not None
+            assert self.density_pred is not None
             # For SA-DGAT, get FPN intermediates in a single pass
             if self.use_sa_dgat:
                 _pa_result = self.pa([c3, c4, c5], return_intermediates=True)
                 features_pa, fpn_intermediates = _pa_result
             else:
                 features_pa = self.pa([c3, c4, c5])  # [batch_size, 256, 16, 16]
+
+            if self.neck_acdr is not None:
+                features_pa = self.neck_acdr(features_pa)
 
             # Phase 1: MSAALite post-PA-FPN attention refinement
             if self.msaa_lite is not None:
@@ -1107,6 +1443,12 @@ class DSGCnet(nn.Module):
                     samples, target_size=features_pa.shape[-2:]
                 )
                 features_pa = features_pa + self.dino_gate.tanh() * dino_feat
+
+            if self.depth_cross_attn is not None and depth_map is not None:
+                features_pa = self.depth_cross_attn(features_pa, depth_map)
+
+            if self.geo_attn_post is not None and depth_map is not None:
+                features_pa = self.geo_attn_post(features_pa, depth_map)
 
             density = self.density_pred(features_pa)
 
@@ -1218,7 +1560,10 @@ class DSGCnet(nn.Module):
                 assert self.density_gcn is not None
                 assert self.feature_gcn is not None
                 density_gcn_feature = self.density_gcn(
-                    density, features_pa, uncertainty=uncertainty
+                    density,
+                    features_pa,
+                    uncertainty=uncertainty,
+                    depth_map=depth_map,
                 )
                 feature_gcn_feature = self.feature_gcn(features_pa)
                 if self.msaa_gate is not None:

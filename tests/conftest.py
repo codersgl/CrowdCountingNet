@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import torch
-from unittest.mock import MagicMock
 from omegaconf import OmegaConf
 
 
@@ -61,15 +59,19 @@ def base_cfg():
                 "set_cost_class": 1.0,
                 "set_cost_point": 0.05,
                 "point_loss_coef": 0.0002,
+                "point_loss_type": "smooth_l1",
+                "point_smooth_l1_beta": 1.0,
                 "eos_coef": 0.5,
                 "use_depth": False,
                 "depth": {
                     "encoder": "vitb",
                     "weight_path": "checkpoints/depth_anything_v2_vitb.pth",
+                    "mix_init": 1.5,
                     "embed_dim": 128,
                     "num_isf_layers": 1,
                 },
                 "use_depth_geo": False,
+                "use_depth_geo_post": False,
                 "depth_geo": {
                     "num_heads": 8,
                     "initial_value": 2.0,
@@ -83,7 +85,24 @@ def base_cfg():
                 },
                 "use_depth_attn": False,
                 "depth_attn": {
+                    "version": "v1",
                     "mid_ratio": 4,
+                    "gate_init": 0.0,
+                    "use_tanh_gate": True,
+                    "spatial_gate": True,
+                    "channel_gate": True,
+                    "normalize_depth": True,
+                    "require_depth": True,
+                },
+                "use_depth_cross_attn": False,
+                "depth_cross_attn": {
+                    "embed_dim": 128,
+                    "num_heads": 4,
+                    "window_size": 8,
+                    "dropout": 0.0,
+                    "gate_init": 0.0,
+                    "depth_mid_channels": 64,
+                    "mode": "window",
                 },
                 "use_refine": False,
                 "refine": {

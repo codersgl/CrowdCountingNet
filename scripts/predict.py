@@ -51,6 +51,8 @@ def main(cfg: DictConfig) -> None:
         _mcfg.get("use_depth", False)
         or _mcfg.get("use_depth_geo", False)
         or _mcfg.get("use_depth_dual_vgg", False)
+        or _mcfg.get("use_depth_attn", False)
+        or _mcfg.get("depth_graph_prior", {}).get("enabled", False)
     )
     depth_dir = predict_cfg.get("predict", {}).get("depth_dir", None)
 

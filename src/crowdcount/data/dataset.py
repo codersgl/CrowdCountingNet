@@ -62,7 +62,9 @@ class SHHA(Dataset):
         # Parse density generation config
         if density_gen_cfg is None:
             density_gen_cfg = {}
+        self.density_mode = str(density_gen_cfg.get("mode", "auto"))
         self.perspective_guided = bool(density_gen_cfg.get("perspective_guided", False))
+        self.fixed_sigma = float(density_gen_cfg.get("fixed_sigma", 8.0))
         self.persp_beta = float(density_gen_cfg.get("beta", 0.3))
         self.persp_min_sigma = float(density_gen_cfg.get("min_sigma", 1.0))
         self.persp_sigma_base = float(density_gen_cfg.get("sigma_base", 1.0))
@@ -176,8 +178,10 @@ class SHHA(Dataset):
             cache_dir = _resolve_density_cache_dir(
                 self.root_path,
                 "train",
+                mode=self.density_mode,
                 perspective_guided=self.perspective_guided,
                 hybrid=self.hybrid,
+                fixed_sigma=self.fixed_sigma,
                 beta=self.persp_beta,
                 min_sigma=self.persp_min_sigma,
                 sigma_base=self.persp_sigma_base,
@@ -198,8 +202,10 @@ class SHHA(Dataset):
                 generate_density_maps(
                     data_root,
                     split="train",
+                    mode=self.density_mode,
                     perspective_guided=self.perspective_guided,
                     hybrid=self.hybrid,
+                    fixed_sigma=self.fixed_sigma,
                     beta=self.persp_beta,
                     min_sigma=self.persp_min_sigma,
                     hybrid_min_sigma=self.hybrid_min_sigma,

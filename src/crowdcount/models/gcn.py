@@ -12,6 +12,14 @@ from torch_geometric.nn import GATv2Conv, GCNConv, MessagePassing
 from torch_geometric.utils import add_self_loops
 
 
+def _cfg_get(cfg: object | None, key: str, default: object) -> object:
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
 def compute_uncertainty(density: torch.Tensor) -> torch.Tensor:
     """Compute pixel-wise uncertainty from a density prediction.
 
@@ -140,6 +148,135 @@ class SpatialPriorDensityGraphBuilder:
         # builder), so downstream GCN sees the same edge-weight semantics.
         edge_d = torch.gather(d_dist, 2, sorted_indices)  # [B, N, k]
         edge_attr = torch.exp(-edge_d).reshape(-1, 1)  # [B*N*k, 1]
+
+        src_nodes = (
+            torch.arange(num_nodes, device=device)
+            .view(1, num_nodes, 1)
+            .expand(B, num_nodes, self.k)
+        )
+        tgt_nodes = sorted_indices
+
+        batch_offset = torch.arange(B, device=device).view(B, 1, 1) * num_nodes
+        src_nodes = (src_nodes + batch_offset).reshape(-1)
+        tgt_nodes = (tgt_nodes + batch_offset).reshape(-1)
+        edge_index = torch.stack([src_nodes, tgt_nodes], dim=0)
+
+        num_nodes_total = B * num_nodes
+        edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes_total)
+        self_loop_attr = torch.ones(num_nodes_total, 1, device=device)
+        edge_attr = torch.cat([edge_attr, self_loop_attr], dim=0)
+        return edge_index, edge_attr, num_nodes_total, H, W
+
+
+class DepthAwareDensityGraphBuilder:
+    """Density graph builder with depth-consistent candidate selection.
+
+    This is designed for the current best GATv2 path: it changes the
+    candidate ``edge_index`` while leaving the GATv2 layer untouched.  The
+    returned ``edge_attr`` keeps the legacy density-similarity semantics for
+    compatibility with non-GAT paths.
+    """
+
+    def __init__(
+        self,
+        k: int = 4,
+        density_weight: float = 1.0,
+        spatial_weight: float = 1.0,
+        depth_weight: float = 0.5,
+        depth_mode: str = "raw",
+        fallback_to_spatial: bool = True,
+        eps: float = 1e-6,
+    ) -> None:
+        self.k = k
+        self.density_weight = density_weight
+        self.spatial_weight = spatial_weight
+        self.depth_weight = depth_weight
+        self.depth_mode = depth_mode
+        self.fallback_to_spatial = fallback_to_spatial
+        self.eps = eps
+
+    def _prepare_depth(
+        self,
+        depth_map: torch.Tensor,
+        size: tuple[int, int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if depth_map.dim() == 3:
+            depth_map = depth_map.unsqueeze(1)
+        if depth_map.dim() != 4 or depth_map.shape[1] != 1:
+            raise ValueError(
+                "depth_map must have shape [B, 1, H, W] or [B, H, W], "
+                f"got {tuple(depth_map.shape)}"
+            )
+        depth = depth_map.detach().to(device=device, dtype=dtype)
+        depth = torch.nan_to_num(depth, nan=0.0, posinf=1.0, neginf=0.0)
+        if depth.shape[-2:] != size:
+            depth = F.interpolate(
+                depth, size=size, mode="bilinear", align_corners=False
+            )
+        if self.depth_mode in {"inverse", "normalized_inverse", "perspective"}:
+            depth = 1.0 / depth.clamp_min(self.eps)
+        if self.depth_mode in {"normalized", "normalized_inverse", "perspective"}:
+            flat = depth.view(depth.shape[0], -1)
+            d_min = flat.min(dim=1, keepdim=True).values.view(-1, 1, 1, 1)
+            d_max = flat.max(dim=1, keepdim=True).values.view(-1, 1, 1, 1)
+            depth = (depth - d_min) / (d_max - d_min + self.eps)
+        return depth
+
+    def build_batch_graph(
+        self,
+        density_maps: torch.Tensor,
+        depth_map: torch.Tensor | None = None,
+    ):
+        B, _C, H, W = density_maps.shape
+        num_nodes = H * W
+        device = density_maps.device
+        dtype = density_maps.dtype
+        flat_density = density_maps.view(B, -1)
+
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device=device, dtype=dtype),
+            torch.arange(W, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        coords = torch.stack([xs.reshape(-1), ys.reshape(-1)], dim=-1)
+        p_dist = torch.cdist(coords, coords, p=2.0)
+        sigma_p = max(0.38 * float((H * H + W * W) ** 0.5), self.eps)
+
+        density_dist = (
+            flat_density.unsqueeze(2) - flat_density.unsqueeze(1)
+        ).abs()
+        density_scale = (
+            density_dist.reshape(B, -1).mean(dim=1).view(B, 1, 1).clamp_min(self.eps)
+        )
+
+        cost = self.density_weight * density_dist / density_scale
+        if self.spatial_weight != 0.0:
+            cost = cost + self.spatial_weight * (p_dist.unsqueeze(0) / sigma_p)
+
+        if depth_map is not None and self.depth_weight != 0.0:
+            depth = self._prepare_depth(depth_map, (H, W), device, dtype)
+            flat_depth = depth.view(B, -1)
+            depth_dist = (
+                flat_depth.unsqueeze(2) - flat_depth.unsqueeze(1)
+            ).abs()
+            depth_scale = (
+                depth_dist.reshape(B, -1)
+                .mean(dim=1)
+                .view(B, 1, 1)
+                .clamp_min(self.eps)
+            )
+            cost = cost + self.depth_weight * depth_dist / depth_scale
+        elif depth_map is None and not self.fallback_to_spatial:
+            raise ValueError("depth_map is required when fallback_to_spatial=False")
+
+        sorted_indices = torch.topk(cost, k=self.k + 1, dim=2, largest=False).indices[
+            :, :, 1 : self.k + 1
+        ]
+
+        edge_d = torch.gather(density_dist, 2, sorted_indices)
+        edge_attr = torch.exp(-edge_d).reshape(-1, 1)
 
         src_nodes = (
             torch.arange(num_nodes, device=device)
@@ -596,11 +733,13 @@ class DensityGCNProcessor(nn.Module):
         spatial_prior: bool = False,
         spatial_alpha: float = 1.0,
         spatial_beta: float = 1.0,
+        depth_prior_cfg: object | None = None,
     ):
         super().__init__()
         self._use_uncertainty = use_uncertainty
         self._anisotropic = anisotropic
         self._conv_type = conv_type
+        self._use_depth_prior = bool(_cfg_get(depth_prior_cfg, "enabled", False))
         if use_uncertainty and adaptive:
             self.graph_builder = UncertaintyAdaptiveDensityGraphBuilder(
                 k_base=k,
@@ -612,6 +751,17 @@ class DensityGCNProcessor(nn.Module):
         elif adaptive:
             self.graph_builder = AdaptiveDensityGraphBuilder(
                 k_base=k, k_min=k_min, k_max=k_max, density_scale=density_scale
+            )
+        elif self._use_depth_prior:
+            self.graph_builder = DepthAwareDensityGraphBuilder(
+                k=k,
+                density_weight=float(_cfg_get(depth_prior_cfg, "density_weight", 1.0)),
+                spatial_weight=float(_cfg_get(depth_prior_cfg, "spatial_weight", 1.0)),
+                depth_weight=float(_cfg_get(depth_prior_cfg, "depth_weight", 0.5)),
+                depth_mode=str(_cfg_get(depth_prior_cfg, "depth_mode", "raw")),
+                fallback_to_spatial=bool(
+                    _cfg_get(depth_prior_cfg, "fallback_when_no_depth", True)
+                ),
             )
         elif spatial_prior:
             self.graph_builder = SpatialPriorDensityGraphBuilder(
@@ -631,6 +781,7 @@ class DensityGCNProcessor(nn.Module):
         density_maps: torch.Tensor,
         feature_maps: torch.Tensor,
         uncertainty: torch.Tensor | None = None,
+        depth_map: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, in_channels, H, W = feature_maps.shape
         if self._use_uncertainty and isinstance(
@@ -638,6 +789,12 @@ class DensityGCNProcessor(nn.Module):
         ):
             edge_index, edge_attr, _, H, W = self.graph_builder.build_batch_graph(
                 density_maps, uncertainty=uncertainty
+            )
+        elif self._use_depth_prior and isinstance(
+            self.graph_builder, DepthAwareDensityGraphBuilder
+        ):
+            edge_index, edge_attr, _, H, W = self.graph_builder.build_batch_graph(
+                density_maps, depth_map=depth_map
             )
         else:
             edge_index, edge_attr, _, H, W = self.graph_builder.build_batch_graph(

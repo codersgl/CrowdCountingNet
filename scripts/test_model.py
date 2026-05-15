@@ -200,7 +200,7 @@ def _needs_depth(cfg: DictConfig) -> bool:
             "use_depth_dual_vgg",
             "use_depth_attn",
         )
-    )
+    ) or bool(getattr(getattr(model_cfg, "depth_graph_prior", None), "enabled", False))
 
 
 def _seed_everything(seed: int) -> None:

@@ -12,6 +12,11 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from crowdcount.models.dsgcnet import DSGCnet
+from crowdcount.models.head import (
+    DecoupledPredictionHead,
+    DeepRegressionModel,
+    RegressionModel,
+)
 from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
@@ -828,6 +833,9 @@ def test_decoupled_head_forward() -> None:
     backbone = TinyVGGBackbone()
     model = DSGCnet(backbone, row=2, line=2, use_decoupled_head=True).eval()
     assert model.use_decoupled_head
+    assert isinstance(model.pred_trunk, DecoupledPredictionHead)
+    assert isinstance(model.regression, RegressionModel)
+    assert not isinstance(model.regression, DeepRegressionModel)
     with torch.no_grad():
         out = model(torch.zeros(2, 3, 128, 128))
     assert out["pred_logits"].shape[0] == 2

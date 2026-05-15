@@ -110,6 +110,77 @@ def test_dsgcnet_depth_geo_no_depth_input(sample_batch):
     assert out["pred_logits"].shape[0] == sample_batch.shape[0]
 
 
+def test_dsgcnet_use_depth_geo_post_forward(sample_batch, depth_sample):
+    backbone = TinyVGGBackbone()
+    depth_geo_cfg = OmegaConf.create(
+        {"num_heads": 8, "initial_value": 2.0, "heads_range": 4.0}
+    )
+    model = DSGCnet(
+        backbone,
+        use_depth_geo_post=True,
+        depth_geo_cfg=depth_geo_cfg,
+    )
+    model.eval()
+
+    with torch.no_grad():
+        out = model(sample_batch, depth_map=depth_sample)
+
+    assert model.geo_attn_post is not None
+    assert out["pred_logits"].shape[0] == sample_batch.shape[0]
+    assert out["pred_points"].shape[0] == sample_batch.shape[0]
+    assert out["density_out"].shape[0] == sample_batch.shape[0]
+
+
+def test_dsgcnet_depth_geo_post_gate_zero_init():
+    backbone = TinyVGGBackbone()
+    depth_geo_cfg = OmegaConf.create(
+        {"num_heads": 8, "initial_value": 2.0, "heads_range": 4.0}
+    )
+    model = DSGCnet(
+        backbone,
+        use_depth_geo_post=True,
+        depth_geo_cfg=depth_geo_cfg,
+    )
+
+    assert model.geo_attn_post is not None
+    assert model.geo_attn_post.gate.item() == 0.0
+
+
+def test_dsgcnet_depth_geo_post_no_depth_input(sample_batch):
+    backbone = TinyVGGBackbone()
+    depth_geo_cfg = OmegaConf.create(
+        {"num_heads": 8, "initial_value": 2.0, "heads_range": 4.0}
+    )
+    model = DSGCnet(
+        backbone,
+        use_depth_geo_post=True,
+        depth_geo_cfg=depth_geo_cfg,
+    )
+    model.eval()
+
+    with torch.no_grad():
+        out = model(sample_batch, depth_map=None)
+
+    assert out["pred_logits"].shape[0] == sample_batch.shape[0]
+
+
+def test_dsgcnet_depth_geo_post_mutually_exclusive():
+    backbone = TinyVGGBackbone()
+
+    with pytest.raises(ValueError, match="At most one depth fusion path"):
+        DSGCnet(backbone, use_depth_geo=True, use_depth_geo_post=True)
+
+    with pytest.raises(ValueError, match="At most one depth fusion path"):
+        DSGCnet(backbone, use_depth_cross_attn=True, use_depth_geo_post=True)
+
+
+def test_dsgcnet_depth_geo_post_rejects_msca_decoder():
+    backbone = TinyVGGBackbone()
+
+    with pytest.raises(ValueError, match="use_depth_geo_post is not supported"):
+        DSGCnet(backbone, use_depth_geo_post=True, use_msca_decoder=True)
+
+
 # ---------------------------------------------------------------------------
 # Depth normalisation semantics — geo_prior must NOT re-normalise
 # ---------------------------------------------------------------------------

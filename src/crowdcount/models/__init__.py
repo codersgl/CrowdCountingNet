@@ -39,11 +39,14 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_depth=getattr(cfg.model, "use_depth", False),
         depth_cfg=getattr(cfg.model, "depth", None),
         use_depth_geo=getattr(cfg.model, "use_depth_geo", False),
+        use_depth_geo_post=getattr(cfg.model, "use_depth_geo_post", False),
         depth_geo_cfg=getattr(cfg.model, "depth_geo", None),
         use_depth_dual_vgg=getattr(cfg.model, "use_depth_dual_vgg", False),
         depth_dual_vgg_cfg=getattr(cfg.model, "depth_dual_vgg", None),
         use_depth_attn=getattr(cfg.model, "use_depth_attn", False),
         depth_attn_cfg=getattr(cfg.model, "depth_attn", None),
+        use_depth_cross_attn=getattr(cfg.model, "use_depth_cross_attn", False),
+        depth_cross_attn_cfg=getattr(cfg.model, "depth_cross_attn", None),
         gcn_adaptive=getattr(cfg.model, "gcn_adaptive", False),
         gcn_k=getattr(cfg.model, "gcn_k", 4),
         gcn_k_min=getattr(cfg.model, "gcn_k_min", 2),
@@ -90,6 +93,9 @@ def build_model(cfg: DictConfig, training: bool = False):
         rccformer_deab_blocks=int(getattr(cfg.model, "rccformer_deab_blocks", 2)),
         use_dap_neck=getattr(cfg.model, "use_dap_neck", False),
         dap_neck_cfg=getattr(cfg.model, "dap_neck", None),
+        use_bifpn_neck=getattr(cfg.model, "use_bifpn_neck", False),
+        bifpn_neck_cfg=getattr(cfg.model, "bifpn_neck", None),
+        neck_acdr_cfg=getattr(cfg.model, "neck_acdr", None),
         use_deep_head=getattr(cfg.model, "use_deep_head", False),
         use_density_adaptive_fusion=getattr(
             cfg.model, "use_density_adaptive_fusion", False
@@ -140,6 +146,10 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_qfl=use_qfl,
         qfl_beta=qfl_beta,
         qfl_sigma=qfl_sigma,
+        point_loss_type=str(getattr(cfg.model, "point_loss_type", "smooth_l1")),
+        point_smooth_l1_beta=float(
+            getattr(cfg.model, "point_smooth_l1_beta", 1.0)
+        ),
     )
 
     # Uncertainty weighting (Kendall et al. 2018)

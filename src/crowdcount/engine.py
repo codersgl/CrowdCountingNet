@@ -139,6 +139,11 @@ def train_one_epoch(
         if cfg is not None
         else False
     )
+    use_depth_geo_post = bool(
+        getattr(getattr(cfg, "model", None), "use_depth_geo_post", False)
+        if cfg is not None
+        else False
+    )
     use_depth_dual_vgg = bool(
         getattr(getattr(cfg, "model", None), "use_depth_dual_vgg", False)
         if cfg is not None
@@ -149,8 +154,29 @@ def train_one_epoch(
         if cfg is not None
         else False
     )
+    use_depth_cross_attn = bool(
+        getattr(getattr(cfg, "model", None), "use_depth_cross_attn", False)
+        if cfg is not None
+        else False
+    )
+    depth_graph_prior = (
+        getattr(getattr(cfg, "model", None), "depth_graph_prior", None)
+        if cfg is not None
+        else None
+    )
+    use_depth_graph_prior = bool(
+        getattr(depth_graph_prior, "enabled", False)
+        if depth_graph_prior is not None
+        else False
+    )
     use_depth = (
-        use_depth or use_depth_geo or use_depth_dual_vgg or use_depth_attn
+        use_depth
+        or use_depth_geo
+        or use_depth_geo_post
+        or use_depth_dual_vgg
+        or use_depth_attn
+        or use_depth_cross_attn
+        or use_depth_graph_prior
     )  # any flag requires depth data in batch
 
     for batch in data_loader:

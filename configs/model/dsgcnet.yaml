@@ -5,6 +5,8 @@ line: 2
 set_cost_class: 1.0
 set_cost_point: 0.05
 point_loss_coef: 0.0002
+point_loss_type: smooth_l1 # smooth_l1 | mse; mse aligns with the original DSGC-Net/P2PNet code path
+point_smooth_l1_beta: 1.0 # Only used when point_loss_type=smooth_l1
 eos_coef: 0.5
 count_loss_coef: 0.0 # Global counting L1 loss weight; set >0 to enable (recommended: 0.001~0.01)
 consistency_loss_coef: 0.0 # Density-point consistency loss weight; set >0 to enable (recommended: 0.001~0.01)
@@ -59,6 +61,26 @@ gcn_sim_threshold: 0.5 # adaptive FeatureGCN: cosine similarity threshold
 gcn_spatial_prior: false
 gcn_spatial_alpha: 1.0
 gcn_spatial_beta: 1.0
+
+# Depth-aware candidate graph for GATv2 / DensityGCN (disabled by default).
+# This keeps the GATv2 message passing layer unchanged and only changes the
+# candidate edge_index used by DensityGCN. Cost = wd*|Δdensity|/scale_d +
+# wp*||Δpos||/scale_p + wz*|Δdepth|/scale_z.
+depth_graph_prior:
+  enabled: false
+  apply_to: density # density only in v1; reserved: both
+  density_weight: 1.0
+  spatial_weight: 1.0
+  depth_weight: 0.5
+  depth_mode: raw # raw | normalized | inverse | normalized_inverse | perspective
+  fallback_when_no_depth: true
+  confidence:
+    enabled: false # reserved for v2
+    mode: gradient
+  debug:
+    enabled: false
+  visualize:
+    enabled: false
 
 # Uncertainty-Guided Adaptive GCN (disabled by default)
 # Computes pixel-wise uncertainty from the density head and uses it to:
@@ -172,13 +194,14 @@ sa_dgat:
 use_dino_inject: false
 dino_inject_variant: dinov2_b
 
-# Depth map dual-stream fusion (disabled by default)
+# Depth map shared-backbone Mix fusion (disabled by default)
 use_depth: false
 depth:
   encoder: vitl # vits | vitb | vitl
   weight_path: checkpoints/depth_anything_v2_vitl.pth
-  embed_dim: 128 # internal dim for DepthFusionModule
-  num_isf_layers: 1 # stacked ISFLayer+MFF pairs per scale
+  mix_init: 1.5 # sigmoid(mix_init) is the initial RGB weight for c3/c4/c5 Mix fusion
+  embed_dim: 128 # legacy ISFM setting; not used by shared-backbone Mix fusion
+  num_isf_layers: 1 # legacy ISFM setting; not used by shared-backbone Mix fusion
 
 use_depth_geo: false
 depth_geo:
@@ -186,9 +209,14 @@ depth_geo:
   initial_value: 2.0
   heads_range: 4.0
 
+# Post-neck DFormerv2-style geometry self-attention (disabled by default).
+# Reuses depth_geo.* and applies a single 256-channel GSA block after PA/DAP neck,
+# before density prediction and GCN. Mutually exclusive with all other depth paths.
+use_depth_geo_post: false
+
 # Dual-VGG RGBD fusion (disabled by default)
 # Uses a second VGG backbone (1-channel input) for depth feature extraction.
-# Mutually exclusive with use_depth and use_depth_geo.
+# Mutually exclusive with use_depth, use_depth_geo, and use_depth_geo_post.
 use_depth_dual_vgg: false
 depth_dual_vgg:
   variant: vgg16_bn # vgg16_bn | vgg16 (must match RGB backbone for fair comparison)
@@ -198,10 +226,31 @@ depth_dual_vgg:
 # Depth Residual Gating (disabled by default)
 # Lightweight depth-conditioned residual modulation: feat_out = feat + gate * f(depth)
 # gate is initialised to 0 so the module is identity at training start.
-# Mutually exclusive with use_depth, use_depth_geo, use_depth_dual_vgg.
+# Mutually exclusive with use_depth, use_depth_geo, use_depth_geo_post, use_depth_dual_vgg.
 use_depth_attn: false
 depth_attn:
+  version: v1 # v1 | v2; v1 preserves legacy scalar residual gating
   mid_ratio: 4 # channel reduction: mid = max(feat_channels // mid_ratio, 32)
+  gate_init: 0.0 # v2 global residual gate; tanh(gate_init)=0 keeps identity
+  use_tanh_gate: true # v2 bounds the global residual gate for stability
+  spatial_gate: true # v2: learn where depth should contribute
+  channel_gate: true # v2: learn which feature channels should use depth
+  normalize_depth: true # v2: per-sample normalisation after resizing depth
+  require_depth: true # v2: fail fast if depth_map is missing during forward
+
+# Depth Cross-Attention fusion (disabled by default)
+# Post-neck fusion: Query=RGB PA-FPN feature, Key/Value=depth feature.
+# Uses residual gating initialised to identity for stable training.
+# Mutually exclusive with use_depth, use_depth_geo, use_depth_geo_post, use_depth_dual_vgg, use_depth_attn.
+use_depth_cross_attn: false
+depth_cross_attn:
+  embed_dim: 128
+  num_heads: 4
+  window_size: 8
+  dropout: 0.0
+  gate_init: 0.0
+  depth_mid_channels: 64
+  mode: window # window | global
 
 # SEMC post-GCN enhancer (disabled by default; enable via CLI or override)
 use_semc_enhancer: false
@@ -290,16 +339,36 @@ msca_num_blocks: 2 # number of stacked MSCA blocks (×N)
 # Mutually exclusive with use_msca_decoder.
 use_msca_neck: false
 
-# DAP-Neck v2: SPD-PAFPN + ACDR (disabled by default)
-# Uses proven SPD-PAFPN backbone with density-adaptive routing.
-# Mutually exclusive with use_msca_decoder, use_msca_neck, use_rccformer_neck.
+# DAP-Neck v2 preset (disabled by default)
+# Uses proven SPD-PAFPN backbone; ACDR is now wired through neck_acdr below.
+# Mutually exclusive with use_msca_decoder, use_msca_neck, use_rccformer_neck, use_bifpn_neck.
 use_dap_neck: false
 dap_neck:
   use_peem: false # Enable PEEM on C3 (frequency-domain edge enhancement)
   freq_cutoff: 0.25 # PEEM low-pass Gaussian cutoff ratio (0, 1]
   use_dcn: false # Use deformable conv in PEEM and FPN 3×3 convs
-  acdr_large_kernel: 7 # ACDR context path kernel size
-  acdr_dilation: 2 # ACDR context path dilation rate
+  acdr_large_kernel: 7 # Legacy fallback for neck_acdr when enabled: auto + use_dap_neck
+  acdr_dilation: 2 # Legacy fallback for neck_acdr when enabled: auto + use_dap_neck
+
+# Post-neck ACDR: density-adaptive dual-path routing after the selected neck.
+# enabled: auto preserves legacy DAP behavior (on when use_dap_neck=true, off otherwise).
+# Set true for e.g. SPD-BiFPN + ACDR, or false for pure DAP fusion without ACDR.
+neck_acdr:
+  enabled: auto # auto | true | false
+  large_kernel: 7 # Context path kernel size
+  dilation: 2 # Context path dilation rate
+  hidden_ratio: 4 # Crowdedness estimator hidden-dim ratio
+  gate_init: 0.0 # Residual gate init; 0 keeps identity behavior at startup
+
+# SPD-BiFPN neck (disabled by default)
+# Replaces PA-FPN with fast normalized weighted bidirectional fusion.
+# Keeps output at 256 channels and stride 8 for the existing density/GCN/point heads.
+use_bifpn_neck: false
+bifpn_neck:
+  num_blocks: 1 # Start with one block to avoid over-smoothing point features
+  use_spd_downsample: true # Detail-preserving C3/P4 downsampling instead of pooling
+  use_depthwise_refine: true # EfficientDet-style separable 3×3 node refinement
+  eps: 0.0001 # Denominator epsilon for normalized fusion weights
 
 # Density-Adaptive Fusion (disabled by default)
 # Replaces static alpha / GateMechanism with density-conditioned per-pixel fusion.

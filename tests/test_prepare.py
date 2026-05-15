@@ -13,6 +13,7 @@ import pytest
 from crowdcount.data.prepare import (
     _depth_to_perspective,
     _resolve_density_cache_dir,
+    fixed_gaussian_filter_density,
     gaussian_filter_density,
     perspective_gaussian_filter_density,
 )
@@ -115,6 +116,45 @@ def test_density_map_four_plus_unchanged_behaviour() -> None:
     # Rough sanity: density integral should be close to the number of
     # in-bounds points (each Gaussian integrates to ~1).
     assert pytest.approx(density.sum(), rel=0.3) == float(len(points))
+
+
+# ---------------------------------------------------------------------------
+# Fixed-sigma density maps
+# ---------------------------------------------------------------------------
+
+
+def test_fixed_density_map_integral_and_peak() -> None:
+    H, W = 128, 128
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    points = np.array([[32.0, 32.0], [96.0, 96.0]], dtype=np.float32)
+
+    density = fixed_gaussian_filter_density(img, points, sigma=4.0)
+
+    assert density.shape == (H, W)
+    assert density.dtype == np.float32
+    assert pytest.approx(density.sum(), rel=0.05) == 2.0
+    assert density.max() > 0
+
+
+def test_fixed_density_sigma_controls_peak_height() -> None:
+    H, W = 128, 128
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    points = np.array([[64.0, 64.0]], dtype=np.float32)
+
+    narrow = fixed_gaussian_filter_density(img, points, sigma=2.0)
+    wide = fixed_gaussian_filter_density(img, points, sigma=8.0)
+
+    assert pytest.approx(narrow.sum(), rel=0.05) == 1.0
+    assert pytest.approx(wide.sum(), rel=0.05) == 1.0
+    assert narrow.max() > wide.max()
+
+
+def test_fixed_density_rejects_non_positive_sigma() -> None:
+    img = np.zeros((64, 64, 3), dtype=np.uint8)
+    points = np.array([[32.0, 32.0]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="sigma must be positive"):
+        fixed_gaussian_filter_density(img, points, sigma=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +422,14 @@ def test_cache_dir_hybrid_alpha_change_invalidates_cache(tmp_path) -> None:
     b = _resolve_density_cache_dir(tmp_path, "train", hybrid=True, hybrid_alpha=0.7)
     assert a != b
     assert "hybrid" in a.parent.name
+
+
+def test_cache_dir_fixed_sigma_change_invalidates_cache(tmp_path) -> None:
+    a = _resolve_density_cache_dir(tmp_path, "train", mode="fixed", fixed_sigma=4.0)
+    b = _resolve_density_cache_dir(tmp_path, "train", mode="fixed", fixed_sigma=8.0)
+    assert a != b
+    assert "fixed" in a.parent.name
+    assert "s4p00" in a.parent.name
 
 
 # ---------------------------------------------------------------------------

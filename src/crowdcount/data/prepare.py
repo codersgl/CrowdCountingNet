@@ -189,6 +189,39 @@ def gaussian_filter_density(img: np.ndarray, points: np.ndarray) -> np.ndarray:
     return density
 
 
+def fixed_gaussian_filter_density(
+    img: np.ndarray, points: np.ndarray, sigma: float
+) -> np.ndarray:
+    """Generate a density map with the same Gaussian sigma for every point.
+
+    This is useful for low-density, fixed-camera datasets such as ShanghaiTech
+    Part B where geometry-adaptive k-NN sigmas can become overly broad and
+    flatten sparse targets.
+    """
+    if sigma <= 0:
+        raise ValueError(f"sigma must be positive, got {sigma}")
+
+    img_shape = [img.shape[0], img.shape[1]]
+    density = np.zeros(img_shape, dtype=np.float32)
+    if len(points) == 0:
+        return density
+
+    rounded = np.round(points).astype(np.int64)
+    in_bounds = (
+        (rounded[:, 0] >= 0)
+        & (rounded[:, 0] < img_shape[1])
+        & (rounded[:, 1] >= 0)
+        & (rounded[:, 1] < img_shape[0])
+    )
+    rounded = rounded[in_bounds]
+    if len(rounded) == 0:
+        return density
+
+    for x, y in rounded:
+        _render_point_gaussian(density, int(y), int(x), float(sigma))
+    return density
+
+
 def perspective_gaussian_filter_density(
     img: np.ndarray,
     points: np.ndarray,
@@ -524,12 +557,47 @@ def _format_param_tag(value: float | None) -> str:
     return f"{value:.2f}".replace(".", "p")
 
 
+def _normalise_density_mode(
+    mode: str | None,
+    *,
+    perspective_guided: bool,
+    hybrid: bool,
+) -> str:
+    if mode is None or str(mode).lower() in ("", "auto"):
+        if hybrid:
+            return "hybrid"
+        if perspective_guided:
+            return "perspective_guided"
+        return "geometry_adaptive"
+
+    aliases = {
+        "geo": "geometry_adaptive",
+        "geometry": "geometry_adaptive",
+        "geometry_adaptive": "geometry_adaptive",
+        "fixed": "fixed",
+        "fixed_sigma": "fixed",
+        "persp": "perspective_guided",
+        "perspective": "perspective_guided",
+        "perspective_guided": "perspective_guided",
+        "hybrid": "hybrid",
+    }
+    key = str(mode).lower()
+    if key not in aliases:
+        valid = ", ".join(sorted(set(aliases.values()) | {"auto"}))
+        raise ValueError(
+            f"Unsupported density_generation.mode={mode!r}; expected one of: {valid}"
+        )
+    return aliases[key]
+
+
 def _density_cache_dir(
     data_root: Path,
     split: str,
     *,
+    mode: str | None,
     perspective_guided: bool,
     hybrid: bool,
+    fixed_sigma: float,
     beta: float,
     min_sigma: float,
     sigma_base: float,
@@ -548,7 +616,17 @@ def _density_cache_dir(
     Returns:
         (out_dir, mode_label, meta_dict)
     """
-    if hybrid:
+    density_mode = _normalise_density_mode(
+        mode, perspective_guided=perspective_guided, hybrid=hybrid
+    )
+    if density_mode == "fixed":
+        if fixed_sigma <= 0:
+            raise ValueError(f"fixed_sigma must be positive, got {fixed_sigma}")
+        tag = f"s{_format_param_tag(fixed_sigma)}"
+        out_dir = data_root / f"gt_density_maps_fixed_{tag}" / split
+        mode_label = "fixed-sigma"
+        meta = {"mode": "fixed", "sigma": fixed_sigma}
+    elif density_mode == "hybrid":
         tag = (
             f"a{_format_param_tag(hybrid_alpha)}"
             f"_sb{_format_param_tag(sigma_base)}"
@@ -564,7 +642,7 @@ def _density_cache_dir(
             "min_sigma": hybrid_min_sigma,
             "max_sigma": hybrid_max_sigma,
         }
-    elif perspective_guided:
+    elif density_mode == "perspective_guided":
         tag = (
             f"b{_format_param_tag(beta)}"
             f"_sb{_format_param_tag(sigma_base)}"
@@ -591,8 +669,10 @@ def _resolve_density_cache_dir(
     data_root: str | Path,
     split: str,
     *,
+    mode: str | None = None,
     perspective_guided: bool = False,
     hybrid: bool = False,
+    fixed_sigma: float = 8.0,
     beta: float = 0.3,
     min_sigma: float = 1.0,
     sigma_base: float = 1.0,
@@ -610,8 +690,10 @@ def _resolve_density_cache_dir(
     out_dir, _, _ = _density_cache_dir(
         Path(data_root),
         split,
+        mode=mode,
         perspective_guided=perspective_guided,
         hybrid=hybrid,
+        fixed_sigma=fixed_sigma,
         beta=beta,
         min_sigma=min_sigma,
         sigma_base=sigma_base,
@@ -626,8 +708,10 @@ def _resolve_density_cache_dir(
 def generate_density_maps(
     data_root: str | Path,
     split: str = "train",
+    mode: str | None = None,
     perspective_guided: bool = False,
     hybrid: bool = False,
+    fixed_sigma: float = 8.0,
     beta: float = 0.3,
     min_sigma: float = 1.0,
     hybrid_min_sigma: float = 1.5,
@@ -645,6 +729,7 @@ def generate_density_maps(
     Three generation modes (mutually exclusive; *hybrid* takes priority)::
 
         *geometry-adaptive* (default) — k-NN based sigma.
+        *fixed* — a fixed Gaussian sigma for every point.
         *perspective-guided* — ``sigma = clip(beta·sigma_base·persp, min, max)``.
         *hybrid* — ``sigma = clip(persp^(1-α) · geo_sigma^α, min, max)``.
 
@@ -655,8 +740,12 @@ def generate_density_maps(
     Args:
         data_root: Dataset root directory.
         split: Dataset split ('train' or 'test').
+        mode: Optional explicit mode: 'geometry_adaptive', 'fixed',
+            'perspective_guided', 'hybrid', or 'auto'. When omitted, legacy
+            boolean flags select the mode.
         perspective_guided: If True, use perspective-guided sigma.
         hybrid: If True, use geometry × perspective hybrid (takes priority).
+        fixed_sigma: Sigma used by fixed mode.
         beta: Sigma scaling factor (perspective_guided mode).
         min_sigma: Minimum sigma floor (perspective_guided mode).
         sigma_base: Pixel-scale anchor at median depth (perspective_guided).
@@ -670,9 +759,12 @@ def generate_density_maps(
     from tqdm import tqdm
 
     data_root = Path(data_root)
+    density_mode = _normalise_density_mode(
+        mode, perspective_guided=perspective_guided, hybrid=hybrid
+    )
 
     # Resolve perspective directory (needed for perspective_guided and hybrid)
-    _need_persp = perspective_guided or hybrid
+    _need_persp = density_mode in ("perspective_guided", "hybrid")
     persp_dir: Path | None = None
     if _need_persp:
         persp_dir = data_root / "gt_perspective" / split
@@ -683,8 +775,10 @@ def generate_density_maps(
     out_dir, mode_label, meta = _density_cache_dir(
         data_root,
         split,
+        mode=mode,
         perspective_guided=perspective_guided,
         hybrid=hybrid,
+        fixed_sigma=fixed_sigma,
         beta=beta,
         min_sigma=min_sigma,
         sigma_base=sigma_base,
@@ -720,7 +814,7 @@ def generate_density_maps(
 
         points = _load_points(gt_path)
 
-        if hybrid:
+        if density_mode == "hybrid":
             assert persp_dir is not None
             persp_path = persp_dir / f"{img_path.stem}.npy"
             if not persp_path.exists():
@@ -736,7 +830,7 @@ def generate_density_maps(
                 alpha=hybrid_alpha,
                 sigma_base=sigma_base,
             )
-        elif perspective_guided:
+        elif density_mode == "perspective_guided":
             assert persp_dir is not None
             persp_path = persp_dir / f"{img_path.stem}.npy"
             if not persp_path.exists():
@@ -752,6 +846,8 @@ def generate_density_maps(
                 sigma_base=sigma_base,
                 max_sigma=persp_max_sigma,
             )
+        elif density_mode == "fixed":
+            density = fixed_gaussian_filter_density(img, points, fixed_sigma)
         else:
             density = gaussian_filter_density(img, points)
 

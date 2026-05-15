@@ -131,6 +131,12 @@ class TestDAPNeck:
         out = neck([feat_c3, feat_c4, feat_c5])
         assert out.shape == (2, 256, 16, 16)
 
+    def test_output_shape_without_internal_acdr(self, feat_c3, feat_c4, feat_c5):
+        neck = DAPNeck(C3_size=256, C4_size=512, C5_size=512, use_acdr=False)
+        out = neck([feat_c3, feat_c4, feat_c5])
+        assert out.shape == (2, 256, 16, 16)
+        assert neck.acdr is None
+
     def test_handles_zero_input(self):
         neck = DAPNeck(C3_size=256, C4_size=512, C5_size=512)
         inputs = [
@@ -192,6 +198,7 @@ class TestDAPNeckIntegration:
 
         backbone = TinyVGGBackbone()
         model = DSGCnet(backbone, row=2, line=2, use_dap_neck=True)
+        assert model.neck_acdr is not None
         model.eval()
         x = torch.zeros(1, 3, 128, 128)
         with torch.no_grad():
@@ -201,6 +208,26 @@ class TestDAPNeckIntegration:
         assert "density_out" in out
         assert out["pred_logits"].shape[0] == 1
         assert out["pred_points"].shape[2] == 2
+
+    def test_dsgcnet_dap_neck_can_disable_post_acdr(self):
+        from omegaconf import OmegaConf
+        from crowdcount.models.dsgcnet import DSGCnet
+
+        backbone = TinyVGGBackbone()
+        cfg = OmegaConf.create({"enabled": False})
+        model = DSGCnet(
+            backbone,
+            row=2,
+            line=2,
+            use_dap_neck=True,
+            neck_acdr_cfg=cfg,
+        )
+        assert model.neck_acdr is None
+        model.eval()
+        x = torch.zeros(1, 3, 128, 128)
+        with torch.no_grad():
+            out = model(x)
+        assert out["density_out"].shape == (1, 1, 16, 16)
 
     def test_dsgcnet_dap_neck_mutual_exclusion(self):
         from crowdcount.models.dsgcnet import DSGCnet
@@ -226,6 +253,7 @@ class TestDAPNeckIntegration:
         model = DSGCnet(
             backbone, row=2, line=2, use_dap_neck=True, dap_neck_cfg=dap_cfg
         )
+        assert model.neck_acdr is not None
         model.eval()
         x = torch.zeros(1, 3, 128, 128)
         with torch.no_grad():

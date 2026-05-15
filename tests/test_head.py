@@ -211,6 +211,27 @@ def test_decoupled_head_end_to_end(feature_map):
     assert cls_out.shape == (B, H * W * 4, 2)
 
 
+def test_decoupled_regression_path_matches_paper_original_shape(feature_map):
+    """reg_trunk + RegressionModel matches the original independent head layout."""
+    head = DecoupledPredictionHead()
+    reg = RegressionModel(num_features_in=256, num_anchor_points=4)
+
+    assert isinstance(head.reg_trunk, SharedPredictionTrunk)
+    assert head.reg_trunk.conv1.kernel_size == (3, 3)
+    assert head.reg_trunk.conv2.kernel_size == (3, 3)
+    assert reg.output.kernel_size == (3, 3)
+
+    reg_trunk_ids = {id(p) for p in head.reg_trunk.parameters()}
+    cls_trunk_ids = {id(p) for p in head.cls_trunk.parameters()}
+    projection_ids = {id(p) for p in reg.parameters()}
+    assert reg_trunk_ids.isdisjoint(cls_trunk_ids)
+    assert reg_trunk_ids.isdisjoint(projection_ids)
+
+    out = reg(head.reg_trunk(feature_map))
+    B, H, W = feature_map.shape[0], feature_map.shape[2], feature_map.shape[3]
+    assert out.shape == (B, H * W * 4, 2)
+
+
 # ---------------------------------------------------------------------------
 # EnhancedDensityAttention
 # ---------------------------------------------------------------------------

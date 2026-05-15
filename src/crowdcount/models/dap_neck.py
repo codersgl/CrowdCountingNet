@@ -9,7 +9,7 @@ train (128×128 patches) → eval (full-resolution images) transition is seamles
 Modules:
 - PEEM: Phase-aware Edge Enhancement Module (optional, disabled by default)
 - ACDR: Adaptive Crowdedness Dynamic Router (density-adaptive dual-path routing)
-- DAPNeck: SPD-PAFPN + ACDR end-to-end neck
+- DAPNeck: SPD-PAFPN with optional ACDR end-to-end neck
 """
 
 from __future__ import annotations
@@ -196,7 +196,7 @@ class ACDR(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# DAPNeck: SPD-PAFPN + ACDR
+# DAPNeck: SPD-PAFPN + optional ACDR
 # ---------------------------------------------------------------------------
 
 
@@ -204,8 +204,8 @@ class DAPNeck(nn.Module):
     """Density-Aware Phase-guided Neck (v2).
 
     Uses the proven SPD-PAFPN architecture as the multi-scale fusion backbone,
-    with ACDR appended for density-adaptive feature routing.  Optional PEEM on
-    C3 for frequency-domain edge enhancement.
+    with optional ACDR appended for density-adaptive feature routing.  Optional
+    PEEM on C3 for frequency-domain edge enhancement.
 
     All operations are resolution-invariant: element-wise add for cross-scale
     fusion, nearest-neighbour upsampling, SPD for lossless downsampling.
@@ -216,7 +216,7 @@ class DAPNeck(nn.Module):
         3. Top-down FPN: P5 ↑ + P4 → P4;  P4 ↑ + P3 → P3
         4. Bottom-up PAN with SPD: P3 ↓ + P4 → P4;  P4 ↓ + P5 → P5
         5. All three scales to P4 resolution → concat → 1×1 fusion
-        6. ACDR: density-adaptive routing
+        6. Optional ACDR: density-adaptive routing
 
     Args:
         C3_size: Input channels for C3 (typically 256).
@@ -226,6 +226,8 @@ class DAPNeck(nn.Module):
         use_peem: Enable PEEM on C3 (disabled by default).
         freq_cutoff: PEEM low-pass Gaussian cutoff ratio.
         use_dcn: Use deformable conv in PEEM and FPN 3×3 convs.
+        use_acdr: Enable ACDR after fusion. Defaults to True for direct
+            backwards compatibility; DSGCnet wires ACDR as a post-neck module.
         acdr_large_kernel: Large kernel size for ACDR Path B.
         acdr_dilation: Dilation rate for ACDR Path B.
     """
@@ -239,6 +241,7 @@ class DAPNeck(nn.Module):
         use_peem: bool = False,
         freq_cutoff: float = 0.25,
         use_dcn: bool = False,
+        use_acdr: bool = True,
         acdr_large_kernel: int = 7,
         acdr_dilation: int = 2,
     ) -> None:
@@ -295,11 +298,15 @@ class DAPNeck(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # --- ACDR: density-adaptive routing ---
-        self.acdr = ACDR(
-            channels=feature_size,
-            large_kernel=acdr_large_kernel,
-            dilation=acdr_dilation,
+        # --- Optional ACDR: density-adaptive routing ---
+        self.acdr = (
+            ACDR(
+                channels=feature_size,
+                large_kernel=acdr_large_kernel,
+                dilation=acdr_dilation,
+            )
+            if use_acdr
+            else None
         )
 
     def forward(
@@ -360,8 +367,9 @@ class DAPNeck(nn.Module):
         fused = torch.cat([P3_down, P4_x, P5_x], dim=1)
         out = self.fusion(fused)
 
-        # 5. ACDR: density-adaptive routing
-        out = self.acdr(out)
+        # 5. Optional ACDR: density-adaptive routing
+        if self.acdr is not None:
+            out = self.acdr(out)
 
         if return_intermediates:
             return out, (P3_x, P4_x, P5_x_out)

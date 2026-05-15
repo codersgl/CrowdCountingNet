@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -375,6 +376,38 @@ def test_shha_augmentation_disabled_creates_no_transforms(fake_dataset_root):
     assert isinstance(img, torch.Tensor)
     assert isinstance(target, list)
     assert isinstance(density_images, torch.Tensor)
+
+
+def test_shha_fixed_density_generation_uses_param_cache(fake_dataset_root):
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+
+    ds = SHHA(
+        str(fake_dataset_root),
+        train=True,
+        transform=transform,
+        patch=False,
+        flip=False,
+        aug_cfg={"random_scale": {"enabled": False}},
+        density_gen_cfg={"mode": "fixed", "fixed_sigma": 6.0},
+    )
+
+    cache_dir = Path(ds.gt_dmap_root)
+    assert cache_dir == fake_dataset_root / "gt_density_maps_fixed_s6p00" / "train"
+    assert (cache_dir / "IMG_0000.npy").exists()
+    meta = json.loads((cache_dir / "meta.json").read_text())
+    assert meta["mode"] == "fixed"
+    assert meta["sigma"] == 6.0
+
+    img, target, density_images = ds[0]
+    assert isinstance(img, torch.Tensor)
+    assert isinstance(target, list)
+    assert isinstance(density_images, torch.Tensor)
+    assert float(density_images.sum()) > 0.0
 
 
 def test_ucf_qnrf_layout_and_annpoints(tmp_path):

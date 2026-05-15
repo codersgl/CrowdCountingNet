@@ -191,13 +191,23 @@ class Trainer:
         self.use_moe = bool(getattr(self.model, "supports_moe", lambda: False)())
         self.use_depth = bool(getattr(cfg.model, "use_depth", False))
         self.use_depth_geo = bool(getattr(cfg.model, "use_depth_geo", False))
+        self.use_depth_geo_post = bool(getattr(cfg.model, "use_depth_geo_post", False))
         self.use_depth_dual_vgg = bool(getattr(cfg.model, "use_depth_dual_vgg", False))
         self.use_depth_attn = bool(getattr(cfg.model, "use_depth_attn", False))
+        self.use_depth_cross_attn = bool(
+            getattr(cfg.model, "use_depth_cross_attn", False)
+        )
+        self.use_depth_graph_prior = bool(
+            getattr(getattr(cfg.model, "depth_graph_prior", None), "enabled", False)
+        )
         self._needs_depth = (
             self.use_depth
             or self.use_depth_geo
+            or self.use_depth_geo_post
             or self.use_depth_dual_vgg
             or self.use_depth_attn
+            or self.use_depth_cross_attn
+            or self.use_depth_graph_prior
         )
 
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

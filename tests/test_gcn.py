@@ -13,6 +13,7 @@ from crowdcount.models.gcn import (
     CrossStreamGCNProcessor,
     DensityGCNProcessor,
     DensityGraphBuilder,
+    DepthAwareDensityGraphBuilder,
     ECAConv,
     ECAGCNModel,
     FeatureGCNProcessor,
@@ -103,6 +104,54 @@ def test_spatial_prior_density_graph_builder(small_density_map):
     assert edge_index.shape[1] == 2 * 8 * 8 * (2 + 1)
 
 
+def test_depth_aware_density_graph_builder(small_density_map):
+    depth = torch.rand(2, 1, 16, 16)
+    builder = DepthAwareDensityGraphBuilder(k=2, depth_weight=0.5)
+    edge_index, edge_attr, num_nodes_total, H, W = builder.build_batch_graph(
+        small_density_map, depth_map=depth
+    )
+    assert edge_index.shape[0] == 2
+    assert edge_attr.shape == (edge_index.shape[1], 1)
+    assert num_nodes_total == 2 * 8 * 8
+    assert H == 8 and W == 8
+    assert edge_index.shape[1] == 2 * 8 * 8 * (2 + 1)
+
+
+def test_depth_aware_density_graph_builder_depth_weight_zero_matches_spatial():
+    torch.manual_seed(0)
+    density = torch.rand(1, 1, 8, 8)
+    depth = torch.rand(1, 1, 16, 16)
+    spatial = SpatialPriorDensityGraphBuilder(k=3, alpha=1.0, beta=1.0)
+    depth_aware = DepthAwareDensityGraphBuilder(
+        k=3, density_weight=1.0, spatial_weight=1.0, depth_weight=0.0
+    )
+
+    spatial_edge_index, _, _, _, _ = spatial.build_batch_graph(density)
+    depth_edge_index, _, _, _, _ = depth_aware.build_batch_graph(
+        density, depth_map=depth
+    )
+
+    assert torch.equal(depth_edge_index, spatial_edge_index)
+
+
+def test_depth_aware_density_graph_builder_reduces_cross_depth_edges():
+    density = torch.zeros(1, 1, 4, 4)
+    depth = torch.zeros(1, 1, 4, 4)
+    depth[:, :, :, 2:] = 1.0
+    builder = DepthAwareDensityGraphBuilder(
+        k=2, density_weight=0.0, spatial_weight=0.0, depth_weight=1.0
+    )
+
+    edge_index, _, num_nodes_total, _, W = builder.build_batch_graph(
+        density, depth_map=depth
+    )
+    edge_index = edge_index[:, : edge_index.shape[1] - num_nodes_total]
+    src_side = (edge_index[0] % W) >= 2
+    tgt_side = (edge_index[1] % W) >= 2
+
+    assert torch.equal(src_side, tgt_side)
+
+
 def test_spatial_prior_density_graph_builder_shorter_edges():
     """The spatial prior should reduce mean edge length vs. plain density k-NN."""
     torch.manual_seed(0)
@@ -140,6 +189,23 @@ def test_density_gcn_processor_with_spatial_prior(small_feature_map, small_densi
     )
     assert isinstance(proc.graph_builder, SpatialPriorDensityGraphBuilder)
     out = proc(small_density_map, small_feature_map)
+    assert out.shape == small_feature_map.shape
+
+
+def test_density_gcn_processor_with_depth_prior_gatv2(
+    small_feature_map, small_density_map
+):
+    depth = torch.rand(2, 1, 32, 32)
+    proc = DensityGCNProcessor(
+        k=2,
+        in_channels=256,
+        hidden_channels=128,
+        out_channels=256,
+        conv_type="gatv2",
+        depth_prior_cfg={"enabled": True, "depth_weight": 0.5},
+    )
+    assert isinstance(proc.graph_builder, DepthAwareDensityGraphBuilder)
+    out = proc(small_density_map, small_feature_map, depth_map=depth)
     assert out.shape == small_feature_map.shape
 
 

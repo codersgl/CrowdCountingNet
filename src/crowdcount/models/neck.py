@@ -126,6 +126,14 @@ def _resize_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return F.interpolate(x, size=ref.shape[-2:], mode="nearest")
 
 
+def _resize_bilinear_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    if x.shape[-2:] == ref.shape[-2:]:
+        return x
+    return F.interpolate(
+        x, size=ref.shape[-2:], mode="bilinear", align_corners=False
+    )
+
+
 class _FastNormalizedFusion(nn.Module):
     """BiFPN fast normalized weighted fusion for same-shape tensors."""
 
@@ -315,6 +323,87 @@ class SPDBiFPNNeck(nn.Module):
         p3_to_p4 = self.final_p3_downsample(p3, p4.shape[-2:])
         p5_to_p4 = _resize_like(p5, p4)
         out = self.final_refine(self.final_fusion([p3_to_p4, p4, p5_to_p4]))
+
+        if return_intermediates:
+            return out, (p3, p4, p5)
+        return out
+
+
+class P2PNeXtDecoder(nn.Module):
+    """P2PNeXt-style FPN decoder with bilinear upsampling and Conv-BN-ReLU."""
+
+    _OUTPUT_LEVELS = {"p3", "p4", "p5", "fused"}
+
+    def __init__(
+        self,
+        C3_size: int,
+        C4_size: int,
+        C5_size: int,
+        feature_size: int = 256,
+        output_level: str = "p3",
+    ) -> None:
+        super().__init__()
+        if output_level not in self._OUTPUT_LEVELS:
+            raise ValueError(
+                f"Unsupported output_level={output_level}, "
+                f"expected one of {sorted(self._OUTPUT_LEVELS)}"
+            )
+        self.output_level = output_level
+
+        self.P5_1 = nn.Sequential(
+            nn.Conv2d(C5_size, feature_size, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(feature_size),
+            nn.ReLU(inplace=True),
+        )
+        self.P4_1 = nn.Sequential(
+            nn.Conv2d(C4_size, feature_size, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(feature_size),
+            nn.ReLU(inplace=True),
+        )
+        self.P3_1 = nn.Sequential(
+            nn.Conv2d(C3_size, feature_size, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(feature_size),
+            nn.ReLU(inplace=True),
+        )
+
+        self.P4_2 = _conv3x3_block(feature_size, feature_size)
+        self.P3_2 = _conv3x3_block(feature_size, feature_size)
+        self.P5_2 = _conv3x3_block(feature_size, feature_size)
+        self.fusion = nn.Sequential(
+            nn.Conv2d(3 * feature_size, feature_size, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feature_size),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(
+        self,
+        inputs: list[torch.Tensor],
+        return_intermediates: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    ):
+        c3, c4, c5 = inputs
+        p5 = self.P5_2(self.P5_1(c5))
+        p4_lateral = self.P4_1(c4)
+        p4 = self.P4_2(p4_lateral + _resize_bilinear_like(p5, p4_lateral))
+        p3_lateral = self.P3_1(c3)
+        p3 = self.P3_2(p3_lateral + _resize_bilinear_like(p4, p3_lateral))
+
+        if self.output_level == "fused":
+            out = self.fusion(
+                torch.cat(
+                    [
+                        _resize_bilinear_like(p3, p4),
+                        p4,
+                        _resize_bilinear_like(p5, p4),
+                    ],
+                    dim=1,
+                )
+            )
+        else:
+            selected = {"p3": p3, "p4": p4, "p5": p5}[self.output_level]
+            out = _resize_bilinear_like(selected, p4)
 
         if return_intermediates:
             return out, (p3, p4, p5)

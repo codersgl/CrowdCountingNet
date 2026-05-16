@@ -36,7 +36,7 @@ from crowdcount.models.head import (
     DensityPred_Block5,
 )
 from crowdcount.models.dap_neck import ACDR, DAPNeck
-from crowdcount.models.neck import Decoder_SPD_PAFPN, SPDBiFPNNeck
+from crowdcount.models.neck import Decoder_SPD_PAFPN, P2PNeXtDecoder, SPDBiFPNNeck
 from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.concat_gate_fusion import ConcatGateFusion
@@ -217,6 +217,8 @@ class DSGCnet(nn.Module):
         dap_neck_cfg: DictConfig | None = None,
         use_bifpn_neck: bool = False,
         bifpn_neck_cfg: DictConfig | None = None,
+        use_p2pnext_neck: bool = False,
+        p2pnext_neck_cfg: DictConfig | None = None,
         neck_acdr_cfg: DictConfig | None = None,
         use_deep_head: bool = False,
         use_density_adaptive_fusion: bool = False,
@@ -273,6 +275,7 @@ class DSGCnet(nn.Module):
         self.use_rccformer_neck = use_rccformer_neck
         self.use_dap_neck = use_dap_neck
         self.use_bifpn_neck = use_bifpn_neck
+        self.use_p2pnext_neck = use_p2pnext_neck
         self.use_density_adaptive_fusion = use_density_adaptive_fusion
 
         _neck_flags = sum(
@@ -282,6 +285,7 @@ class DSGCnet(nn.Module):
                 use_rccformer_neck,
                 use_dap_neck,
                 use_bifpn_neck,
+                use_p2pnext_neck,
             ]
         )
         if _neck_flags > 1:
@@ -289,7 +293,8 @@ class DSGCnet(nn.Module):
                 "Neck options are mutually exclusive; enable at most one. Got: "
                 f"use_msca_neck={use_msca_neck}, use_msca_decoder={use_msca_decoder}, "
                 f"use_rccformer_neck={use_rccformer_neck}, use_dap_neck={use_dap_neck}, "
-                f"use_bifpn_neck={use_bifpn_neck}"
+                f"use_bifpn_neck={use_bifpn_neck}, "
+                f"use_p2pnext_neck={use_p2pnext_neck}"
             )
 
         if use_depth_cross_attn and use_msca_decoder:
@@ -456,6 +461,19 @@ class DSGCnet(nn.Module):
                 if _bn
                 else True,
                 eps=float(getattr(_bn, "eps", 1e-4)) if _bn else 1e-4,
+            )
+            self.density_pred = _build_standard_density_head()
+        elif use_p2pnext_neck:
+            self.msca_decoder = None
+            _pn = p2pnext_neck_cfg
+            self.pa = P2PNeXtDecoder(
+                C3_size=256,
+                C4_size=512,
+                C5_size=512,
+                feature_size=int(getattr(_pn, "feature_size", 256)) if _pn else 256,
+                output_level=str(getattr(_pn, "output_level", "p3"))
+                if _pn
+                else "p3",
             )
             self.density_pred = _build_standard_density_head()
         elif use_rccformer_neck:

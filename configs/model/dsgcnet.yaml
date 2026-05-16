@@ -370,6 +370,14 @@ bifpn_neck:
   use_depthwise_refine: true # EfficientDet-style separable 3×3 node refinement
   eps: 0.0001 # Denominator epsilon for normalized fusion weights
 
+# P2PNeXt-style neck (disabled by default)
+# Uses Conv-BN-ReLU refinement and bilinear upsampling. Output is resized to
+# stride 8 so existing anchors, density head, GCN, and point heads stay aligned.
+use_p2pnext_neck: false
+p2pnext_neck:
+  feature_size: 256
+  output_level: p3 # p3 | p4 | p5 | fused; resized to stride 8 for anchor alignment
+
 # Density-Adaptive Fusion (disabled by default)
 # Replaces static alpha / GateMechanism with density-conditioned per-pixel fusion.
 # When enabled in gcn_mode=fixed, alpha and gm are automatically disabled.

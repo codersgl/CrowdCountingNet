@@ -44,6 +44,7 @@ from crowdcount.data import build_dataset, collate_fn_crowd
 from crowdcount.data.collate import collate_fn_crowd_depth
 from crowdcount.engine import _forward_model
 from crowdcount.models import build_model
+from crowdcount.models.checkpoint import load_model_state_dict
 from crowdcount.utils.logging import logger, setup_logger
 
 
@@ -552,12 +553,7 @@ def main(cfg: DictConfig) -> None:
     if not os.path.exists(weight_path):
         raise FileNotFoundError(f"Weight file not found: {weight_path}")
     checkpoint = torch.load(weight_path, map_location="cpu")
-    state_dict = (
-        checkpoint["model"]
-        if isinstance(checkpoint, dict) and "model" in checkpoint
-        else checkpoint
-    )
-    model.load_state_dict(state_dict)
+    load_model_state_dict(model, checkpoint, logger=logger)
     logger.info(f"Loaded weights from {weight_path}")
 
     use_depth = bool(getattr(cfg.model, "use_depth", False))

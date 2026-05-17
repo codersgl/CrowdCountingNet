@@ -104,3 +104,30 @@ def test_dsgcnet_p2pnext_neck_mutual_exclusion():
             use_p2pnext_neck=True,
             use_bifpn_neck=True,
         )
+
+
+def test_dsgcnet_p2pnext_neck_with_post_acdr():
+    from crowdcount.models.dsgcnet import DSGCnet
+
+    acdr_cfg = OmegaConf.create(
+        {
+            "enabled": True,
+            "large_kernel": 5,
+            "dilation": 1,
+            "hidden_ratio": 4,
+            "gate_init": 0.0,
+        }
+    )
+    model = DSGCnet(
+        TinyVGGBackbone(),
+        row=2,
+        line=2,
+        use_p2pnext_neck=True,
+        neck_acdr_cfg=acdr_cfg,
+    )
+    assert model.neck_acdr is not None
+    model.eval()
+    x = torch.zeros(1, 3, 128, 128)
+    with torch.no_grad():
+        out = model(x)
+    assert out["density_out"].shape == (1, 1, 16, 16)

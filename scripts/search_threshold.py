@@ -23,6 +23,7 @@ from crowdcount.data import build_dataset, collate_fn_crowd
 from crowdcount.data.collate import collate_fn_crowd_depth
 from crowdcount.engine import collect_scores_and_counts, search_optimal_threshold
 from crowdcount.models import build_model
+from crowdcount.models.checkpoint import load_model_state_dict
 from crowdcount.utils.logging import logger, setup_logger
 
 
@@ -45,7 +46,7 @@ def main(cfg: DictConfig) -> None:
 
     if weight_path and os.path.exists(weight_path):
         checkpoint = torch.load(weight_path, map_location="cpu")
-        model.load_state_dict(checkpoint["model"])
+        load_model_state_dict(model, checkpoint, logger=logger)
         logger.info(f"Loaded weights from {weight_path}")
     else:
         logger.warning(

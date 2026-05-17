@@ -10,6 +10,8 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+
+plt.rcParams["font.family"] = "Noto Sans CJK JP"
 import pandas as pd
 import scipy.io
 import torch
@@ -121,14 +123,14 @@ def draw_points(axis: plt.Axes, points: torch.Tensor, color: str, size: float) -
 
 
 def save_composite(results: list[dict[str, object]], output_path: Path) -> None:
-    """Save a 3x4 qualitative comparison figure."""
+    """Save a 3x2 qualitative comparison figure (GT vs Pred only)."""
     figure, axes = plt.subplots(
-        nrows=len(results), ncols=4, figsize=(12.5, 3.35 * len(results)), dpi=180
+        nrows=len(results), ncols=2, figsize=(8.6, 3.35 * len(results)), dpi=180
     )
     if len(results) == 1:
         axes = axes.reshape(1, -1)
 
-    column_titles = ["Input", "GT points", "Predicted points", "Density head"]
+    column_titles = ["GT points", "Predicted points"]
     for axis, title in zip(axes[0], column_titles):
         axis.set_title(title, fontsize=11, pad=6)
 
@@ -136,22 +138,22 @@ def save_composite(results: list[dict[str, object]], output_path: Path) -> None:
         image = item["image"]
         gt_points = item["gt_points"]
         pred_points = item["pred_points"]
-        density_display = item["density_display"]
         image_name = str(item["image_name"])
         gt_count = int(item["gt_count"])
         pred_count = int(item["pred_count"])
-        density_sum = float(item["density_sum"])
+        delta = pred_count - gt_count
+
+        density_label = item.get("density_label", "")
 
         axes[row_index, 0].imshow(image)
-        axes[row_index, 0].set_ylabel(image_name, fontsize=9)
-
-        axes[row_index, 1].imshow(image)
-        draw_points(axes[row_index, 1], gt_points, color="#10b981", size=6.0)
-        axes[row_index, 1].text(
+        ylabel = f"{image_name}  {density_label}" if density_label else image_name
+        axes[row_index, 0].set_ylabel(ylabel, fontsize=9)
+        draw_points(axes[row_index, 0], gt_points, color="#10b981", size=6.0)
+        axes[row_index, 0].text(
             0.02,
             0.96,
             f"GT={gt_count}",
-            transform=axes[row_index, 1].transAxes,
+            transform=axes[row_index, 0].transAxes,
             ha="left",
             va="top",
             fontsize=9,
@@ -159,13 +161,14 @@ def save_composite(results: list[dict[str, object]], output_path: Path) -> None:
             bbox={"facecolor": "#065f46", "alpha": 0.82, "pad": 2, "edgecolor": "none"},
         )
 
-        axes[row_index, 2].imshow(image)
-        draw_points(axes[row_index, 2], pred_points, color="#ef4444", size=6.0)
-        axes[row_index, 2].text(
+        axes[row_index, 1].imshow(image)
+        draw_points(axes[row_index, 1], pred_points, color="#ef4444", size=6.0)
+        delta_str = f"+{delta}" if delta > 0 else str(delta)
+        axes[row_index, 1].text(
             0.02,
             0.96,
-            f"Pred={pred_count}",
-            transform=axes[row_index, 2].transAxes,
+            f"Pred={pred_count}  Δ={delta_str}",
+            transform=axes[row_index, 1].transAxes,
             ha="left",
             va="top",
             fontsize=9,
@@ -173,21 +176,7 @@ def save_composite(results: list[dict[str, object]], output_path: Path) -> None:
             bbox={"facecolor": "#7f1d1d", "alpha": 0.82, "pad": 2, "edgecolor": "none"},
         )
 
-        axes[row_index, 3].imshow(image)
-        axes[row_index, 3].imshow(density_display.numpy(), cmap="magma", alpha=0.66)
-        axes[row_index, 3].text(
-            0.02,
-            0.96,
-            f"Density={density_sum:.1f}",
-            transform=axes[row_index, 3].transAxes,
-            ha="left",
-            va="top",
-            fontsize=9,
-            color="white",
-            bbox={"facecolor": "#3b0764", "alpha": 0.82, "pad": 2, "edgecolor": "none"},
-        )
-
-        for col_index in range(4):
+        for col_index in range(2):
             axes[row_index, col_index].set_xticks([])
             axes[row_index, col_index].set_yticks([])
 
@@ -216,8 +205,14 @@ def main() -> None:
     parser.add_argument(
         "--images",
         nargs="+",
-        default=["IMG_136.jpg", "IMG_56.jpg", "IMG_150.jpg"],
+        default=["IMG_123.jpg", "IMG_57.jpg", "IMG_17.jpg"],
         help="SHHA test image names to visualise.",
+    )
+    parser.add_argument(
+        "--density-labels",
+        nargs="+",
+        default=["稀疏 (115人)", "中等 (356人)", "密集 (1157人)"],
+        help="Density-level labels for each image row.",
     )
     parser.add_argument(
         "--output-dir",
@@ -242,15 +237,22 @@ def main() -> None:
     )
 
     model = build_model(cfg, training=False)
-    model.load_state_dict(checkpoint["model"])
+    state_dict = {
+        k.replace("pa.acdr.", "neck_acdr."): v for k, v in checkpoint["model"].items()
+    }
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
+    density_labels = args.density_labels if args.density_labels else [""] * len(args.images)
+
     results = []
-    for image_name in args.images:
+    for idx, image_name in enumerate(args.images):
         image_path = args.data_root / "images" / image_name
         gt_path = args.data_root / "ground_truth" / f"GT_{Path(image_name).stem}.mat"
-        results.append(infer_one(model, image_path, gt_path, threshold, device))
+        item = infer_one(model, image_path, gt_path, threshold, device)
+        item["density_label"] = density_labels[idx] if idx < len(density_labels) else ""
+        results.append(item)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     figure_path = args.output_dir / "fig_qualitative_shha_best.png"

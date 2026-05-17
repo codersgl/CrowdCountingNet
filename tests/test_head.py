@@ -16,6 +16,7 @@ from crowdcount.models.head import (
     EnhancedDensityAttention,
     GatedDensityAttention,
     RegressionModel,
+    ResidualDensityAttention,
     SharedPredictionTrunk,
 )
 from crowdcount.models.ssim_loss import SSIMLoss
@@ -161,6 +162,56 @@ def test_density_attention_mask_shape_and_range(mode):
     assert out.shape == density.shape
     assert (out >= 0).all()
     assert (out <= 1).all()
+
+
+# ---------------------------------------------------------------------------
+# ResidualDensityAttention
+# ---------------------------------------------------------------------------
+
+
+def test_residual_density_attention_init_identity(feature_map):
+    module = ResidualDensityAttention(hidden_channels=16, max_delta=0.5)
+    density = torch.rand(2, 1, 16, 16)
+
+    with torch.no_grad():
+        out = module(density, feature_map)
+
+    assert torch.allclose(out, feature_map, atol=1e-6)
+    assert module.last_attention_scale is not None
+    assert module.last_attention_scale.shape == density.shape
+    assert torch.allclose(
+        module.last_attention_scale,
+        torch.ones_like(module.last_attention_scale),
+        atol=1e-6,
+    )
+
+
+def test_residual_density_attention_gradient_reaches_final_projection(feature_map):
+    module = ResidualDensityAttention(hidden_channels=8, max_delta=0.5)
+    density = torch.rand(2, 1, 16, 16, requires_grad=True)
+    feat = feature_map.clone().requires_grad_(True)
+    out = module(density, feat)
+    out.square().sum().backward()
+
+    final_proj = module.proj[2]
+    assert feat.grad is not None and torch.isfinite(feat.grad).all()
+    assert final_proj.weight.grad is not None
+    assert final_proj.weight.grad.abs().sum() > 0
+
+
+def test_residual_density_attention_scale_is_bounded():
+    module = ResidualDensityAttention(hidden_channels=4, max_delta=0.25)
+    with torch.no_grad():
+        module.strength.fill_(10.0)
+        module.proj[2].bias.fill_(10.0)
+    density = torch.rand(1, 1, 8, 8)
+    feature = torch.ones(1, 4, 8, 8)
+
+    with torch.no_grad():
+        out = module(density, feature)
+
+    assert out.min() >= 0.75 - 1e-6
+    assert out.max() <= 1.25 + 1e-6
 
 
 def test_ssim_loss_zero_for_identical_maps():

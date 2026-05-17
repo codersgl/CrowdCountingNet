@@ -2,6 +2,7 @@
 
 Contains:
   - Density_pred:           density map regression head
+    - ResidualDensityAttention: identity-safe residual density attention
   - SharedPredictionTrunk:  shared 2-layer conv trunk for regression & classification
   - DecoupledPredictionHead: independent trunks for classification & regression (decoupled)
   - RegressionModel:        point regression projection (used after SharedPredictionTrunk)
@@ -49,6 +50,58 @@ class DensityAttentionMask(nn.Module):
             return torch.sigmoid(density * self.scale + self.bias)
         assert self.proj is not None
         return torch.sigmoid(self.proj(density))
+
+
+class ResidualDensityAttention(nn.Module):
+    """Identity-initialised density attention with bounded residual modulation.
+
+    The module normalises the density map per image, predicts a signed spatial
+    residual in ``[-1, 1]``, and applies a bounded scale around 1.0:
+
+        scale = 1 + tanh(strength) * max_delta * residual
+
+    The final projection is zero-initialised, so the first forward pass is an
+    exact identity transform while gradients can still update the residual path.
+    """
+
+    def __init__(
+        self,
+        hidden_channels: int = 16,
+        max_delta: float = 0.5,
+        strength_init: float = 1e-3,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if max_delta <= 0:
+            raise ValueError("max_delta must be positive")
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+
+        self.max_delta = float(max_delta)
+        self.eps = float(eps)
+        self.proj = nn.Sequential(
+            nn.Conv2d(1, hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+            nn.Tanh(),
+        )
+        nn.init.zeros_(self.proj[2].weight)
+        nn.init.zeros_(self.proj[2].bias)
+        self.strength = nn.Parameter(torch.tensor(float(strength_init)))
+        self.last_attention_scale: torch.Tensor | None = None
+
+    def _normalise_density(self, density: torch.Tensor) -> torch.Tensor:
+        density_log = torch.log1p(density.clamp_min(0.0))
+        mean = density_log.mean(dim=(-2, -1), keepdim=True)
+        std = density_log.std(dim=(-2, -1), keepdim=True, unbiased=False)
+        return (density_log - mean) / (std + self.eps)
+
+    def forward(self, density: torch.Tensor, feature: torch.Tensor) -> torch.Tensor:
+        density_norm = self._normalise_density(density)
+        residual = self.proj(density_norm)
+        scale = 1.0 + torch.tanh(self.strength) * self.max_delta * residual
+        self.last_attention_scale = scale.detach()
+        return feature * scale.to(dtype=feature.dtype)
 
 
 class EnhancedDensityAttention(nn.Module):
@@ -135,6 +188,7 @@ class EnhancedDensityAttention(nn.Module):
 
         # --- Residual base ---
         self.base = nn.Parameter(torch.tensor(base_init))
+        self.last_attention_scale: torch.Tensor | None = None
 
     def forward(self, density: torch.Tensor, feature: torch.Tensor) -> torch.Tensor:
         """Apply density-guided channel + spatial attention with residual path.
@@ -166,7 +220,9 @@ class EnhancedDensityAttention(nn.Module):
         sa = self.sa_conv(fused)  # [B, 1, H, W]
 
         # Residual dual-path: feature * (base + spatial_mask) * channel_weight
-        return feature * (self.base + sa) * ca
+        scale = (self.base + sa) * ca
+        self.last_attention_scale = scale.detach().mean(dim=1, keepdim=True)
+        return feature * scale
 
 
 class GatedDensityAttention(nn.Module):
@@ -219,6 +275,7 @@ class GatedDensityAttention(nn.Module):
         # Density prior parameters (mirrors DensityAttentionMask 'sigmoid' mode)
         self.alpha = nn.Parameter(torch.tensor(1.0))
         self.beta = nn.Parameter(torch.tensor(0.0))
+        self.last_attention_scale: torch.Tensor | None = None
 
     def forward(self, density: torch.Tensor, feature: torch.Tensor) -> torch.Tensor:
         """Apply feature-conditioned gated density modulation.
@@ -234,7 +291,9 @@ class GatedDensityAttention(nn.Module):
         f_emb = F.relu(self.feature_proj(feature), inplace=True)
         gate = torch.sigmoid(self.gate_conv(torch.cat([d_emb, f_emb], dim=1)))
         d_attn = torch.sigmoid(density * self.alpha + self.beta)
-        return feature * (1.0 - gate + gate * d_attn)
+        scale = 1.0 - gate + gate * d_attn
+        self.last_attention_scale = scale.detach()
+        return feature * scale
 
 
 class SharedPredictionTrunk(nn.Module):

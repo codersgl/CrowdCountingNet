@@ -74,6 +74,13 @@ def build_model(cfg: DictConfig, training: bool = False):
             getattr(cfg.model, "density_attention_hidden", 32)
         ),
         density_attention_base=float(getattr(cfg.model, "density_attention_base", 0.5)),
+        density_attention_max_delta=float(
+            getattr(cfg.model, "density_attention_max_delta", 0.5)
+        ),
+        density_attention_strength_init=float(
+            getattr(cfg.model, "density_attention_strength_init", 1e-3)
+        ),
+        density_attention_debug=getattr(cfg.model, "density_attention_debug", False),
         use_subpix_refine=getattr(cfg.model, "use_subpix_refine", False),
         subpix_refine_cfg=getattr(cfg.model, "subpix_refine", None),
         use_uncertainty=getattr(cfg.model, "use_uncertainty", False),

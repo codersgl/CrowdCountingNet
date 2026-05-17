@@ -29,6 +29,7 @@ from crowdcount.models.head import (
     FreqDecoupledRouter,
     PointRefineModule,
     RegressionModel,
+    ResidualDensityAttention,
     SharedPredictionTrunk,
     SubPixelRefineModule,
     DensityPred_Block3,
@@ -196,6 +197,9 @@ class DSGCnet(nn.Module):
         density_attention_pre_gcn: bool = False,
         density_attention_hidden: int = 32,
         density_attention_base: float = 0.5,
+        density_attention_max_delta: float = 0.5,
+        density_attention_strength_init: float = 1e-3,
+        density_attention_debug: bool = False,
         use_subpix_refine: bool = False,
         subpix_refine_cfg: DictConfig | None = None,
         use_uncertainty: bool = False,
@@ -266,6 +270,7 @@ class DSGCnet(nn.Module):
             )
         self.use_freq_head = use_freq_head
         self.use_density_attention = use_density_attention
+        self.density_attention_debug = density_attention_debug
         self.use_subpix_refine = use_subpix_refine
         self._gcn_mode = gcn_mode
         self.use_uncertainty = use_uncertainty
@@ -528,6 +533,7 @@ class DSGCnet(nn.Module):
             DensityAttentionMask
             | EnhancedDensityAttention
             | GatedDensityAttention
+            | ResidualDensityAttention
             | None
         )
         if use_density_attention:
@@ -541,6 +547,12 @@ class DSGCnet(nn.Module):
                 self.density_attention = GatedDensityAttention(
                     feature_channels=256,
                     hidden_channels=density_attention_hidden,
+                )
+            elif density_attention_mode in {"residual", "calibrated"}:
+                self.density_attention = ResidualDensityAttention(
+                    hidden_channels=density_attention_hidden,
+                    max_delta=density_attention_max_delta,
+                    strength_init=density_attention_strength_init,
                 )
             else:
                 self.density_attention = DensityAttentionMask(
@@ -1340,6 +1352,39 @@ class DSGCnet(nn.Module):
         if self.sdd_moe is not None:
             self.sdd_moe.update_temperature(decay_rate=decay_rate)
 
+    @staticmethod
+    def _density_attention_stats(
+        attention_scale: torch.Tensor, density: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        scale = attention_scale.detach().float()
+        if scale.shape[1] != 1:
+            scale = scale.mean(dim=1, keepdim=True)
+
+        density_ref = density.detach().float()
+        if density_ref.shape[-2:] != scale.shape[-2:]:
+            density_ref = F.interpolate(
+                density_ref, size=scale.shape[-2:], mode="bilinear", align_corners=False
+            )
+
+        flat = scale.reshape(-1)
+        overall_mean = scale.mean()
+        density_mean = density_ref.mean(dim=(-2, -1), keepdim=True)
+        high_mask = density_ref >= density_mean
+        low_mask = ~high_mask
+        high_mean = scale[high_mask].mean() if high_mask.any().item() else overall_mean
+        low_mean = scale[low_mask].mean() if low_mask.any().item() else overall_mean
+
+        return {
+            "min": scale.amin(),
+            "max": scale.amax(),
+            "mean": overall_mean,
+            "std": scale.std(unbiased=False),
+            "p10": torch.quantile(flat, 0.1),
+            "p90": torch.quantile(flat, 0.9),
+            "high_density_mean": high_mean,
+            "low_density_mean": low_mean,
+        }
+
     def forward(
         self,
         samples: torch.Tensor,
@@ -1635,17 +1680,29 @@ class DSGCnet(nn.Module):
             output_dict["moe_weights"] = light_weights
 
         # Post-GCN density attention: spatial+channel modulation of fused features
+        attention_scale = None
         if self.density_attention is not None:
             if isinstance(
                 self.density_attention,
-                (EnhancedDensityAttention, GatedDensityAttention),
+                (
+                    EnhancedDensityAttention,
+                    GatedDensityAttention,
+                    ResidualDensityAttention,
+                ),
             ):
                 feature_fl = self.density_attention(density.detach(), feature_fl)
+                attention_scale = self.density_attention.last_attention_scale
             else:
                 attention_mask = self.density_attention(density.detach()).to(
                     feature_fl.dtype
                 )
                 feature_fl = feature_fl * attention_mask
+                attention_scale = attention_mask
+
+        if self.density_attention_debug and attention_scale is not None:
+            output_dict["density_attention_stats"] = self._density_attention_stats(
+                attention_scale, density
+            )
 
         # SEMC post-GCN enhancement (optional, disabled by default)
         if self.semc_enhancer is not None and not self.use_moe:

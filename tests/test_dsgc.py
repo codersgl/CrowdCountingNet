@@ -218,7 +218,7 @@ def test_gate_weight_is_valid_probability_distribution() -> None:
     assert torch.allclose(row_sums, torch.ones_like(row_sums), rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("mode", ["sigmoid", "learned", "gated"])
+@pytest.mark.parametrize("mode", ["sigmoid", "learned", "gated", "residual", "calibrated"])
 def test_density_attention_forward_shapes_match(mode: str) -> None:
     backbone = TinyVGGBackbone()
     model = DSGCnet(
@@ -236,6 +236,37 @@ def test_density_attention_forward_shapes_match(mode: str) -> None:
     assert out["pred_logits"].shape[0] == 2
     assert out["pred_points"].shape[0] == 2
     assert out["density_out"].shape == (2, 1, 16, 16)
+
+
+def test_density_attention_debug_stats_are_returned() -> None:
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        use_density_attention=True,
+        density_attention_mode="residual",
+        density_attention_debug=True,
+    ).eval()
+
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+
+    stats = out["density_attention_stats"]
+    expected_keys = {
+        "min",
+        "max",
+        "mean",
+        "std",
+        "p10",
+        "p90",
+        "high_density_mean",
+        "low_density_mean",
+    }
+    assert expected_keys.issubset(stats.keys())
+    for value in stats.values():
+        assert value.ndim == 0
+        assert torch.isfinite(value)
 
 
 # ---------------------------------------------------------------------------

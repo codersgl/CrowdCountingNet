@@ -13,6 +13,31 @@ from omegaconf import DictConfig
 from crowdcount.data.dataset import SHHA
 
 
+def _resolve_norm_stats(
+    cfg: DictConfig,
+) -> tuple[list[float], list[float]]:
+    """Return ``(mean, std)`` for image normalization.
+
+    For CLIP backbones the stats differ from ImageNet defaults; the backbone
+    class exposes them via ``BackboneCLIP.norm_stats``.  We resolve them here
+    from config alone (without instantiating the backbone) so that the data
+    pipeline is independent of the model graph.
+    """
+    backbone_type = getattr(getattr(cfg, "model", None), "backbone_type", "vgg")
+    if backbone_type == "clip":
+        from crowdcount.models.backbone import (
+            _CLIP_DEFAULT_PRETRAINED,
+            _CLIP_NORM_STATS,
+        )
+
+        backbone_name = getattr(getattr(cfg, "model", None), "backbone", "ViT-B-16")
+        pretrained_tag = _CLIP_DEFAULT_PRETRAINED.get(backbone_name, "openai")
+        mean, std = _CLIP_NORM_STATS.get(pretrained_tag, _CLIP_NORM_STATS["openai"])
+        return list(mean), list(std)
+    # Default: ImageNet stats (VGG, ConvNeXt, DINOv2)
+    return [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+
+
 def build_dataset(cfg: DictConfig):
     """Return (train_set, val_set).
 
@@ -20,13 +45,11 @@ def build_dataset(cfg: DictConfig):
         cfg: top-level hydra DictConfig; uses cfg.data.data_root,
              cfg.data.patch, cfg.data.flip, cfg.model.use_depth.
     """
+    norm_mean, norm_std = _resolve_norm_stats(cfg)
     transform = standard_transforms.Compose(
         [
             standard_transforms.ToTensor(),
-            standard_transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
+            standard_transforms.Normalize(mean=norm_mean, std=norm_std),
         ]
     )
     data_root = cfg.data.data_root

@@ -29,6 +29,7 @@ dependencies = [
     "mamba-ssm",
     "xformers>=0.0.35",
     "pypdf>=6.9.2",
+    "open-clip-torch>=2.20",
 ]
 
 [project.optional-dependencies]

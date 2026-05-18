@@ -1,5 +1,5 @@
-backbone: vgg16_bn # vgg16_bn | vgg16 | dinov2_s | dinov2_b | dinov2_l | convnext_tiny | convnext_small | convnext_base | convnext_large
-backbone_type: vgg # vgg | dinov2 | convnext
+backbone: vgg16_bn # vgg16_bn | vgg16 | dinov2_s | dinov2_b | dinov2_l | convnext_tiny | convnext_small | convnext_base | convnext_large | ViT-B-16 | convnext_base_w
+backbone_type: vgg # vgg | dinov2 | convnext | clip
 row: 2
 line: 2
 set_cost_class: 1.0

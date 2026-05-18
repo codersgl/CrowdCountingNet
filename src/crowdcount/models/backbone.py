@@ -1,9 +1,10 @@
-"""VGG, DINOv2 and ConvNeXt backbone wrappers for DSGCNet.
+"""VGG, DINOv2, ConvNeXt and CLIP backbone wrappers for DSGCNet.
 
 Supports:
   - vgg16_bn / vgg16 (default)
   - dinov2_s / dinov2_b / dinov2_l / dinov2_g (optional, loaded via torch.hub)
   - convnext_tiny / convnext_small / convnext_base / convnext_large (torchvision)
+  - ViT-B-16 / convnext_base_w (OpenCLIP, loaded via open_clip)
 """
 
 from __future__ import annotations
@@ -325,6 +326,295 @@ class BackboneConvNeXt(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# CLIP backbone (OpenCLIP)
+# ---------------------------------------------------------------------------
+
+
+def _detect_clip_arch(visual) -> str:
+    """Detect whether an OpenCLIP visual encoder is ViT- or ConvNeXt-based."""
+    if hasattr(visual, "transformer"):
+        return "vit"
+    if hasattr(visual, "trunk") and hasattr(visual.trunk, "stages"):
+        return "convnext"
+    if hasattr(visual, "stem") and hasattr(visual, "stages"):
+        return "convnext"
+    raise ValueError(
+        f"Cannot detect CLIP visual architecture. "
+        f"Expected ViT (with .transformer) or ConvNeXt (with .stem + .stages). "
+        f"Got type: {type(visual).__name__}"
+    )
+
+
+# Default pretrained tags for CLIP models. When ``pretrained=True`` the
+# corresponding tag is passed to ``open_clip.create_model`` so users don't
+# need to know model-specific tag strings.
+_CLIP_DEFAULT_PRETRAINED = {
+    "ViT-B-16": "openai",
+    "convnext_base_w": "laion2b_s13b_b82k",
+}
+
+# Per-model normalization stats (mean, std) used during CLIP pretraining.
+# These should be used by the data loader instead of ImageNet defaults.
+_CLIP_NORM_STATS: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {
+    # OpenAI CLIP: mean/std from the original paper / open_clip source
+    "openai": (
+        (0.48145466, 0.4578275, 0.40821073),
+        (0.26862954, 0.26130258, 0.27577711),
+    ),
+    # LAION-2B default (same as openai stats in open_clip)
+    "laion2b_s13b_b82k": (
+        (0.48145466, 0.4578275, 0.40821073),
+        (0.26862954, 0.26130258, 0.27577711),
+    ),
+    "laion2b_s34b_b88k": (
+        (0.48145466, 0.4578275, 0.40821073),
+        (0.26862954, 0.26130258, 0.27577711),
+    ),
+}
+
+
+class BackboneCLIP(nn.Module):
+    """CLIP backbone wrapper exposing the 4-scale interface expected by DSGCNet.
+
+    Uses OpenCLIP (``open_clip``) to load pretrained CLIP vision encoders.
+    All CLIP weights are frozen; only the 1x1 projection convolutions are
+    trainable.
+
+    ViT path (e.g. ViT-B-16)
+    ------------------------
+    Transformer blocks are split into incremental groups.  Intermediate
+    features are extracted at group boundaries, projected via 1x1 convolutions
+    to the expected channel widths, then upsampled to form a multi-scale
+    feature pyramid:
+
+        out[0]: 128ch, stride patch_size//8
+        out[1]: 256ch, stride patch_size//4
+        out[2]: 512ch, stride patch_size//2
+        out[3]: 512ch, stride patch_size
+
+    ConvNeXt path (e.g. convnext_base_w)
+    ------------------------------------
+    Stage features are extracted directly (strides 4/8/16) and projected to
+    the expected channel widths.  Stage 3 (stride 32) is unused, matching the
+    existing ``BackboneConvNeXt`` convention.
+    """
+
+    def __init__(self, name: str, pretrained: bool | str = True):
+        super().__init__()
+        try:
+            import open_clip
+        except ImportError:
+            raise ImportError(
+                "open_clip_torch is required for CLIP backbone. "
+                "Install it with: uv sync --extra dev  or  pip install open_clip_torch"
+            )
+
+        self._name = name
+
+        # Resolve pretrained tag: True → default tag, False/None → no weights
+        if pretrained is True:
+            pretrained_tag = _CLIP_DEFAULT_PRETRAINED.get(name)
+        elif pretrained is False or pretrained is None:
+            pretrained_tag = None
+        else:
+            pretrained_tag = pretrained
+
+        model = open_clip.create_model(name, pretrained=pretrained_tag)
+        self.visual = model.visual
+        self._arch = _detect_clip_arch(self.visual)
+
+        # Freeze all CLIP weights -- only projection layers are trained
+        for p in self.visual.parameters():
+            p.requires_grad = False
+
+        # Expose the correct normalization stats for the data loader
+        tag = pretrained_tag or "openai"
+        if tag in _CLIP_NORM_STATS:
+            _mean, _std = _CLIP_NORM_STATS[tag]
+        else:
+            # Fall back to the most common CLIP stats
+            _mean, _std = _CLIP_NORM_STATS["openai"]
+        self._norm_mean: tuple[float, ...] = _mean
+        self._norm_std: tuple[float, ...] = _std
+
+        if self._arch == "vit":
+            self._init_vit()
+        else:
+            self._init_convnext()
+
+    # ------------------------------------------------------------------
+    # ViT initialisation
+    # ------------------------------------------------------------------
+
+    def _init_vit(self) -> None:
+        embed_dim = self.visual.conv1.out_channels
+        patch_size = self.visual.conv1.kernel_size[0]
+        depth = len(self.visual.transformer.resblocks)
+
+        self._embed_dim = embed_dim
+        self._patch_size = patch_size
+
+        # Incremental block grouping (matching DINOv2-style extraction)
+        d = depth
+        self._output_indices = {max(1, d // 12), max(1, d // 4), max(1, d // 2), d}
+
+        # 1x1 projections to match the expected channel contract
+        self.proj0 = nn.Conv2d(embed_dim, 128, 1)  # placeholder
+        self.proj1 = nn.Conv2d(embed_dim, 256, 1)  # c3
+        self.proj2 = nn.Conv2d(embed_dim, 512, 1)  # c4
+        self.proj3 = nn.Conv2d(embed_dim, 512, 1)  # c5
+
+    # ------------------------------------------------------------------
+    # ConvNeXt initialisation
+    # ------------------------------------------------------------------
+
+    def _init_convnext(self) -> None:
+        # open_clip may wrap the ConvNeXt in a .trunk or expose it directly
+        trunk = getattr(self.visual, "trunk", self.visual)
+
+        stem = trunk.stem
+        stages = trunk.stages
+
+        # Probe channel dimensions by running a dummy forward.
+        # s1 = stage0 output (stride 4), s2 = stage1 output (stride 8),
+        # s3 = stage2 output (stride 16).  We need each stage's actual
+        # output channels because stages[i] may change the channel count.
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, 128, 128)
+            s0 = stem(dummy)
+            s1 = stages[0](s0)
+            c1 = s1.shape[1]  # stage0 output channels (stride 4)
+            s2 = stages[1](s1)
+            c2 = s2.shape[1]  # stage1 output channels (stride 8)
+            s3 = stages[2](s2)
+            c3 = s3.shape[1]  # stage2 output channels (stride 16)
+
+        self._stem = stem
+        self._stages = stages
+        self._stage_channels = (c1, c2, c3)
+
+        # Projections matching the VGG / PA-FPN channel contract.
+        # proj0/proj1 both take s1 (stride 4); proj2 takes s2 (stride 8);
+        # proj3 takes s3 (stride 16).
+        self.proj0 = nn.Conv2d(c1, 128, 1)  # placeholder (stride 4)
+        self.proj1 = nn.Conv2d(c1, 256, 1)  # c3 (stride 4)
+        self.proj2 = nn.Conv2d(c2, 512, 1)  # c4 (stride 8)
+        self.proj3 = nn.Conv2d(c3, 512, 1)  # c5 (stride 16)
+
+    # ------------------------------------------------------------------
+    # Normalization stats (for the data loader)
+    # ------------------------------------------------------------------
+
+    @property
+    def norm_stats(self) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """Return ``(mean, std)`` that matches the CLIP pretraining normalization."""
+        return self._norm_mean, self._norm_std
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        if self._arch == "vit":
+            return self._forward_vit(x)
+        return self._forward_convnext(x)
+
+    def _forward_vit(self, x: torch.Tensor) -> list[torch.Tensor]:
+        B, C, H, W = x.shape
+        ps = self._patch_size
+
+        # Adjust spatial dims to a multiple of patch_size
+        H_adj = (H // ps) * ps
+        W_adj = (W // ps) * ps
+        if H_adj != H or W_adj != W:
+            x = F.interpolate(
+                x, size=(H_adj, W_adj), mode="bilinear", align_corners=False
+            )
+
+        # Patch embed → [B, D, h, w]
+        tokens = self.visual.conv1(x)
+        h, w = tokens.shape[2], tokens.shape[3]
+        tokens = tokens.reshape(B, self._embed_dim, -1).permute(0, 2, 1)  # [B, N, D]
+
+        # Class token + position embedding
+        cls_embed = getattr(self.visual, "class_embedding", None)
+        if cls_embed is None:
+            cls_embed = getattr(self.visual, "cls_token")
+        if cls_embed.ndim == 1:
+            cls_embed = cls_embed.view(1, 1, -1)
+        tokens = torch.cat(
+            [cls_embed.expand(B, -1, -1).to(tokens.dtype), tokens], dim=1
+        )
+
+        pos_embed = getattr(self.visual, "positional_embedding", None)
+        if pos_embed is None:
+            pos_embed = getattr(self.visual, "pos_embed")
+        # Interpolate position embedding when grid size differs from pretrained size
+        num_patches = h * w
+        pos_embed_num_patches = pos_embed.shape[0] - 1  # subtract class token
+        if num_patches != pos_embed_num_patches:
+            # Separate class token (row 0) from patch positions (rows 1:)
+            pos_cls = pos_embed[:1, :]  # [1, D]
+            pos_patch = pos_embed[1:, :]  # [N_pre, D]
+            h_pre = int(pos_embed_num_patches**0.5)
+            # Reshape to 2D, interpolate, reshape back
+            pos_patch = pos_patch.reshape(1, h_pre, -1, self._embed_dim).permute(
+                0, 3, 1, 2
+            )
+            pos_patch = F.interpolate(
+                pos_patch, size=(h, w), mode="bicubic", align_corners=False
+            )
+            pos_patch = pos_patch.permute(0, 2, 3, 1).reshape(-1, self._embed_dim)
+            pos_embed = torch.cat([pos_cls, pos_patch], dim=0)
+
+        tokens = tokens + pos_embed.to(tokens.dtype)
+
+        ln_pre = getattr(self.visual, "ln_pre", None)
+        if ln_pre is not None:
+            tokens = ln_pre(tokens)
+
+        # Step through transformer blocks, collecting at output indices
+        blocks = self.visual.transformer.resblocks
+        feats = []
+        for i, block in enumerate(blocks):
+            tokens = block(tokens)
+            if (i + 1) in self._output_indices:
+                patch_feat = tokens[:, 1:, :]  # strip class token
+                patch_feat = patch_feat.permute(0, 2, 1).reshape(
+                    B, self._embed_dim, h, w
+                )
+                feats.append(patch_feat)
+
+        # Project and upsample to build multi-scale pyramid
+        projs = [self.proj0, self.proj1, self.proj2, self.proj3]
+        up_factors = [8, 4, 2, 1]  # stride: ps/8, ps/4, ps/2, ps
+        out = []
+        for feat, proj, scale in zip(feats, projs, up_factors):
+            feat = proj(feat)
+            if scale > 1:
+                feat = F.interpolate(
+                    feat,
+                    scale_factor=float(scale),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            out.append(feat)
+        return out
+
+    def _forward_convnext(self, x: torch.Tensor) -> list[torch.Tensor]:
+        s0 = self._stem(x)
+        s1 = self._stages[0](s0)
+        s2 = self._stages[1](s1)
+        s3 = self._stages[2](s2)
+        return [
+            self.proj0(s1),  # stride 4, placeholder
+            self.proj1(s1),  # stride 4, c3
+            self.proj2(s2),  # stride 8, c4
+            self.proj3(s3),  # stride 16, c5
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -338,5 +628,7 @@ def build_backbone(cfg) -> nn.Module:
         return BackboneDINOv2(backbone_name)
     elif backbone_type == "convnext":
         return BackboneConvNeXt(backbone_name)
+    elif backbone_type == "clip":
+        return BackboneCLIP(backbone_name)
     else:
         return Backbone_VGG(backbone_name, True)

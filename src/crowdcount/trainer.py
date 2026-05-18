@@ -214,16 +214,38 @@ class Trainer:
         logger.info(f"Number of trainable parameters: {n_params:,}")
 
         # Optimizer
+        # For CLIP backbones the frozen visual encoder contributes no trainable
+        # parameters, but the randomly-initialised projection layers live under
+        # the "backbone.*" namespace and would normally get lr_backbone.
+        # We give those projections the full lr instead so they adapt quickly.
+        _backbone_type = getattr(getattr(cfg, "model", None), "backbone_type", "vgg")
+        _clip_proj_names = {
+            "backbone.proj0",
+            "backbone.proj1",
+            "backbone.proj2",
+            "backbone.proj3",
+        }
+
         non_backbone_params = [
             p
             for n, p in model.named_parameters()
             if "backbone" not in n and p.requires_grad
         ]
-        backbone_params = [
-            p
-            for n, p in model.named_parameters()
-            if "backbone" in n and p.requires_grad
-        ]
+        if _backbone_type == "clip":
+            # proj layers → full lr; no other backbone params are trainable
+            clip_proj_params = [
+                p
+                for n, p in model.named_parameters()
+                if any(n.startswith(pn) for pn in _clip_proj_names) and p.requires_grad
+            ]
+            backbone_params: list = []  # CLIP visual is frozen
+            non_backbone_params = non_backbone_params + clip_proj_params
+        else:
+            backbone_params = [
+                p
+                for n, p in model.named_parameters()
+                if "backbone" in n and p.requires_grad
+            ]
 
         param_dicts = [
             {"params": non_backbone_params},

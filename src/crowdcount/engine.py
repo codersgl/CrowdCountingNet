@@ -39,6 +39,120 @@ def _forward_model(
     return model(samples, **kwargs)
 
 
+def _resize_depth_target(
+    depth_map: torch.Tensor,
+    prediction: torch.Tensor,
+) -> torch.Tensor:
+    if depth_map.dim() == 3:
+        depth_map = depth_map.unsqueeze(1)
+    if depth_map.shape[1] != 1:
+        raise ValueError(f"depth_map must have one channel, got {depth_map.shape[1]}")
+    depth_target = depth_map.to(device=prediction.device, dtype=prediction.dtype)
+    if depth_target.shape[-2:] != prediction.shape[-2:]:
+        depth_target = F.interpolate(
+            depth_target,
+            size=prediction.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    return depth_target.clamp(0.0, 1.0)
+
+
+def _sobel_gradients(depth_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    sobel_x = depth_tensor.new_tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
+    ).view(1, 1, 3, 3)
+    sobel_y = depth_tensor.new_tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]
+    ).view(1, 1, 3, 3)
+    grad_x = F.conv2d(depth_tensor, sobel_x, padding=1)
+    grad_y = F.conv2d(depth_tensor, sobel_y, padding=1)
+    return grad_x, grad_y
+
+
+def _density_focus_weights(
+    gt_density: torch.Tensor,
+    prediction: torch.Tensor,
+    focus_weight: float,
+) -> torch.Tensor | None:
+    if focus_weight <= 0:
+        return None
+    density_focus = gt_density.detach().to(
+        device=prediction.device, dtype=prediction.dtype
+    )
+    if density_focus.shape[-2:] != prediction.shape[-2:]:
+        density_focus = F.interpolate(
+            density_focus,
+            size=prediction.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    density_focus = torch.log1p(density_focus.clamp_min(0.0))
+    focus_max = density_focus.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+    return 1.0 + float(focus_weight) * (density_focus / focus_max)
+
+
+def _weighted_mean(
+    loss_map: torch.Tensor,
+    weight_map: torch.Tensor | None,
+) -> torch.Tensor:
+    if weight_map is None:
+        return loss_map.mean()
+    return (loss_map * weight_map).sum() / weight_map.sum().clamp_min(1e-6)
+
+
+def _compute_depth_aux_loss(
+    prediction: torch.Tensor,
+    depth_map: torch.Tensor,
+    gt_density: torch.Tensor,
+    depth_aux_cfg: object | None,
+    epoch: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    loss_type = str(getattr(depth_aux_cfg, "loss_type", "smooth_l1")).lower()
+    if loss_type not in {"smooth_l1", "l1", "mse"}:
+        raise ValueError("depth_aux.loss_type must be one of smooth_l1, l1, mse")
+    loss_weight = float(getattr(depth_aux_cfg, "loss_weight", 0.05))
+    gradient_weight = float(getattr(depth_aux_cfg, "gradient_weight", 0.0))
+    density_focus_weight = float(getattr(depth_aux_cfg, "density_focus_weight", 0.0))
+    smooth_l1_beta = float(getattr(depth_aux_cfg, "smooth_l1_beta", 0.1))
+    warmup_epochs = int(getattr(depth_aux_cfg, "warmup_epochs", 0))
+
+    depth_target = _resize_depth_target(depth_map, prediction)
+    focus_weights = _density_focus_weights(
+        gt_density,
+        prediction,
+        density_focus_weight,
+    )
+    if loss_type == "smooth_l1":
+        pixel_loss_map = F.smooth_l1_loss(
+            prediction,
+            depth_target,
+            beta=smooth_l1_beta,
+            reduction="none",
+        )
+    elif loss_type == "l1":
+        pixel_loss_map = F.l1_loss(prediction, depth_target, reduction="none")
+    else:
+        pixel_loss_map = F.mse_loss(prediction, depth_target, reduction="none")
+    pixel_loss = _weighted_mean(pixel_loss_map, focus_weights)
+
+    grad_loss = prediction.new_tensor(0.0)
+    if gradient_weight > 0:
+        pred_grad_x, pred_grad_y = _sobel_gradients(prediction)
+        target_grad_x, target_grad_y = _sobel_gradients(depth_target)
+        grad_loss = 0.5 * (
+            F.l1_loss(pred_grad_x, target_grad_x)
+            + F.l1_loss(pred_grad_y, target_grad_y)
+        )
+
+    if warmup_epochs > 0:
+        warmup_factor = min(1.0, float(epoch + 1) / float(warmup_epochs))
+    else:
+        warmup_factor = 1.0
+    total_loss = (pixel_loss + gradient_weight * grad_loss) * loss_weight
+    return total_loss * warmup_factor, pixel_loss, grad_loss, warmup_factor
+
+
 def train_one_epoch(
     model: nn.Module,
     criterion: nn.Module,
@@ -180,6 +294,16 @@ def train_one_epoch(
         if cfg is not None
         else False
     )
+    use_depth_aux = bool(
+        getattr(getattr(cfg, "model", None), "use_depth_aux", False)
+        if cfg is not None
+        else False
+    )
+    depth_aux_cfg = (
+        getattr(getattr(cfg, "model", None), "depth_aux", None)
+        if cfg is not None
+        else None
+    )
     depth_graph_prior = (
         getattr(getattr(cfg, "model", None), "depth_graph_prior", None)
         if cfg is not None
@@ -190,7 +314,7 @@ def train_one_epoch(
         if depth_graph_prior is not None
         else False
     )
-    use_depth = (
+    use_depth_input = (
         use_depth
         or use_depth_geo
         or use_depth_geo_post
@@ -198,10 +322,11 @@ def train_one_epoch(
         or use_depth_attn
         or use_depth_cross_attn
         or use_depth_graph_prior
-    )  # any flag requires depth data in batch
+    )
+    needs_depth_batch = use_depth_input or use_depth_aux
 
     for batch in data_loader:
-        if use_depth:
+        if needs_depth_batch:
             samples, targets, gt_dmap, depth_map = batch
             depth_map = torch.stack(depth_map).to(device)
         else:
@@ -211,11 +336,12 @@ def train_one_epoch(
         gt_dmap = torch.stack(gt_dmap)
         gt_dmap = gt_dmap.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        depth_input_map = depth_map if use_depth_input else None
 
         outputs = _forward_model(
             model,
             samples,
-            depth_map=depth_map,
+            depth_map=depth_input_map,
             targets=targets,
             gt_density=gt_dmap,
         )
@@ -419,6 +545,33 @@ def train_one_epoch(
             density_ssim_loss = density_ssim_weight * ssim_criterion(et_dmap, gt_dmap)
             density_loss = density_loss + density_ssim_loss
 
+        depth_aux_loss = torch.tensor(0.0, device=samples.device)
+        depth_aux_pixel_loss = torch.tensor(0.0, device=samples.device)
+        depth_aux_grad_loss = torch.tensor(0.0, device=samples.device)
+        depth_aux_warmup = 0.0
+        if use_depth_aux:
+            depth_aux_out = outputs.get("depth_aux_out")
+            if depth_aux_out is None:
+                raise ValueError(
+                    "model.use_depth_aux=True but model output has no depth_aux_out"
+                )
+            if depth_map is None:
+                raise ValueError(
+                    "model.use_depth_aux=True requires depth maps in the training batch"
+                )
+            (
+                depth_aux_loss,
+                depth_aux_pixel_loss,
+                depth_aux_grad_loss,
+                depth_aux_warmup,
+            ) = _compute_depth_aux_loss(
+                depth_aux_out,
+                depth_map,
+                gt_dmap,
+                depth_aux_cfg,
+                epoch,
+            )
+
         moe_aux_total = outputs.get("moe_aux_total")
         moe_aux_component = torch.tensor(0.0, device=samples.device)
         if moe_aux_total is not None:
@@ -477,7 +630,12 @@ def train_one_epoch(
             )
             uw_loss = uncertainty_weighter(density_loss, loss_ce_raw, loss_reg_raw)
             loss_sum = (
-                uw_loss + losses + moe_aux_component + fg_loss + prompt_align_loss
+                uw_loss
+                + losses
+                + moe_aux_component
+                + fg_loss
+                + prompt_align_loss
+                + depth_aux_loss
             )
         else:
             loss_sum = (
@@ -486,6 +644,7 @@ def train_one_epoch(
                 + moe_aux_component
                 + fg_loss
                 + prompt_align_loss
+                + depth_aux_loss
             )
 
         # SA-DGAT auxiliary losses: local count ranking loss
@@ -549,7 +708,8 @@ def train_one_epoch(
                 f"loss_sum is {loss_sum.item()} ("
                 f"task={loss_value:.4f}, "
                 f"density={density_loss.item():.4f}, "
-                f"moe_aux={moe_aux_component.item():.4f}), stopping training"
+                f"moe_aux={moe_aux_component.item():.4f}, "
+                f"depth_aux={depth_aux_loss.item():.4f}), stopping training"
             )
             logger.error(str(loss_dict_reduced))
             sys.exit(1)
@@ -564,6 +724,13 @@ def train_one_epoch(
             metric_logger.update(fg_loss=fg_loss.item())
         if prompt_align_loss.item() > 0:
             metric_logger.update(prompt_align_loss=prompt_align_loss.item())
+        if use_depth_aux:
+            metric_logger.update(
+                depth_aux_loss=depth_aux_loss.item(),
+                depth_aux_pixel_loss=depth_aux_pixel_loss.item(),
+                depth_aux_grad_loss=depth_aux_grad_loss.item(),
+                depth_aux_warmup=depth_aux_warmup,
+            )
 
         if fusion_mode == "sa_dgat":
             if sa_dgat_ranking_loss.item() > 0:

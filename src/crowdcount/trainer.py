@@ -197,10 +197,11 @@ class Trainer:
         self.use_depth_cross_attn = bool(
             getattr(cfg.model, "use_depth_cross_attn", False)
         )
+        self.use_depth_aux = bool(getattr(cfg.model, "use_depth_aux", False))
         self.use_depth_graph_prior = bool(
             getattr(getattr(cfg.model, "depth_graph_prior", None), "enabled", False)
         )
-        self._needs_depth = (
+        self._needs_depth_eval = (
             self.use_depth
             or self.use_depth_geo
             or self.use_depth_geo_post
@@ -209,6 +210,7 @@ class Trainer:
             or self.use_depth_cross_attn
             or self.use_depth_graph_prior
         )
+        self._needs_depth_train = self._needs_depth_eval or self.use_depth_aux
 
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"Number of trainable parameters: {n_params:,}")
@@ -285,7 +287,7 @@ class Trainer:
             sampler_train, cfg.data.batch_size, drop_last=True
         )
         train_collate = make_train_collate(
-            getattr(cfg.data, "augmentation", None), use_depth=self._needs_depth
+            getattr(cfg.data, "augmentation", None), use_depth=self._needs_depth_train
         )
         self.data_loader_train = DataLoader(
             train_set,
@@ -301,7 +303,7 @@ class Trainer:
             sampler=sampler_val,
             drop_last=False,
             collate_fn=collate_fn_crowd_depth
-            if self._needs_depth
+            if self._needs_depth_eval
             else collate_fn_crowd,
             num_workers=cfg.num_workers,
             worker_init_fn=_seed_worker,
@@ -433,7 +435,13 @@ class Trainer:
             )
 
             # TensorBoard
-            for key in ("loss_sum", "losses", "den_loss", "loss_ce"):
+            for key in (
+                "loss_sum",
+                "losses",
+                "den_loss",
+                "loss_ce",
+                "depth_aux_loss",
+            ):
                 if key in stat:
                     self.writer.add_scalar(f"loss/{key}", stat[key], epoch)
             if self.uncertainty_weighter is not None:
@@ -477,7 +485,7 @@ class Trainer:
                     self.model,
                     self.data_loader_val,
                     self.device,
-                    use_depth=self._needs_depth,
+                    use_depth=self._needs_depth_eval,
                     cfg=self.cfg,
                 )
                 t2 = time.time()
@@ -518,7 +526,7 @@ class Trainer:
                             self.model,
                             self.data_loader_val,
                             self.device,
-                            use_depth=self._needs_depth,
+                            use_depth=self._needs_depth_eval,
                         )
                         best_threshold, opt_mae, _ = search_optimal_threshold(
                             all_scores, gt_counts

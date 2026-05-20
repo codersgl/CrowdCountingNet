@@ -282,6 +282,23 @@ depth_cross_attn:
   depth_mid_channels: 64
   mode: window # window | global
 
+# Depth auxiliary supervision head (disabled by default)
+# Predicts the precomputed relative depth map from post-neck RGB features during
+# training only. It does not feed depth into the inference path.
+use_depth_aux: false
+depth_aux:
+  in_channels: 256
+  hidden_channels: 64
+  num_layers: 3
+  dropout: 0.0
+  detach_features: false
+  loss_type: smooth_l1 # smooth_l1 | l1 | mse
+  smooth_l1_beta: 0.1
+  loss_weight: 0.05
+  gradient_weight: 0.02
+  density_focus_weight: 0.5
+  warmup_epochs: 10
+
 # SEMC post-GCN enhancer (disabled by default; enable via CLI or override)
 use_semc_enhancer: false
 semc:

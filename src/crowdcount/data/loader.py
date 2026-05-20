@@ -42,8 +42,8 @@ def build_dataset(cfg: DictConfig):
     """Return (train_set, val_set).
 
     Args:
-        cfg: top-level hydra DictConfig; uses cfg.data.data_root,
-             cfg.data.patch, cfg.data.flip, cfg.model.use_depth.
+           cfg: top-level hydra DictConfig; uses cfg.data.data_root,
+               cfg.data.patch, cfg.data.flip, and model depth flags.
     """
     norm_mean, norm_std = _resolve_norm_stats(cfg)
     transform = standard_transforms.Compose(
@@ -73,7 +73,8 @@ def build_dataset(cfg: DictConfig):
     )
     depth_graph_prior = getattr(getattr(cfg, "model", None), "depth_graph_prior", None)
     use_depth_graph_prior = bool(getattr(depth_graph_prior, "enabled", False))
-    needs_depth = (
+    use_depth_aux = bool(getattr(getattr(cfg, "model", None), "use_depth_aux", False))
+    needs_depth_input = (
         use_depth
         or use_depth_geo
         or use_depth_geo_post
@@ -82,8 +83,12 @@ def build_dataset(cfg: DictConfig):
         or use_depth_cross_attn
         or use_depth_graph_prior
     )
+    needs_depth_train = needs_depth_input or use_depth_aux
+    needs_depth_eval = needs_depth_input
     depth_cfg = (
-        getattr(getattr(cfg, "model", None), "depth", None) if needs_depth else None
+        getattr(getattr(cfg, "model", None), "depth", None)
+        if (needs_depth_train or needs_depth_eval)
+        else None
     )
 
     # Extract augmentation configuration
@@ -101,7 +106,7 @@ def build_dataset(cfg: DictConfig):
         patch=cfg.data.patch,
         patch_size=int(cfg.data.get("patch_size", 128)),
         flip=cfg.data.flip,
-        use_depth=needs_depth,
+        use_depth=needs_depth_train,
         depth_cfg=depth_cfg,
         aug_cfg=aug_cfg,
         flip_prob=flip_prob,
@@ -114,7 +119,7 @@ def build_dataset(cfg: DictConfig):
         data_root,
         train=False,
         transform=transform,
-        use_depth=needs_depth,
+        use_depth=needs_depth_eval,
         depth_cfg=depth_cfg,
         aug_cfg=aug_cfg,
         flip_prob=flip_prob,

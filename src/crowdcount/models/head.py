@@ -2,6 +2,7 @@
 
 Contains:
   - Density_pred:           density map regression head
+    - DepthAuxHead:           auxiliary relative depth prediction head
     - ResidualDensityAttention: identity-safe residual density attention
   - SharedPredictionTrunk:  shared 2-layer conv trunk for regression & classification
   - DecoupledPredictionHead: independent trunks for classification & regression (decoupled)
@@ -374,6 +375,57 @@ class Density_pred(nn.Module):
         x = self.v2(x)
         x = self.v3(x)
         return self.conv_layers(x)
+
+
+class DepthAuxHead(nn.Module):
+    """Auxiliary relative depth prediction head for post-neck features."""
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        hidden_channels: int = 64,
+        num_layers: int = 3,
+        dropout: float = 0.0,
+        detach_features: bool = False,
+    ) -> None:
+        super().__init__()
+        if in_channels <= 0:
+            raise ValueError("in_channels must be positive")
+        if hidden_channels <= 0:
+            raise ValueError("hidden_channels must be positive")
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        if dropout < 0.0 or dropout >= 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+
+        layers: list[nn.Module] = []
+        current_channels = in_channels
+        for _ in range(num_layers - 1):
+            layers.extend(
+                [
+                    nn.Conv2d(
+                        current_channels,
+                        hidden_channels,
+                        kernel_size=3,
+                        padding=1,
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(hidden_channels),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+            if dropout > 0.0:
+                layers.append(nn.Dropout2d(p=dropout))
+            current_channels = hidden_channels
+        layers.append(nn.Conv2d(current_channels, 1, kernel_size=1))
+
+        self.proj = nn.Sequential(*layers)
+        self.detach_features = detach_features
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if self.detach_features:
+            features = features.detach()
+        return torch.sigmoid(self.proj(features))
 
 
 class Density_pred_MS(nn.Module):

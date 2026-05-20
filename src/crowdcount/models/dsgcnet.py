@@ -19,6 +19,7 @@ from crowdcount.models.head import (
     DecoupledPredictionHead,
     DeepClassificationModel,
     DeepRegressionModel,
+    DepthAuxHead,
     DensityAttentionMask,
     Density_pred,
     Density_pred_MS,
@@ -176,6 +177,8 @@ class DSGCnet(nn.Module):
         depth_attn_cfg: DictConfig | None = None,
         use_depth_cross_attn: bool = False,
         depth_cross_attn_cfg: DictConfig | None = None,
+        use_depth_aux: bool = False,
+        depth_aux_cfg: DictConfig | None = None,
         gcn_adaptive: bool = False,
         gcn_k: int = 4,
         gcn_k_min: int = 2,
@@ -253,6 +256,7 @@ class DSGCnet(nn.Module):
         self.use_depth_dual_vgg = use_depth_dual_vgg
         self.use_depth_attn = use_depth_attn
         self.use_depth_cross_attn = use_depth_cross_attn
+        self.use_depth_aux = use_depth_aux
 
         # Mutual exclusion: only one depth fusion path at a time
         _depth_flags = sum(
@@ -606,6 +610,17 @@ class DSGCnet(nn.Module):
             self.neck_moe = None
         self.neck_moe_position = neck_moe_position
         self.neck_moe_use_pyramid_context = neck_moe_use_pyramid_context
+        self.depth_aux_head: DepthAuxHead | None = (
+            DepthAuxHead(
+                in_channels=int(getattr(depth_aux_cfg, "in_channels", 256)),
+                hidden_channels=int(getattr(depth_aux_cfg, "hidden_channels", 64)),
+                num_layers=int(getattr(depth_aux_cfg, "num_layers", 3)),
+                dropout=float(getattr(depth_aux_cfg, "dropout", 0.0)),
+                detach_features=bool(getattr(depth_aux_cfg, "detach_features", False)),
+            )
+            if use_depth_aux
+            else None
+        )
 
         self.clip_prompt_density: CLIPPromptDensityGuide | None
         self.clip_prompt_density_apply_to = "density_only"
@@ -1697,6 +1712,10 @@ class DSGCnet(nn.Module):
 
             density = self.density_pred(density_features)
 
+        depth_aux_out = (
+            self.depth_aux_head(features_pa) if self.depth_aux_head is not None else None
+        )
+
         batch_size = features_list[0].shape[0]
 
         # Uncertainty map from density prediction (detach to avoid gradient leak)
@@ -1718,6 +1737,8 @@ class DSGCnet(nn.Module):
             "neck_moe_aux_total": neck_moe_aux_total,
             "neck_moe_weights": neck_moe_weights,
         }
+        if depth_aux_out is not None:
+            output_dict["depth_aux_out"] = depth_aux_out
         if self.neck_moe is not None:
             output_dict["moe_aux_losses"] = neck_moe_aux_losses
             output_dict["moe_aux_total"] = neck_moe_aux_total

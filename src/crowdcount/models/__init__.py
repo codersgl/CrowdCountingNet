@@ -19,6 +19,10 @@ def build_model(cfg: DictConfig, training: bool = False):
     """
     num_classes = 1
     backbone = build_backbone(cfg)
+    clip_prompt_density_cfg = getattr(cfg.model, "clip_prompt_density", None)
+    use_clip_prompt_density = bool(
+        getattr(cfg.model, "use_clip_prompt_density", False)
+    ) or bool(getattr(clip_prompt_density_cfg, "enabled", False))
     model = DSGCnet(
         backbone,
         row=cfg.model.row,
@@ -81,6 +85,8 @@ def build_model(cfg: DictConfig, training: bool = False):
             getattr(cfg.model, "density_attention_strength_init", 1e-3)
         ),
         density_attention_debug=getattr(cfg.model, "density_attention_debug", False),
+        use_clip_prompt_density=use_clip_prompt_density,
+        clip_prompt_density_cfg=clip_prompt_density_cfg,
         use_subpix_refine=getattr(cfg.model, "use_subpix_refine", False),
         subpix_refine_cfg=getattr(cfg.model, "subpix_refine", None),
         use_uncertainty=getattr(cfg.model, "use_uncertainty", False),
@@ -105,6 +111,8 @@ def build_model(cfg: DictConfig, training: bool = False):
         use_p2pnext_neck=getattr(cfg.model, "use_p2pnext_neck", False),
         p2pnext_neck_cfg=getattr(cfg.model, "p2pnext_neck", None),
         neck_acdr_cfg=getattr(cfg.model, "neck_acdr", None),
+        use_neck_moe=getattr(cfg.model, "use_neck_moe", False),
+        neck_moe_cfg=getattr(cfg.model, "neck_moe", None),
         use_deep_head=getattr(cfg.model, "use_deep_head", False),
         use_density_adaptive_fusion=getattr(
             cfg.model, "use_density_adaptive_fusion", False

@@ -1,5 +1,6 @@
 from crowdcount.plugins.gm import GateMechanism
 from crowdcount.plugins.concat_gate_fusion import ConcatGateFusion
+from crowdcount.plugins.clip_prompt_density import CLIPPromptDensityGuide
 from crowdcount.plugins.depth_cross_attention import DepthCrossAttentionFusion
 from crowdcount.plugins.depth_residual_gating import (
     DepthResidualGating,
@@ -20,6 +21,7 @@ from crowdcount.plugins.msaa import (
 
 __all__ = [
     "ConcatGateFusion",
+    "CLIPPromptDensityGuide",
     "DepthCrossAttentionFusion",
     "DepthResidualGating",
     "DepthResidualGatingV2",

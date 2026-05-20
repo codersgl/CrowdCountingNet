@@ -103,12 +103,22 @@ def train_one_epoch(
         else 0.005
     )
     model_moe_cfg = getattr(getattr(cfg, "model", None), "moe", None)
+    model_neck_moe_cfg = getattr(getattr(cfg, "model", None), "neck_moe", None)
     fusion_mode = str(getattr(getattr(cfg, "model", None), "fusion_mode", "gcn"))
+    use_neck_moe = bool(
+        getattr(getattr(cfg, "model", None), "use_neck_moe", False)
+        if cfg is not None
+        else False
+    )
     moe_aux_weight = (
         float(getattr(model_moe_cfg, "aux_loss_weight", 1.0))
         if model_moe_cfg is not None
         else 1.0
     )
+    if use_neck_moe and fusion_mode == "gcn" and model_neck_moe_cfg is not None:
+        moe_aux_weight = float(
+            getattr(model_neck_moe_cfg, "aux_loss_weight", moe_aux_weight)
+        )
     model_sdd_moe_cfg = getattr(getattr(cfg, "model", None), "sdd_moe", None)
     if fusion_mode == "sdd_moe" and model_sdd_moe_cfg is not None:
         moe_aux_weight = float(
@@ -128,6 +138,17 @@ def train_one_epoch(
     )
     fg_pos_weight = (
         float(getattr(cfg, "fg_pos_weight", 5.0)) if cfg is not None else 5.0
+    )
+    prompt_cfg = getattr(getattr(cfg, "model", None), "clip_prompt_density", None)
+    prompt_align_weight = (
+        float(getattr(prompt_cfg, "align_loss_weight", 0.0))
+        if prompt_cfg is not None
+        else 0.0
+    )
+    prompt_align_pos_weight = (
+        float(getattr(prompt_cfg, "align_pos_weight", 1.0))
+        if prompt_cfg is not None
+        else 1.0
     )
     use_depth = bool(
         getattr(getattr(cfg, "model", None), "use_depth", False)
@@ -419,6 +440,33 @@ def train_one_epoch(
                 * fg_loss_weight
             )
 
+        prompt_align_loss = torch.tensor(0.0, device=samples.device)
+        prompt_logits = outputs.get("clip_prompt_foreground_logits")
+        if prompt_logits is not None and prompt_align_weight > 0:
+            prompt_target = gt_dmap.float().clamp_min(0.0)
+            if prompt_target.shape[-2:] != prompt_logits.shape[-2:]:
+                prompt_target = F.interpolate(
+                    prompt_target,
+                    size=prompt_logits.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            prompt_target = torch.log1p(prompt_target)
+            target_max = prompt_target.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+            prompt_target = (prompt_target / target_max).to(dtype=prompt_logits.dtype)
+            prompt_align_loss = (
+                F.binary_cross_entropy_with_logits(
+                    prompt_logits,
+                    prompt_target,
+                    pos_weight=torch.tensor(
+                        prompt_align_pos_weight,
+                        device=samples.device,
+                        dtype=prompt_logits.dtype,
+                    ),
+                )
+                * prompt_align_weight
+            )
+
         if uncertainty_weighter is not None:
             # Learned weighting for the three main branches
             loss_ce_raw = loss_dict.get(
@@ -428,9 +476,17 @@ def train_one_epoch(
                 "loss_points", torch.tensor(0.0, device=samples.device)
             )
             uw_loss = uncertainty_weighter(density_loss, loss_ce_raw, loss_reg_raw)
-            loss_sum = uw_loss + losses + moe_aux_component + fg_loss
+            loss_sum = (
+                uw_loss + losses + moe_aux_component + fg_loss + prompt_align_loss
+            )
         else:
-            loss_sum = losses + density_loss + moe_aux_component + fg_loss
+            loss_sum = (
+                losses
+                + density_loss
+                + moe_aux_component
+                + fg_loss
+                + prompt_align_loss
+            )
 
         # SA-DGAT auxiliary losses: local count ranking loss
         sa_dgat_ranking_loss = torch.tensor(0.0, device=samples.device)
@@ -506,6 +562,8 @@ def train_one_epoch(
 
         if fg_logits is not None:
             metric_logger.update(fg_loss=fg_loss.item())
+        if prompt_align_loss.item() > 0:
+            metric_logger.update(prompt_align_loss=prompt_align_loss.item())
 
         if fusion_mode == "sa_dgat":
             if sa_dgat_ranking_loss.item() > 0:
@@ -535,7 +593,14 @@ def train_one_epoch(
                 moe_aux_raw=float(moe_aux_total.item()),
             )
             moe_aux_losses = outputs.get("moe_aux_losses") or {}
-            for key in ("l_balance", "l_decorr", "l_scale", "l_ssim"):
+            for key in (
+                "l_balance",
+                "l_decorr",
+                "l_scale",
+                "l_ssim",
+                "neck_l_balance",
+                "neck_entropy",
+            ):
                 if key in moe_aux_losses:
                     metric_logger.update(**{key: float(moe_aux_losses[key].item())})
 
@@ -543,6 +608,7 @@ def train_one_epoch(
                 getattr(model, "moe", None)
                 or getattr(model, "light_moe", None)
                 or getattr(model, "sdd_moe", None)
+                or getattr(model, "neck_moe", None)
             )
             if moe_module is not None:
                 # Temperature: direct attr or nested in router (SDDMoE)

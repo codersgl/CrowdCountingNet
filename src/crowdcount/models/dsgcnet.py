@@ -60,6 +60,8 @@ from crowdcount.plugins.cross_scale_density import (
     CrossScaleDensityRefinement,
     MultiScaleDensityFusion,
 )
+from crowdcount.plugins.clip_prompt_density import CLIPPromptDensityGuide
+from crowdcount.plugins.neck_moe import NeckScaleMoE
 
 
 class _DepthEncoder(nn.Module):
@@ -200,6 +202,8 @@ class DSGCnet(nn.Module):
         density_attention_max_delta: float = 0.5,
         density_attention_strength_init: float = 1e-3,
         density_attention_debug: bool = False,
+        use_clip_prompt_density: bool = False,
+        clip_prompt_density_cfg: DictConfig | None = None,
         use_subpix_refine: bool = False,
         subpix_refine_cfg: DictConfig | None = None,
         use_uncertainty: bool = False,
@@ -224,6 +228,8 @@ class DSGCnet(nn.Module):
         use_p2pnext_neck: bool = False,
         p2pnext_neck_cfg: DictConfig | None = None,
         neck_acdr_cfg: DictConfig | None = None,
+        use_neck_moe: bool = False,
+        neck_moe_cfg: DictConfig | None = None,
         use_deep_head: bool = False,
         use_density_adaptive_fusion: bool = False,
         density_adaptive_fusion_cfg: DictConfig | None = None,
@@ -281,6 +287,7 @@ class DSGCnet(nn.Module):
         self.use_dap_neck = use_dap_neck
         self.use_bifpn_neck = use_bifpn_neck
         self.use_p2pnext_neck = use_p2pnext_neck
+        self.use_neck_moe = use_neck_moe
         self.use_density_adaptive_fusion = use_density_adaptive_fusion
 
         _neck_flags = sum(
@@ -318,6 +325,55 @@ class DSGCnet(nn.Module):
             raise ValueError(
                 "use_msca_neck and use_msca_decoder are mutually exclusive; "
                 "enable only one."
+            )
+
+        if use_clip_prompt_density and use_msca_decoder:
+            raise ValueError(
+                "use_clip_prompt_density is not supported with use_msca_decoder because "
+                "MSCADecoder owns density prediction internally."
+            )
+
+        neck_moe_position = str(
+            getattr(neck_moe_cfg, "position", "pre_acdr")
+            if neck_moe_cfg is not None
+            else "pre_acdr"
+        ).lower()
+        if neck_moe_position not in {"pre_acdr", "post_acdr"}:
+            raise ValueError(
+                "neck_moe.position must be 'pre_acdr' or 'post_acdr', "
+                f"got {neck_moe_position!r}"
+            )
+        neck_moe_use_pyramid_context = bool(
+            getattr(neck_moe_cfg, "use_pyramid_context", True)
+            if neck_moe_cfg is not None
+            else True
+        )
+        neck_moe_allow_with_fusion_moe = bool(
+            getattr(neck_moe_cfg, "allow_with_fusion_moe", False)
+            if neck_moe_cfg is not None
+            else False
+        )
+        if use_neck_moe and use_msca_decoder:
+            raise ValueError(
+                "use_neck_moe is not supported with use_msca_decoder because "
+                "MSCADecoder owns the neck feature contract."
+            )
+        if (
+            use_neck_moe
+            and self.fusion_mode != "gcn"
+            and not neck_moe_allow_with_fusion_moe
+        ):
+            raise ValueError(
+                "use_neck_moe v1 is supported with fusion_mode='gcn'. Set "
+                "neck_moe.allow_with_fusion_moe=true only for explicit ablations."
+            )
+        if use_neck_moe and neck_moe_use_pyramid_context and (
+            use_msca_neck or use_rccformer_neck
+        ):
+            raise ValueError(
+                "neck_moe.use_pyramid_context=true requires a neck that returns "
+                "P3/P4/P5 intermediates. Set use_pyramid_context=false for "
+                "MSCA/RCCFormer neck ablations."
             )
 
         if self.fusion_mode not in {
@@ -529,6 +585,83 @@ class DSGCnet(nn.Module):
                     256, 512, 512, use_dcn=use_dcn, fpn_attention=fpn_attention
                 )
             self.density_pred = Density_pred()
+
+        if use_neck_moe:
+            _nm = neck_moe_cfg
+            _rates_raw = getattr(_nm, "context_rates", [1, 3, 5]) if _nm else [1, 3, 5]
+            self.neck_moe: NeckScaleMoE | None = NeckScaleMoE(
+                in_channels=int(getattr(_nm, "in_channels", 256)) if _nm else 256,
+                num_experts=int(getattr(_nm, "num_experts", 4)) if _nm else 4,
+                grid_stride=int(getattr(_nm, "grid_stride", 4)) if _nm else 4,
+                routing=str(getattr(_nm, "routing", "soft")) if _nm else "soft",
+                top_k=int(getattr(_nm, "top_k", 0)) if _nm else 0,
+                use_pyramid_context=neck_moe_use_pyramid_context,
+                lambda_balance=float(getattr(_nm, "lambda_balance", 0.01))
+                if _nm
+                else 0.01,
+                gate_init=float(getattr(_nm, "gate_init", 0.0)) if _nm else 0.0,
+                context_rates=tuple(int(rate) for rate in _rates_raw),
+            )
+        else:
+            self.neck_moe = None
+        self.neck_moe_position = neck_moe_position
+        self.neck_moe_use_pyramid_context = neck_moe_use_pyramid_context
+
+        self.clip_prompt_density: CLIPPromptDensityGuide | None
+        self.clip_prompt_density_apply_to = "density_only"
+        self.clip_prompt_density_debug = False
+        if use_clip_prompt_density:
+            _cpd = clip_prompt_density_cfg
+            _model_cfg = getattr(cfg, "model", cfg) if cfg is not None else None
+            _clip_model = str(
+                getattr(
+                    _cpd,
+                    "clip_model",
+                    getattr(_model_cfg, "backbone", "ViT-B-16")
+                    if _model_cfg is not None
+                    else "ViT-B-16",
+                )
+            )
+            self.clip_prompt_density_apply_to = str(
+                getattr(_cpd, "apply_to", "density_only")
+                if _cpd is not None
+                else "density_only"
+            )
+            if self.clip_prompt_density_apply_to not in {"density_only", "shared"}:
+                raise ValueError(
+                    "clip_prompt_density.apply_to must be 'density_only' or 'shared', "
+                    f"got {self.clip_prompt_density_apply_to!r}"
+                )
+            self.clip_prompt_density_debug = bool(
+                getattr(_cpd, "debug", False) if _cpd is not None else False
+            )
+            self.clip_prompt_density = CLIPPromptDensityGuide(
+                feature_channels=256,
+                clip_model=_clip_model,
+                pretrained=getattr(_cpd, "pretrained", True)
+                if _cpd is not None
+                else True,
+                positive_prompts=getattr(_cpd, "positive_prompts", None)
+                if _cpd is not None
+                else None,
+                negative_prompts=getattr(_cpd, "negative_prompts", None)
+                if _cpd is not None
+                else None,
+                temperature=float(getattr(_cpd, "temperature", 0.07))
+                if _cpd is not None
+                else 0.07,
+                hidden_dim=int(getattr(_cpd, "hidden_dim", 128))
+                if _cpd is not None
+                else 128,
+                max_delta=float(getattr(_cpd, "max_delta", 0.5))
+                if _cpd is not None
+                else 0.5,
+                strength_init=float(getattr(_cpd, "strength_init", 1e-3))
+                if _cpd is not None
+                else 1e-3,
+            )
+        else:
+            self.clip_prompt_density = None
         self.density_attention: (
             DensityAttentionMask
             | EnhancedDensityAttention
@@ -1328,9 +1461,12 @@ class DSGCnet(nn.Module):
             or (self.use_mamba_moe and self.mamba_moe is not None)
             or (self.use_sdd_moe and self.sdd_moe is not None)
             or self.light_moe is not None
+            or self.neck_moe is not None
         )
 
     def get_moe_gating_parameters(self) -> list[nn.Parameter]:
+        if self.neck_moe is not None:
+            return list(self.neck_moe.router.parameters())
         if self.light_moe is not None:
             return list(self.light_moe.router.parameters())
         if self.sdd_moe is not None:
@@ -1385,6 +1521,22 @@ class DSGCnet(nn.Module):
             "low_density_mean": low_mean,
         }
 
+    @staticmethod
+    def _clip_prompt_density_stats(
+        prompt_info: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        foreground_prob = prompt_info["foreground_prob"].detach().float()
+        positive_weight = prompt_info["positive_weight"].detach().float()
+        negative_weight = prompt_info["negative_weight"].detach().float()
+        strength = prompt_info["strength"].detach().float()
+        return {
+            "foreground_mean": foreground_prob.mean(),
+            "foreground_std": foreground_prob.std(unbiased=False),
+            "positive_weight_mean": positive_weight.mean(),
+            "negative_weight_mean": negative_weight.mean(),
+            "strength": strength.reshape(()),
+        }
+
     def forward(
         self,
         samples: torch.Tensor,
@@ -1393,6 +1545,10 @@ class DSGCnet(nn.Module):
         gt_density: torch.Tensor | None = None,
     ) -> dict:
         features = self.backbone(samples)
+        clip_prompt_info: dict[str, torch.Tensor] | None = None
+        neck_moe_aux_losses: dict[str, torch.Tensor] | None = None
+        neck_moe_aux_total: torch.Tensor | None = None
+        neck_moe_weights: torch.Tensor | None = None
 
         # Convert dict to list format for compatibility with MSAA and PA-FPN
         features_list = [features[0], features[1], features[2], features[3]]
@@ -1486,15 +1642,33 @@ class DSGCnet(nn.Module):
         else:
             assert self.pa is not None
             assert self.density_pred is not None
-            # For SA-DGAT, get FPN intermediates in a single pass
-            if self.use_sa_dgat:
+            need_neck_intermediates = self.use_sa_dgat or (
+                self.neck_moe is not None and self.neck_moe_use_pyramid_context
+            )
+            if need_neck_intermediates:
                 _pa_result = self.pa([c3, c4, c5], return_intermediates=True)
                 features_pa, fpn_intermediates = _pa_result
             else:
                 features_pa = self.pa([c3, c4, c5])  # [batch_size, 256, 16, 16]
 
+            if self.neck_moe is not None and self.neck_moe_position == "pre_acdr":
+                features_pa, neck_moe_aux_losses, neck_moe_weights = self.neck_moe(
+                    features_pa,
+                    pyramid=fpn_intermediates,
+                    training=self.training,
+                )
+                neck_moe_aux_total = neck_moe_aux_losses.get("total_aux")
+
             if self.neck_acdr is not None:
                 features_pa = self.neck_acdr(features_pa)
+
+            if self.neck_moe is not None and self.neck_moe_position == "post_acdr":
+                features_pa, neck_moe_aux_losses, neck_moe_weights = self.neck_moe(
+                    features_pa,
+                    pyramid=fpn_intermediates,
+                    training=self.training,
+                )
+                neck_moe_aux_total = neck_moe_aux_losses.get("total_aux")
 
             # Phase 1: MSAALite post-PA-FPN attention refinement
             if self.msaa_lite is not None:
@@ -1513,7 +1687,15 @@ class DSGCnet(nn.Module):
             if self.geo_attn_post is not None and depth_map is not None:
                 features_pa = self.geo_attn_post(features_pa, depth_map)
 
-            density = self.density_pred(features_pa)
+            density_features = features_pa
+            if self.clip_prompt_density is not None:
+                density_features, clip_prompt_info = self.clip_prompt_density(
+                    features_pa
+                )
+                if self.clip_prompt_density_apply_to == "shared":
+                    features_pa = density_features
+
+            density = self.density_pred(density_features)
 
         batch_size = features_list[0].shape[0]
 
@@ -1532,7 +1714,23 @@ class DSGCnet(nn.Module):
             "moe_aux_losses": None,
             "moe_aux_total": None,
             "moe_weights": None,
+            "neck_moe_aux_losses": neck_moe_aux_losses,
+            "neck_moe_aux_total": neck_moe_aux_total,
+            "neck_moe_weights": neck_moe_weights,
         }
+        if self.neck_moe is not None:
+            output_dict["moe_aux_losses"] = neck_moe_aux_losses
+            output_dict["moe_aux_total"] = neck_moe_aux_total
+            output_dict["moe_weights"] = neck_moe_weights
+
+        if clip_prompt_info is not None:
+            output_dict["clip_prompt_foreground_logits"] = clip_prompt_info[
+                "foreground_logits"
+            ]
+            if self.clip_prompt_density_debug:
+                output_dict["clip_prompt_density_stats"] = (
+                    self._clip_prompt_density_stats(clip_prompt_info)
+                )
 
         if self.use_multi_scale_density:
             if self.use_cross_scale_refine:

@@ -22,18 +22,24 @@ from crowdcount.models.ssim_loss import SSIMLoss
 class DummyDSGC(nn.Module):
     """Tiny model with the same output interface as DSGCnet."""
 
-    def __init__(self, num_queries: int = 20):
+    def __init__(self, num_queries: int = 20, return_prompt_logits: bool = False):
         super().__init__()
         self.num_queries = num_queries
+        self.return_prompt_logits = return_prompt_logits
         self.linear = nn.Linear(1, 1)  # just to have parameters
 
     def forward(self, samples):
         B = samples.shape[0]
-        return {
+        outputs = {
             "pred_logits": torch.rand(B, self.num_queries, 2, requires_grad=True),
             "pred_points": torch.rand(B, self.num_queries, 2, requires_grad=True) * 128,
             "density_out": torch.rand(B, 1, 16, 16, requires_grad=True),
         }
+        if self.return_prompt_logits:
+            outputs["clip_prompt_foreground_logits"] = torch.rand(
+                B, 1, 16, 16, requires_grad=True
+            )
+        return outputs
 
 
 def _make_targets(B: int = 2, n_pts: int = 3, device="cpu"):
@@ -144,6 +150,47 @@ def test_train_one_epoch_with_density_ssim_reports_metric():
 
     assert "den_ssim" in stat
     assert stat["den_ssim"] >= 0
+
+
+def test_train_one_epoch_with_prompt_alignment_reports_metric():
+    model = DummyDSGC(return_prompt_logits=True)
+    matcher = HungarianMatcher_Crowd(cost_class=1.0, cost_point=0.05)
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_ce": 1, "loss_points": 0.0002},
+        eos_coef=0.5,
+        losses=["labels", "points"],
+    )
+    density_criterion = nn.MSELoss(reduction="sum")
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    loader = [_make_train_batch()]
+    device = torch.device("cpu")
+    cfg = OmegaConf.create(
+        {
+            "density_loss_weight": 0.01,
+            "model": {
+                "clip_prompt_density": {
+                    "align_loss_weight": 0.001,
+                    "align_pos_weight": 2.0,
+                }
+            },
+        }
+    )
+
+    stat = train_one_epoch(
+        model,
+        criterion,
+        loader,
+        optimizer,
+        density_criterion,
+        device,
+        epoch=0,
+        cfg=cfg,
+    )
+
+    assert "prompt_align_loss" in stat
+    assert stat["prompt_align_loss"] > 0
 
 
 # ---------------------------------------------------------------------------

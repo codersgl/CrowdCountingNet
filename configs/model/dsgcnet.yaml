@@ -38,6 +38,33 @@ use_ms_density_head: false
 density_head_version: v1
 density_head_upsample: false # PixelShuffle 2× upsample (only for v3)
 
+# CLIP text-prompt guidance for density regression (disabled by default).
+# Applies a frozen prompt bank before the density head; v1 keeps point heads stable
+# by defaulting to density-only feature modulation.
+use_clip_prompt_density: false
+clip_prompt_density:
+  enabled: false
+  clip_model: ViT-B-16
+  pretrained: true # true -> default OpenCLIP tag; false for no-download smoke tests
+  positive_prompts:
+    - dense crowd of people
+    - sparse pedestrians in a public scene
+    - human heads in a crowd
+    - many people gathered together
+  negative_prompts:
+    - empty background without people
+    - road building tree background
+    - scene with no pedestrians
+    - non human background regions
+  temperature: 0.07
+  hidden_dim: 128
+  max_delta: 0.5
+  strength_init: 0.001
+  apply_to: density_only # density_only | shared
+  align_loss_weight: 0.0 # Optional BCE alignment against GT density foreground
+  align_pos_weight: 1.0
+  debug: false
+
 # RCCFormer-style neck: replace PA-FPN with MFFM + DEAB/ASAM density head
 use_rccformer_neck: false
 rccformer_deab_blocks: 2 # Number of DEAB blocks in density prediction branch
@@ -362,6 +389,24 @@ neck_acdr:
   dilation: 2 # Context path dilation rate
   hidden_ratio: 4 # Crowdedness estimator hidden-dim ratio
   gate_init: 0.0 # Residual gate init; 0 keeps identity behavior at startup
+
+# Scale-aware Neck MoE adapter (disabled by default)
+# Adds a residual mixture-of-experts refinement after the selected neck while
+# preserving the 256-channel stride-8 contract expected by density/GCN heads.
+use_neck_moe: false
+neck_moe:
+  position: pre_acdr # pre_acdr | post_acdr
+  in_channels: 256
+  num_experts: 4 # 3: local/mid/context; 4: + cross-scale expert
+  use_pyramid_context: true # consume P3/P4/P5 intermediates when the neck supports them
+  grid_stride: 4 # coarse routing patch size
+  routing: soft # soft | topk | sparse_topk; topk masks weights but does not reduce FLOPs in v1
+  top_k: 0 # set >0 when routing is topk/sparse_topk
+  context_rates: [1, 3, 5] # dilation rates for the context expert
+  lambda_balance: 0.01 # entropy balance loss weight inside the module
+  aux_loss_weight: 0.2 # global multiplier applied by the training loop
+  gate_init: 0.0 # residual gate init; 0 keeps identity behavior at startup
+  allow_with_fusion_moe: false # v1 default: avoid stacking multiple MoE routers
 
 # SPD-BiFPN neck (disabled by default)
 # Replaces PA-FPN with fast normalized weighted bidirectional fusion.

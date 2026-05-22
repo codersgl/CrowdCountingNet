@@ -18,6 +18,7 @@ from crowdcount.models.gcn import (
     ECAGCNModel,
     FeatureGCNProcessor,
     FeatureGraphBuilder,
+    FeatureTransformerProcessor,
     GATv2Model,
     GCNModel,
     SpatialPriorDensityGraphBuilder,
@@ -529,3 +530,48 @@ def test_feature_gcn_processor_gatv2(small_feature_map):
     )
     out = proc(small_feature_map)
     assert out.shape == small_feature_map.shape
+
+
+# ---------------------------------------------------------------------------
+# Feature Transformer Processor
+# ---------------------------------------------------------------------------
+
+
+def test_feature_transformer_processor_output_shape(small_feature_map):
+    proc = FeatureTransformerProcessor(
+        in_channels=256,
+        embed_dim=64,
+        num_heads=4,
+        window_size=4,
+        num_layers=1,
+    )
+    out = proc(small_feature_map)
+    assert out.shape == small_feature_map.shape
+
+
+def test_feature_transformer_processor_padding_shape():
+    feature_maps = torch.randn(1, 256, 7, 10)
+    proc = FeatureTransformerProcessor(
+        in_channels=256,
+        embed_dim=64,
+        num_heads=4,
+        window_size=4,
+        num_layers=1,
+    )
+    out = proc(feature_maps)
+    assert out.shape == feature_maps.shape
+
+
+def test_feature_transformer_processor_identity_init():
+    feature_maps = torch.randn(1, 256, 8, 8)
+    proc = FeatureTransformerProcessor(
+        in_channels=256,
+        embed_dim=64,
+        num_heads=4,
+        window_size=4,
+        num_layers=1,
+        gate_init=0.0,
+    ).eval()
+    with torch.no_grad():
+        out = proc(feature_maps)
+    assert torch.allclose(out, feature_maps, atol=1e-6)

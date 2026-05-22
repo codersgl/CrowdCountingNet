@@ -11,6 +11,7 @@ from crowdcount.models.gcn import (
     DensityAdaptiveFusion,
     DensityGCNProcessor,
     FeatureGCNProcessor,
+    FeatureTransformerProcessor,
     SuperNodeGCNProcessor,
     compute_uncertainty,
 )
@@ -213,6 +214,8 @@ class DSGCnet(nn.Module):
         uncertainty_scale: float = 6.0,
         gcn_aniso: bool = False,
         gcn_conv_type: str = "gcn",
+        feature_stream_type: str = "gcn",
+        feature_transformer_cfg: DictConfig | None = None,
         use_fg_branch: bool = False,
         fg_branch_base: float = 0.5,
         fg_branch_scale: float = 0.5,
@@ -283,6 +286,7 @@ class DSGCnet(nn.Module):
         self.density_attention_debug = density_attention_debug
         self.use_subpix_refine = use_subpix_refine
         self._gcn_mode = gcn_mode
+        self.feature_stream_type = str(feature_stream_type).lower()
         self.use_uncertainty = use_uncertainty
         self.use_msca_decoder = use_msca_decoder
         self.use_decoupled_head = use_decoupled_head
@@ -391,6 +395,11 @@ class DSGCnet(nn.Module):
         }:
             raise ValueError(
                 f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', 'graph_attn_moe', 'mamba_moe', 'sdd_moe', or 'sa_dgat'"
+            )
+        if self.feature_stream_type not in {"gcn", "transformer", "window_transformer"}:
+            raise ValueError(
+                "feature_stream_type must be 'gcn', 'transformer', or "
+                f"'window_transformer', got {feature_stream_type!r}"
             )
 
         density_cfg = (
@@ -965,15 +974,45 @@ class DSGCnet(nn.Module):
                         else None
                     ),
                 )
-                self.feature_gcn: FeatureGCNProcessor | None = FeatureGCNProcessor(
-                    k=gcn_k,
-                    adaptive=gcn_adaptive,
-                    k_min=gcn_k_min,
-                    k_max=gcn_k_max,
-                    sim_threshold=gcn_sim_threshold,
-                    anisotropic=gcn_aniso,
-                    conv_type=gcn_conv_type,
-                )
+                if self.feature_stream_type in {"transformer", "window_transformer"}:
+                    _ft_cfg = feature_transformer_cfg
+                    self.feature_gcn: FeatureGCNProcessor | FeatureTransformerProcessor | None = FeatureTransformerProcessor(
+                        in_channels=256,
+                        embed_dim=int(getattr(_ft_cfg, "embed_dim", 128))
+                        if _ft_cfg is not None
+                        else 128,
+                        num_heads=int(getattr(_ft_cfg, "num_heads", 4))
+                        if _ft_cfg is not None
+                        else 4,
+                        window_size=int(getattr(_ft_cfg, "window_size", 8))
+                        if _ft_cfg is not None
+                        else 8,
+                        num_layers=int(getattr(_ft_cfg, "num_layers", 1))
+                        if _ft_cfg is not None
+                        else 1,
+                        mlp_ratio=float(getattr(_ft_cfg, "mlp_ratio", 4.0))
+                        if _ft_cfg is not None
+                        else 4.0,
+                        dropout=float(getattr(_ft_cfg, "dropout", 0.0))
+                        if _ft_cfg is not None
+                        else 0.0,
+                        gate_init=float(getattr(_ft_cfg, "gate_init", 0.0))
+                        if _ft_cfg is not None
+                        else 0.0,
+                        mode=str(getattr(_ft_cfg, "mode", "window"))
+                        if _ft_cfg is not None
+                        else "window",
+                    )
+                else:
+                    self.feature_gcn = FeatureGCNProcessor(
+                        k=gcn_k,
+                        adaptive=gcn_adaptive,
+                        k_min=gcn_k_min,
+                        k_max=gcn_k_max,
+                        sim_threshold=gcn_sim_threshold,
+                        anisotropic=gcn_aniso,
+                        conv_type=gcn_conv_type,
+                    )
                 self.alpha: nn.Parameter | None = nn.Parameter(
                     torch.ones(3, dtype=torch.float32)
                 )

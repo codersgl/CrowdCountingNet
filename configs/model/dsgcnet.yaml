@@ -132,6 +132,20 @@ gcn_aniso: false
 # When gcn_conv_type is set, it takes priority over gcn_aniso.
 gcn_conv_type: gcn
 
+# Feature stream architecture inside the default dual-stream fusion path.
+# gcn keeps the original FeatureGCN/GAT branch; transformer replaces only the
+# feature-similarity branch while leaving the density-guided GCN/GAT branch intact.
+feature_stream_type: gcn # gcn | transformer | window_transformer
+feature_transformer:
+  embed_dim: 128
+  num_heads: 4
+  window_size: 8
+  num_layers: 1
+  mlp_ratio: 4.0
+  dropout: 0.0
+  gate_init: 0.0 # tanh gate init; 0 starts as identity for stable ablations
+  mode: window # window | global
+
 moe:
   top_k: 3 # all experts active (soft routing); kept for API compat
   temperature_init: 1.0

@@ -723,6 +723,36 @@ def test_cross_stream_mode_does_not_create_external_gm() -> None:
     assert model.gm is None
 
 
+def test_feature_transformer_stream_forward() -> None:
+    backbone = TinyVGGBackbone()
+    feature_transformer_cfg = OmegaConf.create(
+        {
+            "embed_dim": 64,
+            "num_heads": 4,
+            "window_size": 4,
+            "num_layers": 1,
+            "dropout": 0.0,
+            "gate_init": 0.0,
+            "mode": "window",
+        }
+    )
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        gcn_conv_type="gatv2",
+        feature_stream_type="transformer",
+        feature_transformer_cfg=feature_transformer_cfg,
+        use_gm=True,
+        use_density_attention=True,
+    ).eval()
+    with torch.no_grad():
+        out = model(torch.zeros(1, 3, 128, 128))
+    assert out["pred_logits"].shape[0] == 1
+    assert out["pred_points"].shape[0] == 1
+    assert out["density_out"].shape[0] == 1
+
+
 # ---------------------------------------------------------------------------
 # graph_attn_moe fusion mode
 # ---------------------------------------------------------------------------

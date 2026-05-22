@@ -1,7 +1,8 @@
 """GCN modules for DSGCNet.
 
 Density-guided and feature-guided graph convolutional processors.
-Supports fixed-k, adaptive, uncertainty-guided, and super-node graph construction strategies.
+Supports fixed-k, adaptive, uncertainty-guided, super-node graph construction strategies,
+and a windowed Transformer processor for feature-stream ablations.
 Also contains DensityAdaptiveFusion for density-conditioned multi-stream fusion.
 """
 
@@ -713,6 +714,219 @@ class GATv2Model(nn.Module):
         h = F.dropout(h, p=self.dropout, training=self.training)
 
         return h + self.res_proj(residual)
+
+
+class FeatureTransformerBlock(nn.Module):
+    """Window/global self-attention block for feature-stream replacement."""
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        embed_dim: int = 128,
+        num_heads: int = 4,
+        window_size: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        gate_init: float = 0.0,
+        mode: str = "window",
+    ) -> None:
+        super().__init__()
+        if embed_dim <= 0:
+            raise ValueError(f"embed_dim must be positive, got {embed_dim}")
+        if num_heads <= 0:
+            raise ValueError(f"num_heads must be positive, got {num_heads}")
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
+            )
+        if mode not in {"window", "global"}:
+            raise ValueError(f"mode must be 'window' or 'global', got {mode!r}")
+        if mode == "window" and window_size <= 0:
+            raise ValueError(
+                f"window_size must be positive for window mode, got {window_size}"
+            )
+
+        self.in_channels = int(in_channels)
+        self.embed_dim = int(embed_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.embed_dim // self.num_heads
+        self.window_size = int(window_size)
+        self.dropout = float(dropout)
+        self.mode = mode
+
+        self.norm1 = nn.GroupNorm(1, in_channels)
+        self.qkv_proj = nn.Conv2d(in_channels, embed_dim * 3, 1, bias=False)
+        self.out_proj = nn.Sequential(
+            nn.Conv2d(embed_dim, in_channels, 1, bias=False),
+            nn.BatchNorm2d(in_channels),
+        )
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout2d(dropout)
+        self.attn_gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+        hidden_channels = max(int(in_channels * mlp_ratio), in_channels)
+        self.norm2 = nn.GroupNorm(1, in_channels)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, 1),
+            nn.GELU(),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(hidden_channels, in_channels, 1),
+            nn.BatchNorm2d(in_channels),
+        )
+        self.mlp_gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(self, feature_maps: torch.Tensor) -> torch.Tensor:
+        if feature_maps.dim() != 4:
+            raise ValueError(
+                f"feature_maps must be 4D, got {tuple(feature_maps.shape)}"
+            )
+
+        query, key, value = self.qkv_proj(self.norm1(feature_maps)).chunk(3, dim=1)
+        if self.mode == "global":
+            attention_out = self._global_attention(query, key, value)
+        else:
+            attention_out = self._window_attention(query, key, value)
+
+        attention_out = self.proj_drop(self.out_proj(attention_out))
+        feature_maps = feature_maps + self.attn_gate.tanh().to(
+            dtype=feature_maps.dtype
+        ) * attention_out
+
+        mlp_out = self.mlp(self.norm2(feature_maps))
+        return feature_maps + self.mlp_gate.tanh().to(dtype=feature_maps.dtype) * mlp_out
+
+    def _global_attention(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        batch_size, channels, height, width = query.shape
+        query_seq = query.flatten(2).transpose(1, 2)
+        key_seq = key.flatten(2).transpose(1, 2)
+        value_seq = value.flatten(2).transpose(1, 2)
+        out = self._scaled_dot_product(query_seq, key_seq, value_seq)
+        return out.transpose(1, 2).reshape(batch_size, channels, height, width)
+
+    def _window_attention(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        batch_size, channels, height, width = query.shape
+        window_size = self.window_size
+        pad_h = (window_size - height % window_size) % window_size
+        pad_w = (window_size - width % window_size) % window_size
+        if pad_h or pad_w:
+            query = F.pad(query, (0, pad_w, 0, pad_h))
+            key = F.pad(key, (0, pad_w, 0, pad_h))
+            value = F.pad(value, (0, pad_w, 0, pad_h))
+
+        padded_h, padded_w = query.shape[-2:]
+        query_windows = self._partition_windows(query, window_size)
+        key_windows = self._partition_windows(key, window_size)
+        value_windows = self._partition_windows(value, window_size)
+        out_windows = self._scaled_dot_product(
+            query_windows, key_windows, value_windows
+        )
+        out = self._reverse_windows(
+            out_windows,
+            batch_size=batch_size,
+            channels=channels,
+            height=padded_h,
+            width=padded_w,
+            window_size=window_size,
+        )
+        return out[:, :, :height, :width]
+
+    @staticmethod
+    def _partition_windows(feature_maps: torch.Tensor, window_size: int) -> torch.Tensor:
+        batch_size, channels, height, width = feature_maps.shape
+        feature_maps = feature_maps.view(
+            batch_size,
+            channels,
+            height // window_size,
+            window_size,
+            width // window_size,
+            window_size,
+        )
+        feature_maps = feature_maps.permute(0, 2, 4, 3, 5, 1).contiguous()
+        return feature_maps.view(-1, window_size * window_size, channels)
+
+    @staticmethod
+    def _reverse_windows(
+        feature_maps: torch.Tensor,
+        batch_size: int,
+        channels: int,
+        height: int,
+        width: int,
+        window_size: int,
+    ) -> torch.Tensor:
+        feature_maps = feature_maps.view(
+            batch_size,
+            height // window_size,
+            width // window_size,
+            window_size,
+            window_size,
+            channels,
+        )
+        feature_maps = feature_maps.permute(0, 5, 1, 3, 2, 4).contiguous()
+        return feature_maps.view(batch_size, channels, height, width)
+
+    def _scaled_dot_product(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        batch_windows, tokens, _ = query.shape
+        query = query.view(
+            batch_windows, tokens, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key = key.view(batch_windows, tokens, self.num_heads, self.head_dim).transpose(
+            1, 2
+        )
+        value = value.view(
+            batch_windows, tokens, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+        attn = torch.matmul(query, key.transpose(-2, -1)) * (self.head_dim**-0.5)
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+        out = torch.matmul(attn, value)
+        return out.transpose(1, 2).contiguous().view(
+            batch_windows, tokens, self.embed_dim
+        )
+
+
+class FeatureTransformerProcessor(nn.Module):
+    """Feature-stream Transformer processor with the same contract as FeatureGCN."""
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        embed_dim: int = 128,
+        num_heads: int = 4,
+        window_size: int = 8,
+        num_layers: int = 1,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        gate_init: float = 0.0,
+        mode: str = "window",
+    ) -> None:
+        super().__init__()
+        if num_layers <= 0:
+            raise ValueError(f"num_layers must be positive, got {num_layers}")
+        self.blocks = nn.Sequential(
+            *[
+                FeatureTransformerBlock(
+                    in_channels=in_channels,
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    window_size=window_size,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    gate_init=gate_init,
+                    mode=mode,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(self, feature_maps: torch.Tensor) -> torch.Tensor:
+        return self.blocks(feature_maps)
 
 
 class DensityGCNProcessor(nn.Module):

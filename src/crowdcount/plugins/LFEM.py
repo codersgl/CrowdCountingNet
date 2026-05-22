@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
-import math
 
 ##### FreDFT: Frequency Domain Fusion Transformer for Visible-Infrared Object Detection
 #  local feature enhancement module (LFEM)
@@ -11,7 +12,16 @@ class DeformConv2d(nn.Module):
     带调制的可变形卷积V2（Deformable ConvNets v2）
     对应结构图绿色Df-Conv模块，核心功能：自适应学习卷积核的采样偏移，精准捕捉形变目标、不规则边缘的局部特征
     """
-    def __init__(self, inc, outc, kernel_size=3, padding=1, stride=1, bias=None, modulation=False):
+    def __init__(
+        self,
+        inc: int,
+        outc: int,
+        kernel_size: int = 3,
+        padding: int = 1,
+        stride: int = 1,
+        bias: bool = False,
+        modulation: bool = False,
+    ):
         super(DeformConv2d, self).__init__()
         self.kernel_size = kernel_size
         self.padding = padding
@@ -22,28 +32,33 @@ class DeformConv2d(nn.Module):
         # 偏移量预测卷积：输出每个采样点的x/y偏移
         self.p_conv = nn.Conv2d(inc, 2 * kernel_size * kernel_size, kernel_size=3, padding=1, stride=stride)
         nn.init.constant_(self.p_conv.weight, 0)
-        self.p_conv.register_full_backward_hook(self._set_lr)
+        if self.p_conv.bias is not None:
+            nn.init.constant_(self.p_conv.bias, 0)
+            self.p_conv.bias.register_hook(self._scale_grad)
+        self.p_conv.weight.register_hook(self._scale_grad)
         # 调制门控（V2核心）：学习每个采样点的权重
         self.modulation = modulation
         if modulation:
             self.m_conv = nn.Conv2d(inc, kernel_size * kernel_size, kernel_size=3, padding=1, stride=stride)
             nn.init.constant_(self.m_conv.weight, 0)
-            self.m_conv.register_full_backward_hook(self._set_lr)
+            if self.m_conv.bias is not None:
+                nn.init.constant_(self.m_conv.bias, 0)
+                self.m_conv.bias.register_hook(self._scale_grad)
+            self.m_conv.weight.register_hook(self._scale_grad)
 
     @staticmethod
-    def _set_lr(module, grad_input, grad_output):
+    def _scale_grad(grad: torch.Tensor) -> torch.Tensor:
         """偏移量学习率缩放，保证训练稳定性"""
-        grad_input = tuple(grad_input[i] * 0.1 for i in range(len(grad_input)))
-        grad_output = tuple(grad_output[i] * 0.1 for i in range(len(grad_output)))
+        return grad * 0.1
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 预测采样偏移量
         offset = self.p_conv(x)
+        m: torch.Tensor | None = None
         # 预测调制权重（V2）
         if self.modulation:
             m = torch.sigmoid(self.m_conv(x))
 
-        dtype = offset.data.type()
         ks = self.kernel_size
         N = offset.size(1) // 2
 
@@ -51,7 +66,7 @@ class DeformConv2d(nn.Module):
             x = self.zero_padding(x)
 
         # 计算最终采样坐标
-        p = self._get_p(offset, dtype)
+        p = self._get_p(offset)
         p = p.contiguous().permute(0, 2, 3, 1)
         # 双线性插值的四个邻域坐标
         q_lt = p.detach().floor()
@@ -83,7 +98,7 @@ class DeformConv2d(nn.Module):
                    g_rt.unsqueeze(dim=1) * x_q_rt
 
         # 调制权重加权（V2核心）
-        if self.modulation:
+        if m is not None:
             m = m.contiguous().permute(0, 2, 3, 1)
             m = m.unsqueeze(dim=1)
             m = torch.cat([m for _ in range(x_offset.size(1))], dim=1)
@@ -95,29 +110,40 @@ class DeformConv2d(nn.Module):
         return out
 
     # 生成卷积核的基准采样坐标
-    def _get_p_n(self, N, dtype):
+    def _get_p_n(self, N, device, dtype):
         p_n_x, p_n_y = torch.meshgrid(
-            torch.arange(-(self.kernel_size-1)//2, (self.kernel_size-1)//2+1),
-            torch.arange(-(self.kernel_size-1)//2, (self.kernel_size-1)//2+1), indexing='ij')
+            torch.arange(
+                -(self.kernel_size - 1) // 2,
+                (self.kernel_size - 1) // 2 + 1,
+                device=device,
+                dtype=dtype,
+            ),
+            torch.arange(
+                -(self.kernel_size - 1) // 2,
+                (self.kernel_size - 1) // 2 + 1,
+                device=device,
+                dtype=dtype,
+            ),
+            indexing='ij')
         p_n = torch.cat([torch.flatten(p_n_x), torch.flatten(p_n_y)], 0)
-        p_n = p_n.view(1, 2*N, 1, 1).type(dtype)
+        p_n = p_n.view(1, 2*N, 1, 1)
         return p_n
 
     # 生成每个像素的基准中心坐标
-    def _get_p_0(self, h, w, N, dtype):
+    def _get_p_0(self, h, w, N, device, dtype):
         p_0_x, p_0_y = torch.meshgrid(
-            torch.arange(1, h*self.stride+1, self.stride),
-            torch.arange(1, w*self.stride+1, self.stride), indexing='ij')
+            torch.arange(1, h*self.stride+1, self.stride, device=device, dtype=dtype),
+            torch.arange(1, w*self.stride+1, self.stride, device=device, dtype=dtype), indexing='ij')
         p_0_x = torch.flatten(p_0_x).view(1, 1, h, w).repeat(1, N, 1, 1)
         p_0_y = torch.flatten(p_0_y).view(1, 1, h, w).repeat(1, N, 1, 1)
-        p_0 = torch.cat([p_0_x, p_0_y], 1).type(dtype)
+        p_0 = torch.cat([p_0_x, p_0_y], 1)
         return p_0
 
     # 生成最终采样坐标 = 基准坐标 + 核偏移 + 学习到的偏移量
-    def _get_p(self, offset, dtype):
+    def _get_p(self, offset):
         N, h, w = offset.size(1)//2, offset.size(2), offset.size(3)
-        p_n = self._get_p_n(N, dtype)
-        p_0 = self._get_p_0(h, w, N, dtype)
+        p_n = self._get_p_n(N, offset.device, offset.dtype)
+        p_0 = self._get_p_0(h, w, N, offset.device, offset.dtype)
         p = p_0 + p_n + offset
         return p
 
@@ -155,18 +181,31 @@ def channel_shuffle(x, groups):
     return x
 
 # -------------------------- 基础卷积工具函数 --------------------------
-def autopad(k, p=None):
+def autopad(
+    k: int | tuple[int, int], p: int | tuple[int, int] | None = None
+) -> int | tuple[int, int]:
     """自动计算padding，保证输出尺寸与输入一致"""
-    if p is None:
-        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]
-    return p
+    if p is not None:
+        return p
+    if isinstance(k, int):
+        return k // 2
+    return (k[0] // 2, k[1] // 2)
 
 class Conv(nn.Module):
     """
     标准CBS卷积块：Conv + BatchNorm + SiLU
     对应结构图中所有黄色Conv模块，是LFEM的基础卷积单元
     """
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        k: int | tuple[int, int] = 1,
+        s: int | tuple[int, int] = 1,
+        p: int | tuple[int, int] | None = None,
+        g: int = 1,
+        act: bool | nn.Module = True,
+    ):
         super(Conv, self).__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
@@ -181,7 +220,7 @@ class LFEM(nn.Module):
     LFEM: Local Feature Enhancement Module 局部特征增强模块
     完整对应结构图全流程，核心功能：通过多分支多感受野卷积，捕捉多尺度、形变、细节特征，实现局部特征的全面增强
     """
-    def __init__(self, in_channels):
+    def __init__(self, in_channels: int):
         super(LFEM, self).__init__()
         # 输入1×1卷积，对应结构图最左侧Conv，调整通道、降低计算量
         self.CBSk1 = Conv(in_channels, in_channels, 1, 1)
@@ -212,7 +251,7 @@ class LFEM(nn.Module):
 
         self.last = Conv(in_channels, in_channels, 1, 1)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         rgb_fea = x  # 输入特征 [B, C, H, W]
         # 步骤1：1×1卷积预处理，统一通道维度
         rgb_fea0 = self.CBSk1(rgb_fea)
@@ -223,8 +262,9 @@ class LFEM(nn.Module):
         rgb_fea3 = self.silu(self.bn(self.dfconv(rgb_fea0)))  # 可变形卷积分支
         rgb_fea4 = self.dwconv(rgb_fea0)    # 深度可分离卷积分支
         # 步骤3：多分支特征拼接，对应结构图C拼接环节
-        # rgb_fea_cat = torch.cat([rgb_fea1, rgb_fea2, rgb_fea3, rgb_fea4], dim=1)
-        rgb_fea_cat = rgb_fea1 * gate_weights[:,0,:,:,:] + rgb_fea2 * gate_weights[:,0,:,:,:] + rgb_fea3 * gate_weights[:,0,:,:,:] + rgb_fea4 * gate_weights[:,0,:,:,:]
+        branches = torch.stack([rgb_fea1, rgb_fea2, rgb_fea3, rgb_fea4], dim=1)
+        gate_weights = gate_weights.to(device=branches.device, dtype=branches.dtype)
+        rgb_fea_cat = (branches * gate_weights).sum(dim=1)
         rgb_fea_cat = self.ca(rgb_fea_cat)
         new_rgb_fea = self.last(rgb_fea_cat)
         # # 步骤4：通道混洗，实现跨分支特征交互
@@ -238,16 +278,17 @@ class LFEM(nn.Module):
 # -------------------------- 门控权重生成网络 --------------------------
 class GatedWeightGenerator(nn.Module):
     """门控权重生成网络（对应图左侧模块）：生成各专家的权重"""
-    def __init__(self, in_channels, num_experts=3):
+    def __init__(self, in_channels: int, num_experts: int = 3):
         super().__init__()
+        hidden_channels = max(in_channels // 2, 1)
         self.aap = nn.AdaptiveAvgPool2d(1)  # AAP: 自适应平均池化
         self.amp = nn.AdaptiveMaxPool2d(1)
-        self.mlp1 = nn.Linear(in_channels, in_channels // 2)  # 第一个MLP
+        self.mlp1 = nn.Linear(in_channels, hidden_channels)  # 第一个MLP
         self.relu = nn.ReLU(inplace=True)
-        self.mlp2 = nn.Linear(in_channels // 2, num_experts)  # 第二个MLP（输出专家数）
+        self.mlp2 = nn.Linear(hidden_channels, num_experts)  # 第二个MLP（输出专家数）
         self.softmax = nn.Softmax(dim=1)  # 归一化权重
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch_size, in_channels, H, W)
         out = self.aap(x) + self.amp(x)  # (bs, in_channels, 1, 1)
         out = out.flatten(1)  # 展平为 (bs, in_channels)
@@ -261,20 +302,21 @@ class GatedWeightGenerator(nn.Module):
 ##########################################################################
 ## Channel Attention Layer
 class CALayer(nn.Module):
-    def __init__(self, channel, reduction=16, bias=False):
+    def __init__(self, channel: int, reduction: int = 16, bias: bool = False):
         super(CALayer, self).__init__()
+        reduced_channels = max(channel // reduction, 1)
         # global average pooling: feature --> point
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         # feature channel downscale and upscale --> channel weight
         self.conv_du = nn.Sequential(
-            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=bias),
+            nn.Conv2d(channel, reduced_channels, 1, padding=0, bias=bias),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=bias),
+            nn.Conv2d(reduced_channels, channel, 1, padding=0, bias=bias),
             nn.Sigmoid()
         )
         # self.upsample = nn.Upsample(scale_factor=4, mode='bilinear')
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.avg_pool(x)
         y = self.conv_du(y)
         return x * y

@@ -57,6 +57,7 @@ from crowdcount.plugins.sdd_moe import SDDMoE
 from crowdcount.plugins.sa_dgat import SADGATFusion
 from crowdcount.plugins.msaa import MSAAGate, MSAALite, MsaaAdaptiveLayer
 from crowdcount.plugins.MSCA import MSCADecoder, MSCANeck
+from crowdcount.plugins.lfem_neck import LFEMMultiScaleNeck
 from crowdcount.plugins.rccformer import DensityPredDEAB, MFFMNeck
 from crowdcount.plugins.cross_scale_density import (
     CrossScaleDensityRefinement,
@@ -233,6 +234,8 @@ class DSGCnet(nn.Module):
         bifpn_neck_cfg: DictConfig | None = None,
         use_p2pnext_neck: bool = False,
         p2pnext_neck_cfg: DictConfig | None = None,
+        use_lfem_neck: bool = False,
+        lfem_neck_cfg: DictConfig | None = None,
         neck_acdr_cfg: DictConfig | None = None,
         use_neck_moe: bool = False,
         neck_moe_cfg: DictConfig | None = None,
@@ -295,6 +298,7 @@ class DSGCnet(nn.Module):
         self.use_dap_neck = use_dap_neck
         self.use_bifpn_neck = use_bifpn_neck
         self.use_p2pnext_neck = use_p2pnext_neck
+        self.use_lfem_neck = use_lfem_neck
         self.use_neck_moe = use_neck_moe
         self.use_density_adaptive_fusion = use_density_adaptive_fusion
 
@@ -306,6 +310,7 @@ class DSGCnet(nn.Module):
                 use_dap_neck,
                 use_bifpn_neck,
                 use_p2pnext_neck,
+                use_lfem_neck,
             ]
         )
         if _neck_flags > 1:
@@ -314,7 +319,15 @@ class DSGCnet(nn.Module):
                 f"use_msca_neck={use_msca_neck}, use_msca_decoder={use_msca_decoder}, "
                 f"use_rccformer_neck={use_rccformer_neck}, use_dap_neck={use_dap_neck}, "
                 f"use_bifpn_neck={use_bifpn_neck}, "
-                f"use_p2pnext_neck={use_p2pnext_neck}"
+                f"use_p2pnext_neck={use_p2pnext_neck}, "
+                f"use_lfem_neck={use_lfem_neck}"
+            )
+
+        if use_lfem_neck and use_msaa and msaa_variant == "legacy":
+            raise ValueError(
+                "use_lfem_neck does not support legacy MSAA because legacy MSAA "
+                "changes C3/C4/C5 to 1280 channels. Use msaa_variant='lite' or "
+                "disable use_msaa for LFEM neck ablations."
             )
 
         if use_depth_cross_attn and use_msca_decoder:
@@ -548,6 +561,34 @@ class DSGCnet(nn.Module):
                 output_level=str(getattr(_pn, "output_level", "p3"))
                 if _pn
                 else "p3",
+            )
+            self.density_pred = _build_standard_density_head()
+        elif use_lfem_neck:
+            # LFEM neck: three parallel LFEM branches over C3/C4/C5.
+            self.msca_decoder = None
+            _ln = lfem_neck_cfg
+            lfem_feature_size = int(getattr(_ln, "feature_size", 256)) if _ln else 256
+            if lfem_feature_size != 256:
+                raise ValueError(
+                    "lfem_neck.feature_size must be 256 because DSGCNet's "
+                    "density, GCN, and point heads are wired for 256 channels."
+                )
+            self.pa = LFEMMultiScaleNeck(
+                C3_size=256,
+                C4_size=512,
+                C5_size=512,
+                feature_size=lfem_feature_size,
+                use_spd_downsample=bool(
+                    getattr(_ln, "use_spd_downsample", True)
+                )
+                if _ln
+                else True,
+                fusion_eps=float(getattr(_ln, "fusion_eps", 1e-4))
+                if _ln
+                else 1e-4,
+                upsample_mode=str(getattr(_ln, "upsample_mode", "nearest"))
+                if _ln
+                else "nearest",
             )
             self.density_pred = _build_standard_density_head()
         elif use_rccformer_neck:

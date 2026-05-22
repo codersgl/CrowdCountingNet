@@ -457,6 +457,16 @@ p2pnext_neck:
   feature_size: 256
   output_level: p3 # p3 | p4 | p5 | fused; resized to stride 8 for anchor alignment
 
+# LFEM multi-scale neck (disabled by default)
+# Runs three parallel LFEM modules over C3/C4/C5, aligns them to stride 8, and
+# preserves Density_pred + GCN downstream. Mutually exclusive with other necks.
+use_lfem_neck: false
+lfem_neck:
+  feature_size: 256 # Must stay 256 for existing density/GCN/point heads
+  use_spd_downsample: true # Detail-preserving P3 -> P4 alignment
+  fusion_eps: 0.0001 # Denominator epsilon for normalized three-scale fusion
+  upsample_mode: nearest # nearest | bilinear
+
 # Density-Adaptive Fusion (disabled by default)
 # Replaces static alpha / GateMechanism with density-conditioned per-pixel fusion.
 # When enabled in gcn_mode=fixed, alpha and gm are automatically disabled.

@@ -132,6 +132,7 @@ class SetCriterion_Crowd(nn.Module):
         use_qfl: bool = False,
         qfl_beta: float = 2.0,
         qfl_sigma: float = 10.0,
+        label_smoothing: float = 0.0,
         point_loss_type: str = "smooth_l1",
         point_smooth_l1_beta: float = 1.0,
     ):
@@ -149,6 +150,14 @@ class SetCriterion_Crowd(nn.Module):
         if use_qfl and use_focal_loss:
             raise ValueError(
                 "use_qfl and use_focal_loss are mutually exclusive; enable only one."
+            )
+        self.label_smoothing = float(label_smoothing)
+        if self.label_smoothing < 0.0 or self.label_smoothing >= 1.0:
+            raise ValueError("label_smoothing must be in [0, 1)")
+        if self.label_smoothing > 0.0 and (use_focal_loss or use_qfl):
+            raise ValueError(
+                "label_smoothing is only supported with standard cross entropy; "
+                "disable focal/QFL or set label_smoothing=0.0"
             )
         self.use_qfl = use_qfl
         self.qfl_beta = qfl_beta
@@ -213,7 +222,10 @@ class SetCriterion_Crowd(nn.Module):
             )
         else:
             loss_ce = F.cross_entropy(
-                src_logits.transpose(1, 2), target_classes, self.empty_weight
+                src_logits.transpose(1, 2),
+                target_classes,
+                self.empty_weight,
+                label_smoothing=self.label_smoothing,
             )
         return {"loss_ce": loss_ce}
 

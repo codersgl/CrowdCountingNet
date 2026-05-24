@@ -6,11 +6,16 @@ import pytest
 import torch
 
 from crowdcount.plugins.graph_moe import (
+    BackgroundSuppressExpert,
     CoarseDensityRouter,
     GraphAttentionExpert,
     GraphAwareMoE,
+    GraphMoE,
     GraphMoEBalanceLoss,
+    GraphMoERouter,
     LocalExpert,
+    ScaleSpecialistExpert,
+    TinyPerspectiveExpert,
     _window_partition,
     _window_unpartition,
 )
@@ -110,6 +115,37 @@ class TestGraphAttentionExpert:
 
 
 # ---------------------------------------------------------------------------
+# GraphMoE v1 experts
+# ---------------------------------------------------------------------------
+
+
+class TestGraphMoEExperts:
+    def test_tiny_perspective_shape(self) -> None:
+        expert = TinyPerspectiveExpert(input_dim=C).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        with torch.no_grad():
+            out = expert(x, density)
+        assert out.shape == (B, C, H, W)
+
+    def test_scale_specialist_shape(self) -> None:
+        expert = ScaleSpecialistExpert(input_dim=C, dilations=(1, 2)).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        with torch.no_grad():
+            out = expert(x, density)
+        assert out.shape == (B, C, H, W)
+
+    def test_background_suppress_shape(self) -> None:
+        expert = BackgroundSuppressExpert(input_dim=C).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        with torch.no_grad():
+            out = expert(x, density)
+        assert out.shape == (B, C, H, W)
+
+
+# ---------------------------------------------------------------------------
 # CoarseDensityRouter
 # ---------------------------------------------------------------------------
 
@@ -139,6 +175,27 @@ class TestCoarseDensityRouter:
         with torch.no_grad():
             w = router(x, density)
         assert w.shape == (B, 2, 4, 4)
+
+
+class TestGraphMoERouter:
+    def test_topk_weights_sum_to_one(self) -> None:
+        router = GraphMoERouter(input_dim=C, num_experts=5, top_k=2).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        with torch.no_grad():
+            weights, logits = router(x, density, training=False)
+        assert weights.shape == (B, 5, H, W)
+        assert logits.shape == (B, 5, H, W)
+        assert torch.allclose(weights.sum(dim=1), torch.ones(B, H, W), atol=1e-5)
+        assert ((weights > 0).sum(dim=1) <= 2).all()
+
+    def test_density_spatial_mismatch(self) -> None:
+        router = GraphMoERouter(input_dim=C, num_experts=3, top_k=2).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H * 2, W * 2)
+        with torch.no_grad():
+            weights, _ = router(x, density, training=False)
+        assert weights.shape == (B, 3, H, W)
 
 
 # ---------------------------------------------------------------------------
@@ -408,3 +465,67 @@ class TestGraphAwareMoELocalFirst:
             feat, aux, weights = moe(x, density, training=False)
         assert feat.shape == (B, C, H, W)
         assert aux == {}
+
+
+# ---------------------------------------------------------------------------
+# GraphMoE v1 (top-level)
+# ---------------------------------------------------------------------------
+
+
+class TestGraphMoE:
+    def test_forward_shape_topk_and_aux_keys(self) -> None:
+        moe = GraphMoE(
+            input_dim=C,
+            num_experts=5,
+            top_k=2,
+            num_heads=4,
+            local_expansion=1,
+        ).train()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        feat, aux, weights = moe(x, density, training=True)
+        assert feat.shape == (B, C, H, W)
+        assert weights.shape == (B, 5, H, W)
+        assert torch.allclose(weights.sum(dim=1), torch.ones(B, H, W), atol=1e-5)
+        assert ((weights > 0).sum(dim=1) <= 2).all()
+        assert "total_aux" in aux
+        assert "l_importance" in aux
+        assert "router_entropy" in aux
+
+    def test_eval_no_aux(self) -> None:
+        moe = GraphMoE(input_dim=C, num_experts=5, top_k=2, local_expansion=1).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        with torch.no_grad():
+            feat, aux, weights = moe(x, density, training=False)
+        assert feat.shape == (B, C, H, W)
+        assert aux == {}
+        assert weights.shape == (B, 5, H, W)
+
+    def test_disabled_expert_gets_zero_weight(self) -> None:
+        moe = GraphMoE(
+            input_dim=C,
+            num_experts=5,
+            top_k=2,
+            local_expansion=1,
+            disabled_experts=("background_suppress",),
+        ).eval()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        with torch.no_grad():
+            _, _, weights = moe(x, density, training=False)
+        assert weights[:, 4].sum().item() == 0.0
+
+    def test_single_active_expert_has_no_balance_aux(self) -> None:
+        moe = GraphMoE(
+            input_dim=C,
+            num_experts=2,
+            disabled_experts=("nonlocal_context",),
+            local_expansion=1,
+        ).train()
+        x = torch.randn(B, C, H, W)
+        density = torch.rand(B, 1, H, W)
+        feat, aux, weights = moe(x, density, training=True)
+        assert feat.shape == (B, C, H, W)
+        assert aux == {}
+        assert weights[:, 0].sum().item() == float(B * H * W)

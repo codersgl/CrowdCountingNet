@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from crowdcount.models.matcher import HungarianMatcher_Crowd, build_matcher_crowd
@@ -238,6 +239,75 @@ def test_point_loss_type_invalid_raises(cfg):
             eos_coef=cfg.model.eos_coef,
             losses=["points"],
             point_loss_type="charbonnier",
+        )
+
+
+def test_label_smoothing_matches_torch_cross_entropy(cfg):
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=None,
+        weight_dict={"loss_ce": 1.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["labels"],
+        label_smoothing=0.1,
+    )
+    outputs = {
+        "pred_logits": torch.tensor(
+            [[[0.2, 1.0], [1.5, -0.5]]], dtype=torch.float32
+        )
+    }
+    targets = [
+        {
+            "labels": torch.ones(1, dtype=torch.long),
+            "point": torch.zeros(1, 2),
+        }
+    ]
+    indices = [(torch.tensor([0]), torch.tensor([0]))]
+
+    loss = criterion.loss_labels(outputs, targets, indices, num_points=1)["loss_ce"]
+    target_classes = torch.tensor([[1, 0]], dtype=torch.long)
+    expected = F.cross_entropy(
+        outputs["pred_logits"].transpose(1, 2),
+        target_classes,
+        criterion.empty_weight,
+        label_smoothing=0.1,
+    )
+    assert torch.allclose(loss, expected)
+
+
+@pytest.mark.parametrize("label_smoothing", [-0.1, 1.0])
+def test_label_smoothing_invalid_raises(cfg, label_smoothing):
+    with pytest.raises(ValueError, match="label_smoothing"):
+        SetCriterion_Crowd(
+            num_classes=1,
+            matcher=None,
+            weight_dict={"loss_ce": 1.0},
+            eos_coef=cfg.model.eos_coef,
+            losses=["labels"],
+            label_smoothing=label_smoothing,
+        )
+
+
+def test_label_smoothing_rejects_focal_or_qfl(cfg):
+    with pytest.raises(ValueError, match="label_smoothing"):
+        SetCriterion_Crowd(
+            num_classes=1,
+            matcher=None,
+            weight_dict={"loss_ce": 1.0},
+            eos_coef=cfg.model.eos_coef,
+            losses=["labels"],
+            use_focal_loss=True,
+            label_smoothing=0.1,
+        )
+    with pytest.raises(ValueError, match="label_smoothing"):
+        SetCriterion_Crowd(
+            num_classes=1,
+            matcher=None,
+            weight_dict={"loss_ce": 1.0},
+            eos_coef=cfg.model.eos_coef,
+            losses=["labels"],
+            use_qfl=True,
+            label_smoothing=0.1,
         )
 
 

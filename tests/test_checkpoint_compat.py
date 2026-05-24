@@ -30,3 +30,19 @@ def test_legacy_dap_acdr_keys_load_into_post_neck_acdr() -> None:
 
     target_model = DSGCnet(TinyVGGBackbone(), row=2, line=2, use_dap_neck=True)
     load_model_state_dict(target_model, {"model": legacy_state_dict})
+
+
+def test_regularization_dropout_does_not_change_state_dict_keys() -> None:
+    source_model = DSGCnet(TinyVGGBackbone(), row=2, line=2)
+    target_model = DSGCnet(
+        TinyVGGBackbone(),
+        row=2,
+        line=2,
+        neck_dropout=0.1,
+        head_dropout=0.1,
+        density_dropout=0.1,
+        gcn_dropout=0.1,
+    )
+
+    assert set(source_model.state_dict()) == set(target_model.state_dict())
+    load_model_state_dict(target_model, {"model": source_model.state_dict()})

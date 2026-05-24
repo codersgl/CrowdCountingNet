@@ -20,6 +20,7 @@ from crowdcount.models.head import (
 from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
+from crowdcount.plugins.mamba_vss_dual_fusion import MambaVSSDualFusion
 from crowdcount.plugins.moe import ESCA, MoE, LightMoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
@@ -153,6 +154,51 @@ def test_mamba_moe_mode_forward() -> None:
     assert out["pred_points"].shape[0] == 1
     assert out["moe_weights"] is not None
     assert out["moe_aux_total"] is not None
+
+
+def test_mamba_vss_dual_mode_forward() -> None:
+    backbone = TinyVGGBackbone()
+    cfg = OmegaConf.create(
+        {
+            "d_state": 4,
+            "d_conv": 3,
+            "mlp_ratio": 1.0,
+            "vss_low_dim": 4,
+            "num_vss_blocks": 1,
+            "num_moe_blocks": 1,
+            "num_experts": 2,
+            "top_k": 1,
+            "expand": 1.0,
+            "d_spectral": 16,
+            "mlp_hidden": 64,
+            "drop_path": 0.0,
+            "lambda_balance": 0.01,
+            "use_density_hint": True,
+            "density_embed_dim": 16,
+            "fusion_spatial": True,
+            "gate_init": 0.001,
+        }
+    )
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        fusion_mode="mamba_vss_dual",
+        mamba_vss_dual_cfg=cfg,
+    ).eval()
+    assert model.alpha is None
+    assert isinstance(model.mamba_vss_dual, MambaVSSDualFusion)
+    assert model.supports_moe()
+    assert model.get_moe_gating_parameters()
+
+    with torch.no_grad():
+        out = model(torch.zeros(1, 3, 128, 128))
+
+    assert out["pred_logits"].shape[0] == 1
+    assert out["pred_points"].shape[0] == 1
+    assert out["moe_weights"] is not None
+    assert out["moe_aux_total"] is not None
+    assert out["mamba_vss_fusion_weights"] is not None
 
 
 def test_gate_mechanism_initialized_when_enabled() -> None:
@@ -882,6 +928,88 @@ def test_graph_attn_moe_local_first_forward() -> None:
     assert torch.allclose(
         w.sum(dim=1), torch.ones(2, w.shape[2], w.shape[3]), atol=1e-5
     )
+
+
+# ---------------------------------------------------------------------------
+# graph_moe fusion mode
+# ---------------------------------------------------------------------------
+
+
+def _graph_moe_test_cfg():
+    return OmegaConf.create(
+        {
+            "num_experts": 5,
+            "top_k": 2,
+            "grid_stride": 4,
+            "router_temperature": 1.0,
+            "router_detach_density": True,
+            "use_uncertainty_hint": True,
+            "use_coordinate_hint": True,
+            "aux_loss_weight": 1.0,
+            "lambda_balance": 0.01,
+            "lambda_importance": 0.01,
+            "lambda_capacity": 0.0,
+            "router_z_loss_weight": 0.0,
+            "capacity_factor": 1.25,
+            "local_kernels": [1, 3],
+            "local_expansion": 1,
+            "local_use_density_gate": True,
+            "local_window_size": 0,
+            "num_heads": 4,
+            "use_density_bias": True,
+            "density_bias_scale": 1.0,
+            "attn_dropout": 0.0,
+            "scale_dilations": [1, 2],
+            "background_max_suppression": 0.5,
+            "residual_gate_init": 1.0,
+            "disabled_experts": [],
+        }
+    )
+
+
+def test_graph_moe_forward() -> None:
+    """DSGCnet with fusion_mode='graph_moe' should replace dual-stream GCN."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        fusion_mode="graph_moe",
+        graph_moe_cfg=_graph_moe_test_cfg(),
+    ).eval()
+    assert model.graph_moe is not None
+    assert model.graph_attn_moe is None
+    assert model.alpha is None
+    assert model.density_gcn is None
+    assert model.feature_gcn is None
+    with torch.no_grad():
+        out = model(torch.zeros(2, 3, 128, 128))
+    assert out["pred_logits"].shape[0] == 2
+    assert out["pred_points"].shape[0] == 2
+    assert out["density_out"].shape[0] == 2
+    weights = out["moe_weights"]
+    assert weights.shape[1] == 5
+    assert torch.allclose(
+        weights.sum(dim=1), torch.ones(2, weights.shape[2], weights.shape[3]), atol=1e-5
+    )
+    assert ((weights > 0).sum(dim=1) <= 2).all()
+
+
+def test_graph_moe_train_mode_aux_loss() -> None:
+    """GraphMoE should expose router auxiliary losses in train mode."""
+    backbone = TinyVGGBackbone()
+    model = DSGCnet(
+        backbone,
+        row=2,
+        line=2,
+        fusion_mode="graph_moe",
+        graph_moe_cfg=_graph_moe_test_cfg(),
+    ).train()
+    out = model(torch.zeros(2, 3, 128, 128))
+    assert out["moe_aux_losses"] is not None
+    assert out["moe_aux_total"] is not None
+    assert "l_importance" in out["moe_aux_losses"]
+    assert "router_entropy" in out["moe_aux_losses"]
 
 
 # ---------------------------------------------------------------------------

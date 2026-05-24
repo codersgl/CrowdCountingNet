@@ -21,6 +21,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _validate_dropout(dropout: float, name: str = "dropout") -> float:
+    dropout = float(dropout)
+    if dropout < 0.0 or dropout >= 1.0:
+        raise ValueError(f"{name} must be in [0, 1), got {dropout}")
+    return dropout
+
+
 class DensityAttentionMask(nn.Module):
     """Convert density maps into a broadcastable spatial attention mask."""
 
@@ -307,8 +314,14 @@ class SharedPredictionTrunk(nn.Module):
     Output: [B, feature_size, H, W]
     """
 
-    def __init__(self, in_channels: int = 256, feature_size: int = 256) -> None:
+    def __init__(
+        self,
+        in_channels: int = 256,
+        feature_size: int = 256,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
+        self.dropout = _validate_dropout(dropout, "head dropout")
         self.conv1 = nn.Conv2d(in_channels, feature_size, kernel_size=3, padding=1)
         self.act1 = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(feature_size, feature_size, kernel_size=3, padding=1)
@@ -316,7 +329,9 @@ class SharedPredictionTrunk(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.act1(self.conv1(x))
-        return self.act2(self.conv2(out))
+        out = F.dropout2d(out, p=self.dropout, training=self.training)
+        out = self.act2(self.conv2(out))
+        return F.dropout2d(out, p=self.dropout, training=self.training)
 
 
 class DecoupledPredictionHead(nn.Module):
@@ -330,10 +345,15 @@ class DecoupledPredictionHead(nn.Module):
     Output: (cls_feat, reg_feat) — each [B, feature_size, H, W]
     """
 
-    def __init__(self, in_channels: int = 256, feature_size: int = 256) -> None:
+    def __init__(
+        self,
+        in_channels: int = 256,
+        feature_size: int = 256,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-        self.cls_trunk = SharedPredictionTrunk(in_channels, feature_size)
-        self.reg_trunk = SharedPredictionTrunk(in_channels, feature_size)
+        self.cls_trunk = SharedPredictionTrunk(in_channels, feature_size, dropout)
+        self.reg_trunk = SharedPredictionTrunk(in_channels, feature_size, dropout)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.cls_trunk(x), self.reg_trunk(x)
@@ -342,8 +362,9 @@ class DecoupledPredictionHead(nn.Module):
 class Density_pred(nn.Module):
     """Density map prediction head (baseline)."""
 
-    def __init__(self):
+    def __init__(self, dropout: float = 0.0):
         super().__init__()
+        self.dropout = _validate_dropout(dropout, "density dropout")
         self.v1 = nn.Sequential(
             nn.Conv2d(256, 256, 3, padding=1, dilation=1),
             nn.BatchNorm2d(256),
@@ -372,8 +393,11 @@ class Density_pred(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.v1(x)
+        x = F.dropout2d(x, p=self.dropout, training=self.training)
         x = self.v2(x)
+        x = F.dropout2d(x, p=self.dropout, training=self.training)
         x = self.v3(x)
+        x = F.dropout2d(x, p=self.dropout, training=self.training)
         return self.conv_layers(x)
 
 
@@ -431,8 +455,9 @@ class DepthAuxHead(nn.Module):
 class Density_pred_MS(nn.Module):
     """Improved density head: multi-scale dilated convolutions + residual + Softplus."""
 
-    def __init__(self):
+    def __init__(self, dropout: float = 0.0):
         super().__init__()
+        self.dropout = _validate_dropout(dropout, "density dropout")
         self.v1 = nn.Sequential(
             nn.Conv2d(256, 256, 3, padding=1, dilation=1),
             nn.BatchNorm2d(256),
@@ -460,7 +485,9 @@ class Density_pred_MS(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.v1(x) + self.v2(x) + self.v3(x)
+        residual = x
+        x = residual + self.v1(x) + self.v2(x) + self.v3(x)
+        x = F.dropout2d(x, p=self.dropout, training=self.training)
         return self.conv_layers(x)
 
 
@@ -482,8 +509,14 @@ class Density_pred_V3(nn.Module):
             layers to produce density maps at double spatial resolution.
     """
 
-    def __init__(self, in_channels: int = 256, upsample: bool = False) -> None:
+    def __init__(
+        self,
+        in_channels: int = 256,
+        upsample: bool = False,
+        dropout: float = 0.1,
+    ) -> None:
         super().__init__()
+        dropout = _validate_dropout(dropout, "density dropout")
         mid = 64  # per-branch output channels
 
         # --- ASPP parallel branches ---
@@ -520,7 +553,7 @@ class Density_pred_V3(nn.Module):
             nn.Conv2d(mid * 5, in_channels, 1, bias=False),
             nn.BatchNorm2d(in_channels),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(0.1),
+            nn.Dropout2d(dropout),
         )
 
         # --- Optional PixelShuffle 2× upsample ---
@@ -645,8 +678,10 @@ class DeepRegressionModel(nn.Module):
         feature_size: int = 256,
         num_layers: int = 3,
         gn_groups: int = 32,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        self.dropout = _validate_dropout(dropout, "head dropout")
         layers: list[nn.Module] = []
         in_ch = num_features_in
         for _ in range(num_layers):
@@ -661,6 +696,7 @@ class DeepRegressionModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.layers(x)
+        out = F.dropout2d(out, p=self.dropout, training=self.training)
         out = self.output(out)
         out = out.permute(0, 2, 3, 1)
         return out.contiguous().view(out.shape[0], -1, 2)
@@ -683,8 +719,10 @@ class DeepClassificationModel(nn.Module):
         feature_size: int = 256,
         num_layers: int = 3,
         gn_groups: int = 32,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        self.dropout = _validate_dropout(dropout, "head dropout")
         self.num_classes = num_classes
         self.num_anchor_points = num_anchor_points
 
@@ -710,6 +748,7 @@ class DeepClassificationModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.layers(x)
+        out = F.dropout2d(out, p=self.dropout, training=self.training)
         out = self.output(out)
         out = out.permute(0, 2, 3, 1)
         batch_size, width, height, _ = out.shape

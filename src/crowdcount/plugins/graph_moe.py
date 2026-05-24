@@ -81,6 +81,44 @@ def _window_unpartition(
     return x
 
 
+def _align_density(
+    density: torch.Tensor | None,
+    size: tuple[int, int] | torch.Size,
+) -> torch.Tensor | None:
+    if density is None:
+        return None
+    if density.shape[-2:] != size:
+        density = F.interpolate(
+            density, size=size, mode="bilinear", align_corners=False
+        )
+    return density
+
+
+def _density_entropy(density: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    p = density.sigmoid()
+    entropy = -(p * torch.log(p + eps) + (1.0 - p) * torch.log(1.0 - p + eps))
+    flat = entropy.flatten(1)
+    e_min = flat.min(dim=1, keepdim=True).values.view(-1, 1, 1, 1)
+    e_max = flat.max(dim=1, keepdim=True).values.view(-1, 1, 1, 1)
+    return (entropy - e_min) / (e_max - e_min + eps)
+
+
+def _coordinate_grid(
+    batch_size: int,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    ys, xs = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype),
+        torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    coords = torch.stack([xs, ys], dim=0).unsqueeze(0)
+    return coords.expand(batch_size, 2, height, width)
+
+
 # ---------------------------------------------------------------------------
 # Local Expert
 # ---------------------------------------------------------------------------
@@ -350,6 +388,162 @@ class GraphAttentionExpert(nn.Module):
         return tokens.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
 
+class NonLocalContextExpert(GraphAttentionExpert):
+    """Density-biased attention expert for occlusion-heavy non-local cues."""
+
+
+class TinyPerspectiveExpert(nn.Module):
+    """Detail-preserving expert for weak far-field and tiny-head responses."""
+
+    def __init__(self, input_dim: int = 256, hidden_ratio: int = 4) -> None:
+        super().__init__()
+        hidden_dim = max(input_dim // hidden_ratio, 16)
+        self.detail_filter = nn.Sequential(
+            nn.Conv2d(input_dim, input_dim, 3, padding=1, groups=input_dim, bias=False),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+            nn.Conv2d(input_dim, input_dim, 1, bias=False),
+            nn.BatchNorm2d(input_dim),
+        )
+        self.hint_gate = nn.Sequential(
+            nn.Conv2d(2, hidden_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, input_dim, 1),
+            nn.Sigmoid(),
+        )
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        density: torch.Tensor | None = None,
+        uncertainty: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        density = _align_density(density, x.shape[-2:])
+        if uncertainty is None and density is not None:
+            uncertainty = _density_entropy(density)
+        uncertainty = _align_density(uncertainty, x.shape[-2:])
+        if density is None:
+            density = x.new_zeros(x.shape[0], 1, x.shape[2], x.shape[3])
+        if uncertainty is None:
+            uncertainty = x.new_zeros(x.shape[0], 1, x.shape[2], x.shape[3])
+
+        smooth = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        detail = x - smooth
+        detail = self.detail_filter(detail)
+        hint = torch.cat([1.0 - density.sigmoid(), uncertainty], dim=1)
+        gate = self.hint_gate(hint)
+        return x + self.gate.tanh() * detail * gate
+
+
+class ScaleSpecialistExpert(nn.Module):
+    """ASPP-lite expert that separates small/medium/large scale processing."""
+
+    def __init__(
+        self,
+        input_dim: int = 256,
+        dilations: tuple[int, ...] = (1, 2, 4),
+        hidden_ratio: int = 4,
+    ) -> None:
+        super().__init__()
+        self.dilations = dilations
+        self.branches = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(
+                        input_dim,
+                        input_dim,
+                        3,
+                        padding=dilation,
+                        dilation=dilation,
+                        groups=input_dim,
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(input_dim),
+                    nn.GELU(),
+                    nn.Conv2d(input_dim, input_dim, 1, bias=False),
+                    nn.BatchNorm2d(input_dim),
+                )
+                for dilation in dilations
+            ]
+        )
+        hidden_dim = max(input_dim // hidden_ratio, 16)
+        self.scale_gate = nn.Sequential(
+            nn.Conv2d(input_dim + 1, hidden_dim, 1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, len(dilations), 1),
+        )
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        density: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        density = _align_density(density, x.shape[-2:])
+        if density is None:
+            density = x.new_zeros(x.shape[0], 1, x.shape[2], x.shape[3])
+        branch_outputs = torch.stack([branch(x) for branch in self.branches], dim=1)
+        gate_input = torch.cat([x, density.sigmoid()], dim=1)
+        scale_weights = F.softmax(self.scale_gate(gate_input), dim=1).unsqueeze(2)
+        fused = (branch_outputs * scale_weights).sum(dim=1)
+        return x + self.gate.tanh() * fused
+
+
+class BackgroundSuppressExpert(nn.Module):
+    """Residual suppressor for repetitive non-human background patterns."""
+
+    def __init__(
+        self,
+        input_dim: int = 256,
+        hidden_ratio: int = 4,
+        max_suppression: float = 0.5,
+    ) -> None:
+        super().__init__()
+        hidden_dim = max(input_dim // hidden_ratio, 16)
+        self.max_suppression = float(max_suppression)
+        self.bg_gate = nn.Sequential(
+            nn.Conv2d(4, hidden_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, 1, 1),
+            nn.Sigmoid(),
+        )
+        self.residual = nn.Sequential(
+            nn.Conv2d(input_dim, input_dim, 3, padding=1, groups=input_dim, bias=False),
+            nn.BatchNorm2d(input_dim),
+            nn.GELU(),
+            nn.Conv2d(input_dim, input_dim, 1, bias=False),
+            nn.BatchNorm2d(input_dim),
+        )
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        density: torch.Tensor | None = None,
+        uncertainty: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        density = _align_density(density, x.shape[-2:])
+        if uncertainty is None and density is not None:
+            uncertainty = _density_entropy(density)
+        uncertainty = _align_density(uncertainty, x.shape[-2:])
+        if density is None:
+            density = x.new_zeros(x.shape[0], 1, x.shape[2], x.shape[3])
+        if uncertainty is None:
+            uncertainty = x.new_zeros(x.shape[0], 1, x.shape[2], x.shape[3])
+
+        avg_feat = x.mean(dim=1, keepdim=True)
+        max_feat = x.amax(dim=1, keepdim=True)
+        hint = torch.cat([avg_feat, max_feat, 1.0 - density.sigmoid(), uncertainty], dim=1)
+        suppress = self.bg_gate(hint)
+        residual = self.residual(x)
+        scale = self.max_suppression * self.gate.tanh().abs()
+        return x - scale * suppress * residual
+
+
 # ---------------------------------------------------------------------------
 # Coarse Density Router
 # ---------------------------------------------------------------------------
@@ -432,24 +626,49 @@ class CoarseDensityRouter(nn.Module):
 
 
 class GraphMoEBalanceLoss(nn.Module):
-    """Entropy-based expert balance loss for two-expert routing."""
+    """Expert-balance regulariser for dense or top-k GraphMoE routing."""
 
-    def __init__(self, lambda_balance: float = 0.01) -> None:
+    def __init__(
+        self,
+        lambda_balance: float = 0.01,
+        lambda_importance: float = 0.0,
+        lambda_capacity: float = 0.0,
+        router_z_loss_weight: float = 0.0,
+        capacity_factor: float = 1.25,
+    ) -> None:
         super().__init__()
-        self.lambda_balance = lambda_balance
+        self.lambda_balance = float(lambda_balance)
+        self.lambda_importance = float(lambda_importance)
+        self.lambda_capacity = float(lambda_capacity)
+        self.router_z_loss_weight = float(router_z_loss_weight)
+        self.capacity_factor = float(capacity_factor)
 
-    def forward(self, expert_weights: torch.Tensor) -> dict[str, torch.Tensor]:
+    @staticmethod
+    def _cv_squared(values: torch.Tensor) -> torch.Tensor:
+        if values.numel() <= 1:
+            return values.new_zeros(())
+        mean = values.mean()
+        return values.var(unbiased=False) / (mean * mean + 1e-8)
+
+    def forward(
+        self,
+        expert_weights: torch.Tensor,
+        router_logits: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """
         Args:
             expert_weights: [B, num_experts, H, W]
+            router_logits: Optional pre-softmax router scores.
 
         Returns:
-            dict with ``l_balance`` and ``total_aux``.
+            dict with balance components and ``total_aux``.
         """
         if expert_weights.dim() == 4:
             usage = expert_weights.mean(dim=(0, 2, 3))  # [num_experts]
+            load = (expert_weights > 1e-6).float().mean(dim=(0, 2, 3))
         else:
             usage = expert_weights.mean(dim=0)
+            load = (expert_weights > 1e-6).float().mean(dim=0)
 
         p = torch.clamp(usage, min=0.0)
         p = p / (p.sum() + 1e-8)
@@ -458,8 +677,138 @@ class GraphMoEBalanceLoss(nn.Module):
         current_entropy = -(p * torch.log(p + 1e-8)).sum()
         l_balance = max_entropy - current_entropy
 
-        total = self.lambda_balance * l_balance
-        return {"l_balance": l_balance, "total_aux": total}
+        l_importance = self._cv_squared(usage) + self._cv_squared(load)
+        capacity = self.capacity_factor / max(float(num_experts), 1.0)
+        l_capacity = torch.clamp(usage - capacity, min=0.0).pow(2).sum()
+        if router_logits is None:
+            l_router_z = usage.new_zeros(())
+        else:
+            l_router_z = torch.logsumexp(router_logits, dim=1).pow(2).mean()
+
+        total = (
+            self.lambda_balance * l_balance
+            + self.lambda_importance * l_importance
+            + self.lambda_capacity * l_capacity
+            + self.router_z_loss_weight * l_router_z
+        )
+        return {
+            "l_balance": l_balance,
+            "l_importance": l_importance,
+            "l_capacity": l_capacity,
+            "l_router_z": l_router_z,
+            "total_aux": total,
+        }
+
+
+class GraphMoERouter(nn.Module):
+    """Coarse-to-fine router that emits per-token top-k expert weights."""
+
+    def __init__(
+        self,
+        input_dim: int = 256,
+        num_experts: int = 5,
+        grid_stride: int = 4,
+        top_k: int = 2,
+        temperature: float = 1.0,
+        noisy_routing_std: float = 0.0,
+        use_uncertainty_hint: bool = True,
+        use_coordinate_hint: bool = True,
+        expert_prior: tuple[float, ...] | None = None,
+    ) -> None:
+        super().__init__()
+        if num_experts <= 0:
+            raise ValueError(f"num_experts must be positive, got {num_experts}")
+        if top_k <= 0:
+            raise ValueError(f"top_k must be positive, got {top_k}")
+        if temperature <= 0.0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
+        self.num_experts = int(num_experts)
+        self.grid_stride = int(grid_stride)
+        self.top_k = min(int(top_k), self.num_experts)
+        self.temperature = float(temperature)
+        self.noisy_routing_std = float(noisy_routing_std)
+        self.use_uncertainty_hint = bool(use_uncertainty_hint)
+        self.use_coordinate_hint = bool(use_coordinate_hint)
+
+        hint_channels = 1
+        if self.use_uncertainty_hint:
+            hint_channels += 1
+        if self.use_coordinate_hint:
+            hint_channels += 2
+        in_ch = input_dim + hint_channels
+        hidden_dim = max(input_dim // 4, 32)
+        self.score_net = nn.Sequential(
+            nn.Conv2d(in_ch, hidden_dim, 1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, self.num_experts, 1),
+        )
+
+        if expert_prior is None:
+            prior = torch.zeros(self.num_experts, dtype=torch.float32)
+        else:
+            prior = torch.tensor(tuple(expert_prior), dtype=torch.float32)
+            if prior.numel() != self.num_experts:
+                raise ValueError(
+                    f"expert_prior must have {self.num_experts} values, "
+                    f"got {prior.numel()}"
+                )
+        self.register_buffer("expert_prior", prior.view(1, self.num_experts, 1, 1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        density: torch.Tensor,
+        uncertainty: torch.Tensor | None = None,
+        training: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        density_aligned = _align_density(density, x.shape[-2:])
+        assert density_aligned is not None
+        density = density_aligned
+        hints = [density.sigmoid()]
+        if self.use_uncertainty_hint:
+            if uncertainty is None:
+                uncertainty = _density_entropy(density)
+            uncertainty_aligned = _align_density(uncertainty, x.shape[-2:])
+            assert uncertainty_aligned is not None
+            hints.append(uncertainty_aligned)
+        if self.use_coordinate_hint:
+            hints.append(
+                _coordinate_grid(
+                    x.shape[0], x.shape[2], x.shape[3], x.device, x.dtype
+                )
+            )
+        inp = torch.cat([x, *hints], dim=1)
+
+        height, width = inp.shape[-2:]
+        stride = self.grid_stride
+        if height >= stride and width >= stride:
+            coarse = F.avg_pool2d(inp, kernel_size=stride, stride=stride)
+            logits = self.score_net(coarse)
+            logits = F.interpolate(
+                logits, size=(height, width), mode="bilinear", align_corners=False
+            )
+        else:
+            logits = self.score_net(inp)
+        expert_prior = self.expert_prior
+        assert isinstance(expert_prior, torch.Tensor)
+        logits = logits + expert_prior.to(device=logits.device, dtype=logits.dtype)
+
+        route_logits = logits / self.temperature
+        if training and self.noisy_routing_std > 0.0:
+            route_logits = route_logits + torch.randn_like(route_logits) * self.noisy_routing_std
+
+        if self.top_k < self.num_experts:
+            top_idx = torch.topk(route_logits, k=self.top_k, dim=1).indices
+            mask = torch.zeros_like(route_logits, dtype=torch.bool)
+            mask.scatter_(1, top_idx, True)
+            route_logits = route_logits.masked_fill(~mask, torch.finfo(route_logits.dtype).min)
+
+        weights = F.softmax(route_logits, dim=1)
+        return weights, logits
 
 
 # ---------------------------------------------------------------------------
@@ -625,5 +974,249 @@ class GraphAwareMoE(nn.Module):
         aux_losses: dict[str, torch.Tensor] = {}
         if training:
             aux_losses = self.aux_loss(weights)
+
+        return feature_fl, aux_losses, weights
+
+
+class GraphMoE(nn.Module):
+    """Unified Graph Mixture-of-Experts replacement for DSGCNet dual GCN.
+
+    The module keeps the fusion-stage contract unchanged while routing each
+    spatial token to complementary graph/scale/background experts:
+
+    0. local_occlusion: local density-gated multi-scale convolution
+    1. nonlocal_context: density-biased attention for long-range cues
+    2. tiny_perspective: far-field detail enhancement
+    3. scale_specialist: ASPP-lite scale-separated processing
+    4. background_suppress: residual background suppression
+    """
+
+    EXPERT_NAMES = (
+        "local_occlusion",
+        "nonlocal_context",
+        "tiny_perspective",
+        "scale_specialist",
+        "background_suppress",
+    )
+
+    def __init__(
+        self,
+        input_dim: int = 256,
+        num_experts: int = 5,
+        top_k: int = 2,
+        router_temperature: float = 1.0,
+        noisy_routing_std: float = 0.0,
+        grid_stride: int = 4,
+        router_detach_density: bool = True,
+        use_uncertainty_hint: bool = True,
+        use_coordinate_hint: bool = True,
+        expert_prior: tuple[float, ...] | None = None,
+        aux_loss_weight: float = 1.0,
+        lambda_balance: float = 0.01,
+        lambda_importance: float = 0.01,
+        lambda_capacity: float = 0.0,
+        router_z_loss_weight: float = 0.0,
+        capacity_factor: float = 1.25,
+        # Shared/local expert knobs
+        local_kernels: tuple[int, ...] = (1, 3, 5),
+        local_expansion: int = 2,
+        local_use_density_gate: bool = True,
+        local_window_size: int = 0,
+        # Non-local expert knobs
+        num_heads: int = 4,
+        use_density_bias: bool = True,
+        density_bias_scale: float = 1.0,
+        attn_dropout: float = 0.1,
+        # Scale/background knobs
+        scale_dilations: tuple[int, ...] = (1, 2, 4),
+        background_max_suppression: float = 0.5,
+        residual_gate_init: float = 1.0,
+        disabled_experts: tuple[str | int, ...] = (),
+        disable_local_occlusion: bool = False,
+        disable_nonlocal_context: bool = False,
+        disable_tiny_perspective: bool = False,
+        disable_scale_specialist: bool = False,
+        disable_background_suppress: bool = False,
+    ) -> None:
+        super().__init__()
+        if num_experts <= 0 or num_experts > len(self.EXPERT_NAMES):
+            raise ValueError(
+                f"num_experts must be in [1, {len(self.EXPERT_NAMES)}], "
+                f"got {num_experts}"
+            )
+        self.input_dim = input_dim
+        self.expert_names = self.EXPERT_NAMES[: int(num_experts)]
+        self.router_detach_density = router_detach_density
+        self.aux_loss_weight = float(aux_loss_weight)
+        self.residual_gate = nn.Parameter(torch.tensor(float(residual_gate_init)))
+
+        disabled = self._normalise_disabled(disabled_experts)
+        flag_disabled = {
+            "local_occlusion": disable_local_occlusion,
+            "nonlocal_context": disable_nonlocal_context,
+            "tiny_perspective": disable_tiny_perspective,
+            "scale_specialist": disable_scale_specialist,
+            "background_suppress": disable_background_suppress,
+        }
+        disabled.update(name for name, flag in flag_disabled.items() if flag)
+        self.active_names = tuple(
+            name for name in self.expert_names if name not in disabled
+        )
+        if not self.active_names:
+            raise ValueError("GraphMoE must keep at least one expert active")
+
+        modules: dict[str, nn.Module] = {}
+        if "local_occlusion" in self.active_names:
+            modules["local_occlusion"] = LocalExpert(
+                input_dim=input_dim,
+                kernel_sizes=local_kernels,
+                expansion=local_expansion,
+                use_density_gate=local_use_density_gate,
+                window_size=local_window_size,
+            )
+        if "nonlocal_context" in self.active_names:
+            modules["nonlocal_context"] = NonLocalContextExpert(
+                input_dim=input_dim,
+                num_heads=num_heads,
+                use_density_bias=use_density_bias,
+                density_bias_scale=density_bias_scale,
+                attn_dropout=attn_dropout,
+            )
+        if "tiny_perspective" in self.active_names:
+            modules["tiny_perspective"] = TinyPerspectiveExpert(input_dim=input_dim)
+        if "scale_specialist" in self.active_names:
+            modules["scale_specialist"] = ScaleSpecialistExpert(
+                input_dim=input_dim,
+                dilations=scale_dilations,
+            )
+        if "background_suppress" in self.active_names:
+            modules["background_suppress"] = BackgroundSuppressExpert(
+                input_dim=input_dim,
+                max_suppression=background_max_suppression,
+            )
+        self.experts = nn.ModuleDict(modules)
+
+        active_prior = None
+        if expert_prior is not None:
+            if len(expert_prior) != len(self.expert_names):
+                raise ValueError(
+                    f"expert_prior must have {len(self.expert_names)} values, "
+                    f"got {len(expert_prior)}"
+                )
+            active_prior = tuple(
+                float(expert_prior[self.expert_names.index(name)])
+                for name in self.active_names
+            )
+
+        self.router: GraphMoERouter | None = None
+        if len(self.active_names) > 1:
+            self.router = GraphMoERouter(
+                input_dim=input_dim,
+                num_experts=len(self.active_names),
+                grid_stride=grid_stride,
+                top_k=top_k,
+                temperature=router_temperature,
+                noisy_routing_std=noisy_routing_std,
+                use_uncertainty_hint=use_uncertainty_hint,
+                use_coordinate_hint=use_coordinate_hint,
+                expert_prior=active_prior,
+            )
+        self.aux_loss = GraphMoEBalanceLoss(
+            lambda_balance=lambda_balance,
+            lambda_importance=lambda_importance,
+            lambda_capacity=lambda_capacity,
+            router_z_loss_weight=router_z_loss_weight,
+            capacity_factor=capacity_factor,
+        )
+        self.last_usage: torch.Tensor | None = None
+
+    def _normalise_disabled(
+        self, disabled_experts: tuple[str | int, ...]
+    ) -> set[str]:
+        disabled: set[str] = set()
+        for value in disabled_experts:
+            if isinstance(value, int):
+                if value < 0 or value >= len(self.expert_names):
+                    raise ValueError(f"disabled expert index out of range: {value}")
+                disabled.add(self.expert_names[value])
+            else:
+                name = str(value)
+                if name not in self.expert_names:
+                    raise ValueError(f"Unknown GraphMoE expert {name!r}")
+                disabled.add(name)
+        return disabled
+
+    def _run_expert(
+        self,
+        name: str,
+        x: torch.Tensor,
+        density: torch.Tensor,
+        uncertainty: torch.Tensor | None,
+    ) -> torch.Tensor:
+        expert = self.experts[name]
+        if name in {"tiny_perspective", "background_suppress"}:
+            return expert(x, density, uncertainty)  # type: ignore[misc]
+        return expert(x, density)  # type: ignore[misc]
+
+    def _scatter_active_weights(
+        self,
+        active_weights: torch.Tensor,
+        num_experts: int,
+    ) -> torch.Tensor:
+        B, _, H, W = active_weights.shape
+        weights = active_weights.new_zeros(B, num_experts, H, W)
+        for active_idx, name in enumerate(self.active_names):
+            full_idx = self.expert_names.index(name)
+            weights[:, full_idx] = active_weights[:, active_idx]
+        return weights
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        density: torch.Tensor,
+        uncertainty: torch.Tensor | None = None,
+        training: bool = True,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+        density_for_experts = density.detach()
+        density_for_router = density.detach() if self.router_detach_density else density
+        uncertainty_for_router = uncertainty.detach() if uncertainty is not None else None
+
+        expert_outputs = torch.stack(
+            [
+                self._run_expert(
+                    name,
+                    x,
+                    density_for_experts,
+                    uncertainty_for_router,
+                )
+                for name in self.active_names
+            ],
+            dim=1,
+        )
+
+        if len(self.active_names) == 1:
+            active_weights = x.new_ones(x.shape[0], 1, x.shape[2], x.shape[3])
+            active_logits = None
+        else:
+            assert self.router is not None
+            active_weights, active_logits = self.router(
+                x,
+                density_for_router,
+                uncertainty=uncertainty_for_router,
+                training=training,
+            )
+
+        mixed = (expert_outputs * active_weights.unsqueeze(2)).sum(dim=1)
+        feature_fl = x + self.residual_gate.tanh() * (mixed - x)
+        weights = self._scatter_active_weights(active_weights, len(self.expert_names))
+        self.last_usage = weights.mean(dim=(0, 2, 3)).detach()
+
+        aux_losses: dict[str, torch.Tensor] = {}
+        if training and len(self.active_names) > 1:
+            aux_losses = self.aux_loss(active_weights, active_logits)
+            router_entropy = -(
+                active_weights.clamp_min(1e-8) * torch.log(active_weights.clamp_min(1e-8))
+            ).sum(dim=1).mean()
+            aux_losses["router_entropy"] = router_entropy
 
         return feature_fl, aux_losses, weights

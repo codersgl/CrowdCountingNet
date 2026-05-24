@@ -10,6 +10,17 @@ point_smooth_l1_beta: 1.0 # Only used when point_loss_type=smooth_l1
 eos_coef: 0.5
 count_loss_coef: 0.0 # Global counting L1 loss weight; set >0 to enable (recommended: 0.001~0.01)
 consistency_loss_coef: 0.0 # Density-point consistency loss weight; set >0 to enable (recommended: 0.001~0.01)
+
+# Regularization knobs. Defaults preserve existing behavior.
+# Set numeric values via CLI, e.g. model.regularization.head_dropout=0.1.
+regularization:
+  neck_dropout: 0.0 # Dropout2d on post-neck 256ch features before density/GCN/head paths
+  head_dropout: 0.0 # Dropout2d inside point prediction trunks/heads
+  density_dropout: null # null: v1/ms keep 0.0, v3 keeps legacy 0.1; number overrides all standard density heads
+  gcn_dropout: null # null: GCN=0.5, GATv2/ECA/CrossStream=0.1, SuperNode=0.3
+  drop_path: null # null: keep branch-local Mamba/MambaVSS drop_path settings
+  label_smoothing: 0.0 # Standard CE only; incompatible with focal/QFL when >0
+
 use_gm: false
 gm_input_dim: 256
 gm_hidden_dim: 128
@@ -69,10 +80,12 @@ clip_prompt_density:
 use_rccformer_neck: false
 rccformer_deab_blocks: 2 # Number of DEAB blocks in density prediction branch
 
-# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe | mamba_moe | sa_dgat
+# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe | graph_moe | mamba_moe | mamba_vss_dual | sa_dgat
 # gcn_moe: GCN dual-stream + LightMoE post-refinement (recommended)
 # graph_attn_moe: 2-expert MoE (local conv + graph-biased attention)
+# graph_moe: 5-expert unified GraphMoE replacement for dual-stream GCN
 # mamba_moe: routed directional Mamba experts + shared channel scan
+# mamba_vss_dual: density-guided VSS stream + MambaMoE feature stream
 # sa_dgat: Scale-Aware Deformable Graph Attention Network
 fusion_mode: gcn
 
@@ -183,6 +196,54 @@ graph_attn_moe:
   disable_local_expert: false # disable local expert → global only
   disable_global_expert: false # disable global expert → local only
 
+# GraphMoE (only used when fusion_mode: graph_moe)
+# Five expert families cover local occlusion, non-local context, tiny targets,
+# scale variation, and background suppression while preserving [B,256,H,W].
+graph_moe:
+  # Router
+  num_experts: 5
+  top_k: 2
+  grid_stride: 4
+  router_temperature: 1.0
+  noisy_routing_std: 0.0
+  router_detach_density: true
+  use_uncertainty_hint: true
+  use_coordinate_hint: true
+  expert_prior: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+  # Auxiliary routing losses. total_aux is scaled by aux_loss_weight in engine.
+  aux_loss_weight: 1.0
+  lambda_balance: 0.01
+  lambda_importance: 0.01
+  lambda_capacity: 0.0
+  router_z_loss_weight: 0.0
+  capacity_factor: 1.25
+
+  # LocalOcclusionExpert
+  local_kernels: [1, 3, 5]
+  local_expansion: 2
+  local_use_density_gate: true
+  local_window_size: 0
+
+  # NonLocalContextExpert
+  num_heads: 4
+  use_density_bias: true
+  density_bias_scale: 1.0
+  attn_dropout: 0.1
+
+  # ScaleSpecialistExpert / BackgroundSuppressExpert
+  scale_dilations: [1, 2, 4]
+  background_max_suppression: 0.5
+  residual_gate_init: 1.0
+
+  # Ablation switches
+  disabled_experts: [] # names or indices
+  disable_local_occlusion: false
+  disable_nonlocal_context: false
+  disable_tiny_perspective: false
+  disable_scale_specialist: false
+  disable_background_suppress: false
+
 # MambaMoE fusion (only used when fusion_mode: mamba_moe)
 mamba_moe:
   d_state: 16
@@ -197,6 +258,30 @@ mamba_moe:
   lambda_balance: 0.01
   use_density_hint: false
   d_spectral: 256
+
+# MambaVSS dual-stream fusion (only used when fusion_mode: mamba_vss_dual)
+# Replaces DensityGCN/FeatureGCN with a density-guided VSS stream and a
+# MambaMoE feature stream, then fuses PA-FPN/density/feature streams by a
+# density-conditioned 3-way gate.
+mamba_vss_dual:
+  d_state: 16
+  d_conv: 3
+  mlp_ratio: 2.0
+  vss_low_dim: 16 # low-rank scan width for the density-guided VSS branch
+  num_vss_blocks: 1
+  num_moe_blocks: 1
+  num_experts: 4
+  top_k: 2
+  lr_space: exp
+  expand: 2.0
+  d_spectral: 256
+  mlp_hidden: 256
+  drop_path: 0.1
+  lambda_balance: 0.01
+  use_density_hint: true
+  density_embed_dim: 64
+  fusion_spatial: true # true: per-pixel [B,3,H,W] | false: per-image [B,3]
+  gate_init: 0.001 # small residual scale for density injection and VSS updates
 
 sdd_moe:
   fg_threshold: 0.3

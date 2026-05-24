@@ -51,8 +51,9 @@ from crowdcount.plugins.depth_residual_gating import (
 from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
 from crowdcount.models.backbone import DepthBackbone_VGG
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
+from crowdcount.plugins.mamba_vss_dual_fusion import MambaVSSDualFusion
 from crowdcount.plugins.moe import ESCA, MoE, LightMoE
-from crowdcount.plugins.graph_moe import GraphAwareMoE
+from crowdcount.plugins.graph_moe import GraphAwareMoE, GraphMoE
 from crowdcount.plugins.sdd_moe import SDDMoE
 from crowdcount.plugins.sa_dgat import SADGATFusion
 from crowdcount.plugins.msaa import MSAAGate, MSAALite, MsaaAdaptiveLayer
@@ -149,6 +150,15 @@ class _SharedBackboneDepthMix(nn.Module):
         return tuple(fused_features)
 
 
+def _validate_dropout(dropout: float | None, name: str) -> float | None:
+    if dropout is None:
+        return None
+    dropout = float(dropout)
+    if dropout < 0.0 or dropout >= 1.0:
+        raise ValueError(f"{name} must be in [0, 1), got {dropout}")
+    return dropout
+
+
 class DSGCnet(nn.Module):
     def __init__(
         self,
@@ -166,7 +176,9 @@ class DSGCnet(nn.Module):
         msaa_variant: str = "legacy",
         moe_cfg: DictConfig | None = None,
         graph_attn_moe_cfg: DictConfig | None = None,
+        graph_moe_cfg: DictConfig | None = None,
         mamba_moe_cfg: DictConfig | None = None,
+        mamba_vss_dual_cfg: DictConfig | None = None,
         sdd_moe_cfg: DictConfig | None = None,
         use_depth: bool = False,
         depth_cfg: DictConfig | None = None,
@@ -242,20 +254,38 @@ class DSGCnet(nn.Module):
         use_deep_head: bool = False,
         use_density_adaptive_fusion: bool = False,
         density_adaptive_fusion_cfg: DictConfig | None = None,
+        neck_dropout: float = 0.0,
+        head_dropout: float = 0.0,
+        density_dropout: float | None = None,
+        gcn_dropout: float | None = None,
+        regularization_drop_path: float | None = None,
     ):
         super().__init__()
         self.backbone = backbone
         self.num_classes = 2
         self.cfg = cfg
+        self.neck_dropout = float(
+            _validate_dropout(neck_dropout, "neck_dropout") or 0.0
+        )
+        head_dropout = float(_validate_dropout(head_dropout, "head_dropout") or 0.0)
+        density_dropout = _validate_dropout(density_dropout, "density_dropout")
+        gcn_dropout = _validate_dropout(gcn_dropout, "gcn_dropout")
+        regularization_drop_path = _validate_dropout(
+            regularization_drop_path, "drop_path"
+        )
         self.fusion_mode = fusion_mode
         self.use_moe = fusion_mode == "esca_moe"
         self.use_gcn_moe = fusion_mode == "gcn_moe"
         self.use_graph_attn_moe = fusion_mode == "graph_attn_moe"
+        self.use_graph_moe = fusion_mode == "graph_moe"
         self.use_mamba_moe = fusion_mode == "mamba_moe"
+        self.use_mamba_vss_dual = fusion_mode == "mamba_vss_dual"
         self.use_sdd_moe = fusion_mode == "sdd_moe"
         self.use_sa_dgat = fusion_mode == "sa_dgat"
+        self.mamba_vss_dual: MambaVSSDualFusion | None = None
         self.sdd_moe: SDDMoE | None = None
         self.sa_dgat_fusion: SADGATFusion | None = None
+        self.graph_moe: GraphMoE | None = None
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
         self.use_depth_geo_post = use_depth_geo_post
@@ -402,12 +432,14 @@ class DSGCnet(nn.Module):
             "esca_moe",
             "gcn_moe",
             "graph_attn_moe",
+            "graph_moe",
             "mamba_moe",
+            "mamba_vss_dual",
             "sdd_moe",
             "sa_dgat",
         }:
             raise ValueError(
-                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', 'graph_attn_moe', 'mamba_moe', 'sdd_moe', or 'sa_dgat'"
+                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', 'graph_attn_moe', 'graph_moe', 'mamba_moe', 'mamba_vss_dual', 'sdd_moe', or 'sa_dgat'"
             )
         if self.feature_stream_type not in {"gcn", "transformer", "window_transformer"}:
             raise ValueError(
@@ -424,18 +456,29 @@ class DSGCnet(nn.Module):
         num_anchor_points = row * line
 
         self.pred_trunk: SharedPredictionTrunk | DecoupledPredictionHead = (
-            DecoupledPredictionHead(in_channels=256, feature_size=256)
+            DecoupledPredictionHead(
+                in_channels=256,
+                feature_size=256,
+                dropout=head_dropout,
+            )
             if use_decoupled_head
-            else SharedPredictionTrunk(in_channels=256, feature_size=256)
+            else SharedPredictionTrunk(
+                in_channels=256,
+                feature_size=256,
+                dropout=head_dropout,
+            )
         )
         if use_deep_head:
             self.regression = DeepRegressionModel(
-                num_features_in=256, num_anchor_points=num_anchor_points
+                num_features_in=256,
+                num_anchor_points=num_anchor_points,
+                dropout=head_dropout,
             )
             self.classification = DeepClassificationModel(
                 num_features_in=256,
                 num_classes=self.num_classes,
                 num_anchor_points=num_anchor_points,
+                dropout=head_dropout,
             )
         else:
             self.regression = RegressionModel(
@@ -452,6 +495,8 @@ class DSGCnet(nn.Module):
         def _build_standard_density_head() -> nn.Module:
             model_cfg = getattr(cfg, "model", None) if cfg is not None else None
             density_version = str(getattr(model_cfg, "density_head_version", "v1"))
+            density_dropout_v1 = 0.0 if density_dropout is None else density_dropout
+            density_dropout_v3 = 0.1 if density_dropout is None else density_dropout
             if (
                 bool(getattr(model_cfg, "use_ms_density_head", False))
                 and density_version == "v1"
@@ -459,10 +504,10 @@ class DSGCnet(nn.Module):
                 density_version = "ms"
             if density_version == "v3":
                 upsample = bool(getattr(model_cfg, "density_head_upsample", False))
-                return Density_pred_V3(upsample=upsample)
+                return Density_pred_V3(upsample=upsample, dropout=density_dropout_v3)
             if density_version == "ms":
-                return Density_pred_MS()
-            return Density_pred()
+                return Density_pred_MS(dropout=density_dropout_v1)
+            return Density_pred(dropout=density_dropout_v1)
 
         def _neck_acdr_enabled() -> bool:
             enabled = getattr(neck_acdr_cfg, "enabled", "auto")
@@ -627,7 +672,9 @@ class DSGCnet(nn.Module):
                 num_heads=msca_num_heads,
                 num_blocks=msca_num_blocks,
             )
-            self.density_pred = Density_pred()
+            self.density_pred = Density_pred(
+                dropout=0.0 if density_dropout is None else density_dropout
+            )
         else:
             self.msca_decoder = None
             if use_msaa and msaa_variant == "legacy":
@@ -638,7 +685,9 @@ class DSGCnet(nn.Module):
                 self.pa = Decoder_SPD_PAFPN(
                     256, 512, 512, use_dcn=use_dcn, fpn_attention=fpn_attention
                 )
-            self.density_pred = Density_pred()
+            self.density_pred = Density_pred(
+                dropout=0.0 if density_dropout is None else density_dropout
+            )
 
         if use_neck_moe:
             _nm = neck_moe_cfg
@@ -828,6 +877,142 @@ class DSGCnet(nn.Module):
             self.gm = None
             self.graph_attn_moe = None
             self.mamba_moe = None
+        elif self.use_graph_moe:
+            _gm_cfg = graph_moe_cfg
+            self.graph_moe = GraphMoE(
+                input_dim=256,
+                num_experts=int(getattr(_gm_cfg, "num_experts", 5))
+                if _gm_cfg
+                else 5,
+                top_k=int(getattr(_gm_cfg, "top_k", 2)) if _gm_cfg else 2,
+                router_temperature=float(
+                    getattr(_gm_cfg, "router_temperature", 1.0)
+                )
+                if _gm_cfg
+                else 1.0,
+                noisy_routing_std=float(getattr(_gm_cfg, "noisy_routing_std", 0.0))
+                if _gm_cfg
+                else 0.0,
+                grid_stride=int(getattr(_gm_cfg, "grid_stride", 4))
+                if _gm_cfg
+                else 4,
+                router_detach_density=bool(
+                    getattr(_gm_cfg, "router_detach_density", True)
+                )
+                if _gm_cfg
+                else True,
+                use_uncertainty_hint=bool(
+                    getattr(_gm_cfg, "use_uncertainty_hint", True)
+                )
+                if _gm_cfg
+                else True,
+                use_coordinate_hint=bool(
+                    getattr(_gm_cfg, "use_coordinate_hint", True)
+                )
+                if _gm_cfg
+                else True,
+                expert_prior=tuple(getattr(_gm_cfg, "expert_prior", []))
+                if _gm_cfg and getattr(_gm_cfg, "expert_prior", None) is not None
+                else None,
+                aux_loss_weight=float(getattr(_gm_cfg, "aux_loss_weight", 1.0))
+                if _gm_cfg
+                else 1.0,
+                lambda_balance=float(getattr(_gm_cfg, "lambda_balance", 0.01))
+                if _gm_cfg
+                else 0.01,
+                lambda_importance=float(getattr(_gm_cfg, "lambda_importance", 0.01))
+                if _gm_cfg
+                else 0.01,
+                lambda_capacity=float(getattr(_gm_cfg, "lambda_capacity", 0.0))
+                if _gm_cfg
+                else 0.0,
+                router_z_loss_weight=float(
+                    getattr(_gm_cfg, "router_z_loss_weight", 0.0)
+                )
+                if _gm_cfg
+                else 0.0,
+                capacity_factor=float(getattr(_gm_cfg, "capacity_factor", 1.25))
+                if _gm_cfg
+                else 1.25,
+                local_kernels=tuple(getattr(_gm_cfg, "local_kernels", [1, 3, 5]))
+                if _gm_cfg
+                else (1, 3, 5),
+                local_expansion=int(getattr(_gm_cfg, "local_expansion", 2))
+                if _gm_cfg
+                else 2,
+                local_use_density_gate=bool(
+                    getattr(_gm_cfg, "local_use_density_gate", True)
+                )
+                if _gm_cfg
+                else True,
+                local_window_size=int(getattr(_gm_cfg, "local_window_size", 0))
+                if _gm_cfg
+                else 0,
+                num_heads=int(getattr(_gm_cfg, "num_heads", 4)) if _gm_cfg else 4,
+                use_density_bias=bool(getattr(_gm_cfg, "use_density_bias", True))
+                if _gm_cfg
+                else True,
+                density_bias_scale=float(
+                    getattr(_gm_cfg, "density_bias_scale", 1.0)
+                )
+                if _gm_cfg
+                else 1.0,
+                attn_dropout=float(getattr(_gm_cfg, "attn_dropout", 0.1))
+                if _gm_cfg
+                else 0.1,
+                scale_dilations=tuple(getattr(_gm_cfg, "scale_dilations", [1, 2, 4]))
+                if _gm_cfg
+                else (1, 2, 4),
+                background_max_suppression=float(
+                    getattr(_gm_cfg, "background_max_suppression", 0.5)
+                )
+                if _gm_cfg
+                else 0.5,
+                residual_gate_init=float(
+                    getattr(_gm_cfg, "residual_gate_init", 1.0)
+                )
+                if _gm_cfg
+                else 1.0,
+                disabled_experts=tuple(getattr(_gm_cfg, "disabled_experts", []))
+                if _gm_cfg
+                else (),
+                disable_local_occlusion=bool(
+                    getattr(_gm_cfg, "disable_local_occlusion", False)
+                )
+                if _gm_cfg
+                else False,
+                disable_nonlocal_context=bool(
+                    getattr(_gm_cfg, "disable_nonlocal_context", False)
+                )
+                if _gm_cfg
+                else False,
+                disable_tiny_perspective=bool(
+                    getattr(_gm_cfg, "disable_tiny_perspective", False)
+                )
+                if _gm_cfg
+                else False,
+                disable_scale_specialist=bool(
+                    getattr(_gm_cfg, "disable_scale_specialist", False)
+                )
+                if _gm_cfg
+                else False,
+                disable_background_suppress=bool(
+                    getattr(_gm_cfg, "disable_background_suppress", False)
+                )
+                if _gm_cfg
+                else False,
+            )
+            self.esca = None
+            self.moe = None
+            self.density_gcn = None
+            self.feature_gcn = None
+            self.alpha = None
+            self.gm = None
+            self.graph_attn_moe = None
+            self.supernode_gcn = None
+            self.cross_stream_gcn = None
+            self.mamba_moe = None
+            self.sdd_moe = None
         elif self.use_graph_attn_moe:
             _gam = graph_attn_moe_cfg
             self.graph_attn_moe: GraphAwareMoE | None = GraphAwareMoE(
@@ -893,7 +1078,13 @@ class DSGCnet(nn.Module):
                 lr_space=str(getattr(_mmm, "lr_space", "exp")) if _mmm else "exp",
                 num_blocks=int(getattr(_mmm, "num_blocks", 1)) if _mmm else 1,
                 mlp_hidden=int(getattr(_mmm, "mlp_hidden", 256)) if _mmm else 256,
-                drop_path=float(getattr(_mmm, "drop_path", 0.1)) if _mmm else 0.1,
+                drop_path=(
+                    regularization_drop_path
+                    if regularization_drop_path is not None
+                    else float(getattr(_mmm, "drop_path", 0.1))
+                    if _mmm
+                    else 0.1
+                ),
                 lambda_balance=float(getattr(_mmm, "lambda_balance", 0.01))
                 if _mmm
                 else 0.01,
@@ -909,6 +1100,64 @@ class DSGCnet(nn.Module):
             self.alpha = None
             self.gm = None
             self.graph_attn_moe = None
+            self.supernode_gcn = None
+            self.cross_stream_gcn = None
+            self.sdd_moe = None
+        elif self.use_mamba_vss_dual:
+            _mvd = mamba_vss_dual_cfg
+            self.mamba_vss_dual = MambaVSSDualFusion(
+                in_channels=256,
+                density_embed_dim=int(getattr(_mvd, "density_embed_dim", 64))
+                if _mvd
+                else 64,
+                d_state=int(getattr(_mvd, "d_state", 16)) if _mvd else 16,
+                d_conv=int(getattr(_mvd, "d_conv", 3)) if _mvd else 3,
+                mlp_ratio=float(getattr(_mvd, "mlp_ratio", 2.0)) if _mvd else 2.0,
+                vss_low_dim=(
+                    int(getattr(_mvd, "vss_low_dim"))
+                    if _mvd is not None and getattr(_mvd, "vss_low_dim", None) is not None
+                    else None
+                ),
+                num_vss_blocks=int(getattr(_mvd, "num_vss_blocks", 1))
+                if _mvd
+                else 1,
+                num_moe_blocks=int(getattr(_mvd, "num_moe_blocks", 1))
+                if _mvd
+                else 1,
+                num_experts=int(getattr(_mvd, "num_experts", 4)) if _mvd else 4,
+                top_k=int(getattr(_mvd, "top_k", 2)) if _mvd else 2,
+                lr_space=str(getattr(_mvd, "lr_space", "exp")) if _mvd else "exp",
+                expand=float(getattr(_mvd, "expand", 2.0)) if _mvd else 2.0,
+                d_spectral=int(getattr(_mvd, "d_spectral", 256)) if _mvd else 256,
+                mlp_hidden=int(getattr(_mvd, "mlp_hidden", 256)) if _mvd else 256,
+                drop_path=(
+                    regularization_drop_path
+                    if regularization_drop_path is not None
+                    else float(getattr(_mvd, "drop_path", 0.1))
+                    if _mvd
+                    else 0.1
+                ),
+                lambda_balance=float(getattr(_mvd, "lambda_balance", 0.01))
+                if _mvd
+                else 0.01,
+                use_density_hint=bool(getattr(_mvd, "use_density_hint", True))
+                if _mvd
+                else True,
+                fusion_spatial=bool(getattr(_mvd, "fusion_spatial", True))
+                if _mvd
+                else True,
+                gate_init=float(getattr(_mvd, "gate_init", 1e-3))
+                if _mvd
+                else 1e-3,
+            )
+            self.esca = None
+            self.moe = None
+            self.density_gcn = None
+            self.feature_gcn = None
+            self.alpha = None
+            self.gm = None
+            self.graph_attn_moe = None
+            self.mamba_moe = None
             self.supernode_gcn = None
             self.cross_stream_gcn = None
             self.sdd_moe = None
@@ -970,6 +1219,7 @@ class DSGCnet(nn.Module):
                         in_channels=256,
                         num_supernodes=gcn_num_supernodes,
                         num_heads=gcn_supernode_heads,
+                        dropout=gcn_dropout,
                     )
                 )
                 self.cross_stream_gcn = None
@@ -987,6 +1237,7 @@ class DSGCnet(nn.Module):
                         sim_threshold=gcn_sim_threshold,
                         use_uncertainty=use_uncertainty,
                         uncertainty_scale=uncertainty_scale,
+                        dropout=gcn_dropout,
                     )
                 )
                 self.supernode_gcn = None
@@ -1014,6 +1265,7 @@ class DSGCnet(nn.Module):
                         if cfg is not None
                         else None
                     ),
+                    dropout=gcn_dropout,
                 )
                 if self.feature_stream_type in {"transformer", "window_transformer"}:
                     _ft_cfg = feature_transformer_cfg
@@ -1053,6 +1305,7 @@ class DSGCnet(nn.Module):
                         sim_threshold=gcn_sim_threshold,
                         anisotropic=gcn_aniso,
                         conv_type=gcn_conv_type,
+                        dropout=gcn_dropout,
                     )
                 self.alpha: nn.Parameter | None = nn.Parameter(
                     torch.ones(3, dtype=torch.float32)
@@ -1554,6 +1807,7 @@ class DSGCnet(nn.Module):
         return (
             (self.use_moe and self.moe is not None)
             or (self.use_mamba_moe and self.mamba_moe is not None)
+            or (self.use_mamba_vss_dual and self.mamba_vss_dual is not None)
             or (self.use_sdd_moe and self.sdd_moe is not None)
             or self.light_moe is not None
             or self.neck_moe is not None
@@ -1571,6 +1825,8 @@ class DSGCnet(nn.Module):
             for momeb in self.mamba_moe.blocks:
                 params.extend(momeb.block.spatial_moe.router.parameters())  # type: ignore[union-attr]
             return params
+        if self.mamba_vss_dual is not None:
+            return self.mamba_vss_dual.get_router_parameters()
         if self.moe is None:
             return []
         return list(self.moe.context_encoder.parameters()) + list(
@@ -1782,6 +2038,9 @@ class DSGCnet(nn.Module):
             if self.geo_attn_post is not None and depth_map is not None:
                 features_pa = self.geo_attn_post(features_pa, depth_map)
 
+            features_pa = F.dropout2d(
+                features_pa, p=self.neck_dropout, training=self.training
+            )
             density_features = features_pa
             if self.clip_prompt_density is not None:
                 density_features, clip_prompt_info = self.clip_prompt_density(
@@ -1791,6 +2050,11 @@ class DSGCnet(nn.Module):
                     features_pa = density_features
 
             density = self.density_pred(density_features)
+
+        if self.use_msca_decoder:
+            features_pa = F.dropout2d(
+                features_pa, p=self.neck_dropout, training=self.training
+            )
 
         depth_aux_out = (
             self.depth_aux_head(features_pa) if self.depth_aux_head is not None else None
@@ -1871,6 +2135,17 @@ class DSGCnet(nn.Module):
             output_dict["moe_aux_losses"] = moe_aux_losses
             output_dict["moe_aux_total"] = moe_aux_losses.get("total_aux")
             output_dict["moe_weights"] = moe_weights
+        elif self.use_graph_moe:
+            assert self.graph_moe is not None
+            feature_fl, graph_aux_losses, graph_weights = self.graph_moe(
+                features_pa,
+                density,
+                uncertainty=uncertainty,
+                training=self.training,
+            )
+            output_dict["moe_aux_losses"] = graph_aux_losses
+            output_dict["moe_aux_total"] = graph_aux_losses.get("total_aux")
+            output_dict["moe_weights"] = graph_weights
         elif self.use_graph_attn_moe:
             assert self.graph_attn_moe is not None
             feature_fl, gam_aux_losses, gam_weights = self.graph_attn_moe(
@@ -1887,6 +2162,17 @@ class DSGCnet(nn.Module):
             output_dict["moe_aux_losses"] = mamba_aux_losses
             output_dict["moe_aux_total"] = mamba_aux_losses.get("total_aux")
             output_dict["moe_weights"] = mamba_weights
+        elif self.use_mamba_vss_dual:
+            assert self.mamba_vss_dual is not None
+            feature_fl, mvd_aux_losses, mvd_weights = self.mamba_vss_dual(
+                features_pa, density.detach(), training=self.training
+            )
+            output_dict["moe_aux_losses"] = mvd_aux_losses
+            output_dict["moe_aux_total"] = mvd_aux_losses.get("total_aux")
+            output_dict["moe_weights"] = mvd_weights
+            output_dict["mamba_vss_fusion_weights"] = (
+                self.mamba_vss_dual.last_fusion_weights
+            )
         elif self.use_sdd_moe:
             assert self.sdd_moe is not None
             feature_fl, sdd_aux_losses, sdd_weights = self.sdd_moe(

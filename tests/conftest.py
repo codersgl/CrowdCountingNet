@@ -62,6 +62,14 @@ def base_cfg():
                 "point_loss_type": "smooth_l1",
                 "point_smooth_l1_beta": 1.0,
                 "eos_coef": 0.5,
+                "regularization": {
+                    "neck_dropout": 0.0,
+                    "head_dropout": 0.0,
+                    "density_dropout": None,
+                    "gcn_dropout": None,
+                    "drop_path": None,
+                    "label_smoothing": 0.0,
+                },
                 "use_depth": False,
                 "depth": {
                     "encoder": "vitb",

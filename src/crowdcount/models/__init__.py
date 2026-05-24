@@ -23,6 +23,24 @@ def build_model(cfg: DictConfig, training: bool = False):
     use_clip_prompt_density = bool(
         getattr(cfg.model, "use_clip_prompt_density", False)
     ) or bool(getattr(clip_prompt_density_cfg, "enabled", False))
+    regularization_cfg = getattr(cfg.model, "regularization", None)
+
+    def _reg_float(key: str, default: float) -> float:
+        if regularization_cfg is None:
+            return default
+        value = getattr(regularization_cfg, key, default)
+        if value is None:
+            return default
+        return float(value)
+
+    def _reg_optional_float(key: str) -> float | None:
+        if regularization_cfg is None:
+            return None
+        value = getattr(regularization_cfg, key, None)
+        if value is None:
+            return None
+        return float(value)
+
     model = DSGCnet(
         backbone,
         row=cfg.model.row,
@@ -38,7 +56,9 @@ def build_model(cfg: DictConfig, training: bool = False):
         msaa_variant=getattr(cfg.model, "msaa_variant", "legacy"),
         moe_cfg=getattr(cfg.model, "moe", None),
         graph_attn_moe_cfg=getattr(cfg.model, "graph_attn_moe", None),
+        graph_moe_cfg=getattr(cfg.model, "graph_moe", None),
         mamba_moe_cfg=getattr(cfg.model, "mamba_moe", None),
+        mamba_vss_dual_cfg=getattr(cfg.model, "mamba_vss_dual", None),
         sdd_moe_cfg=getattr(cfg.model, "sdd_moe", None),
         use_depth=getattr(cfg.model, "use_depth", False),
         depth_cfg=getattr(cfg.model, "depth", None),
@@ -124,6 +144,11 @@ def build_model(cfg: DictConfig, training: bool = False):
             cfg.model, "use_density_adaptive_fusion", False
         ),
         density_adaptive_fusion_cfg=getattr(cfg.model, "density_adaptive_fusion", None),
+        neck_dropout=_reg_float("neck_dropout", 0.0),
+        head_dropout=_reg_float("head_dropout", 0.0),
+        density_dropout=_reg_optional_float("density_dropout"),
+        gcn_dropout=_reg_optional_float("gcn_dropout"),
+        regularization_drop_path=_reg_optional_float("drop_path"),
     )
 
     if not training:
@@ -173,6 +198,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         point_smooth_l1_beta=float(
             getattr(cfg.model, "point_smooth_l1_beta", 1.0)
         ),
+        label_smoothing=_reg_float("label_smoothing", 0.0),
     )
 
     # Uncertainty weighting (Kendall et al. 2018)

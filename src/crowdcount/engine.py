@@ -217,6 +217,10 @@ def train_one_epoch(
         else 0.005
     )
     model_moe_cfg = getattr(getattr(cfg, "model", None), "moe", None)
+    model_graph_attn_moe_cfg = getattr(
+        getattr(cfg, "model", None), "graph_attn_moe", None
+    )
+    model_graph_moe_cfg = getattr(getattr(cfg, "model", None), "graph_moe", None)
     model_neck_moe_cfg = getattr(getattr(cfg, "model", None), "neck_moe", None)
     fusion_mode = str(getattr(getattr(cfg, "model", None), "fusion_mode", "gcn"))
     use_neck_moe = bool(
@@ -232,6 +236,14 @@ def train_one_epoch(
     if use_neck_moe and fusion_mode == "gcn" and model_neck_moe_cfg is not None:
         moe_aux_weight = float(
             getattr(model_neck_moe_cfg, "aux_loss_weight", moe_aux_weight)
+        )
+    if fusion_mode == "graph_attn_moe" and model_graph_attn_moe_cfg is not None:
+        moe_aux_weight = float(
+            getattr(model_graph_attn_moe_cfg, "aux_loss_weight", moe_aux_weight)
+        )
+    if fusion_mode == "graph_moe" and model_graph_moe_cfg is not None:
+        moe_aux_weight = float(
+            getattr(model_graph_moe_cfg, "aux_loss_weight", moe_aux_weight)
         )
     model_sdd_moe_cfg = getattr(getattr(cfg, "model", None), "sdd_moe", None)
     if fusion_mode == "sdd_moe" and model_sdd_moe_cfg is not None:
@@ -762,6 +774,10 @@ def train_one_epoch(
             moe_aux_losses = outputs.get("moe_aux_losses") or {}
             for key in (
                 "l_balance",
+                "l_importance",
+                "l_capacity",
+                "l_router_z",
+                "router_entropy",
                 "l_decorr",
                 "l_scale",
                 "l_ssim",
@@ -774,6 +790,8 @@ def train_one_epoch(
             moe_module = (
                 getattr(model, "moe", None)
                 or getattr(model, "light_moe", None)
+                or getattr(model, "graph_moe", None)
+                or getattr(model, "graph_attn_moe", None)
                 or getattr(model, "sdd_moe", None)
                 or getattr(model, "neck_moe", None)
             )

@@ -21,6 +21,13 @@ def _cfg_get(cfg: object | None, key: str, default: object) -> object:
     return getattr(cfg, key, default)
 
 
+def _resolve_dropout(dropout: float | None, default: float) -> float:
+    value = default if dropout is None else float(dropout)
+    if value < 0.0 or value >= 1.0:
+        raise ValueError(f"dropout must be in [0, 1), got {value}")
+    return value
+
+
 def compute_uncertainty(density: torch.Tensor) -> torch.Tensor:
     """Compute pixel-wise uncertainty from a density prediction.
 
@@ -608,7 +615,7 @@ class ECAGCNModel(nn.Module):
         self.conv2 = ECAConv(hidden_channels, out_channels)
         self.norm1 = nn.LayerNorm(hidden_channels)
         self.norm2 = nn.LayerNorm(out_channels)
-        self.dropout = dropout
+        self.dropout = _resolve_dropout(dropout, 0.1)
         # Residual projection if dims mismatch
         self.res_proj = (
             nn.Linear(in_channels, out_channels, bias=False)
@@ -639,18 +646,20 @@ class GCNModel(nn.Module):
         in_channels: int = 256,
         hidden_channels: int = 512,
         out_channels: int = 256,
+        dropout: float = 0.5,
     ):
         super().__init__()
         self.conv1 = GCNConv(in_channels, hidden_channels)
         self.conv2 = GCNConv(hidden_channels, out_channels)
+        self.dropout = _resolve_dropout(dropout, 0.5)
 
     def forward(self, tensor: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         x = self.conv1(tensor, edge_index)
         x = F.relu(x)
-        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.dropout(x, p=self.dropout, training=self.training)
         x = self.conv2(x, edge_index)
         x = F.relu(x)
-        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.dropout(x, p=self.dropout, training=self.training)
         return x
 
 
@@ -674,6 +683,7 @@ class GATv2Model(nn.Module):
         assert hidden_channels % heads == 0, (
             f"hidden_channels ({hidden_channels}) must be divisible by heads ({heads})"
         )
+        dropout = _resolve_dropout(dropout, 0.1)
         # Layer 1: multi-head with concat → output dim = hidden_channels
         self.conv1 = GATv2Conv(
             in_channels,
@@ -694,7 +704,7 @@ class GATv2Model(nn.Module):
         )
         self.norm1 = nn.LayerNorm(hidden_channels)
         self.norm2 = nn.LayerNorm(out_channels)
-        self.dropout = dropout
+        self.dropout = _resolve_dropout(dropout, 0.1)
         self.res_proj = (
             nn.Linear(in_channels, out_channels, bias=False)
             if in_channels != out_channels
@@ -948,6 +958,7 @@ class DensityGCNProcessor(nn.Module):
         spatial_alpha: float = 1.0,
         spatial_beta: float = 1.0,
         depth_prior_cfg: object | None = None,
+        dropout: float | None = None,
     ):
         super().__init__()
         self._use_uncertainty = use_uncertainty
@@ -984,11 +995,26 @@ class DensityGCNProcessor(nn.Module):
         else:
             self.graph_builder = DensityGraphBuilder(k)
         if conv_type == "gatv2":
-            self.gcn = GATv2Model(in_channels, hidden_channels, out_channels)
+            self.gcn = GATv2Model(
+                in_channels,
+                hidden_channels,
+                out_channels,
+                dropout=_resolve_dropout(dropout, 0.1),
+            )
         elif anisotropic:
-            self.gcn = ECAGCNModel(in_channels, hidden_channels, out_channels)
+            self.gcn = ECAGCNModel(
+                in_channels,
+                hidden_channels,
+                out_channels,
+                dropout=_resolve_dropout(dropout, 0.1),
+            )
         else:
-            self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
+            self.gcn = GCNModel(
+                in_channels,
+                hidden_channels,
+                out_channels,
+                dropout=_resolve_dropout(dropout, 0.5),
+            )
 
     def forward(
         self,
@@ -1037,6 +1063,7 @@ class FeatureGCNProcessor(nn.Module):
         sim_threshold: float = 0.5,
         anisotropic: bool = False,
         conv_type: str = "gcn",
+        dropout: float | None = None,
     ):
         super().__init__()
         self._anisotropic = anisotropic
@@ -1048,11 +1075,26 @@ class FeatureGCNProcessor(nn.Module):
         else:
             self.graph_builder = FeatureGraphBuilder(k)
         if conv_type == "gatv2":
-            self.gcn = GATv2Model(in_channels, hidden_channels, out_channels)
+            self.gcn = GATv2Model(
+                in_channels,
+                hidden_channels,
+                out_channels,
+                dropout=_resolve_dropout(dropout, 0.1),
+            )
         elif anisotropic:
-            self.gcn = ECAGCNModel(in_channels, hidden_channels, out_channels)
+            self.gcn = ECAGCNModel(
+                in_channels,
+                hidden_channels,
+                out_channels,
+                dropout=_resolve_dropout(dropout, 0.1),
+            )
         else:
-            self.gcn = GCNModel(in_channels, hidden_channels, out_channels)
+            self.gcn = GCNModel(
+                in_channels,
+                hidden_channels,
+                out_channels,
+                dropout=_resolve_dropout(dropout, 0.5),
+            )
 
     def forward(self, feature_maps: torch.Tensor) -> torch.Tensor:
         B, C, H, W = feature_maps.shape
@@ -1205,6 +1247,7 @@ class CrossStreamGCNProcessor(nn.Module):
         sim_threshold: float = 0.5,
         use_uncertainty: bool = False,
         uncertainty_scale: float = 6.0,
+        dropout: float | None = None,
     ) -> None:
         super().__init__()
 
@@ -1232,7 +1275,12 @@ class CrossStreamGCNProcessor(nn.Module):
         else:
             self.feature_builder = FeatureGraphBuilder(k)
 
-        self.gcn = CrossStreamGCNModel(in_channels, hidden_channels, out_channels)
+        self.gcn = CrossStreamGCNModel(
+            in_channels,
+            hidden_channels,
+            out_channels,
+            dropout=_resolve_dropout(dropout, 0.1),
+        )
         # Only flag uncertainty if the builder actually supports it
         self._use_uncertainty = isinstance(
             self.density_builder, UncertaintyAdaptiveDensityGraphBuilder
@@ -1290,11 +1338,13 @@ class SuperNodeGCNProcessor(nn.Module):
         num_supernodes: int = 8,
         num_heads: int = 4,
         hidden_channels: int = 512,
+        dropout: float | None = None,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.num_supernodes = num_supernodes
         self.num_heads = num_heads
+        self.dropout = _resolve_dropout(dropout, 0.3)
         head_dim = in_channels // num_heads
 
         # Learnable super-node embeddings (scene prototypes)
@@ -1399,7 +1449,7 @@ class SuperNodeGCNProcessor(nn.Module):
         edges = self._fc_edges.unsqueeze(0).expand(B, -1, -1) + batch_offset
         edges = edges.view(2, -1)  # [2, B*M*M]
         sn_flat = F.relu(self.sn_conv(sn_flat, edges))
-        sn_flat = F.dropout(sn_flat, p=0.3, training=self.training)
+        sn_flat = F.dropout(sn_flat, p=self.dropout, training=self.training)
         sn_flat = F.relu(self.sn_conv2(sn_flat, edges))
         supernodes_refined = sn_flat.view(B, M, C)
 

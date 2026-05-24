@@ -24,7 +24,9 @@ def test_hydra_config_schema(base_cfg):
     assert hasattr(cfg, "data")
     assert hasattr(cfg, "optimizer")
     assert hasattr(cfg, "scheduler")
+    assert hasattr(cfg.model, "regularization")
     assert cfg.model.backbone == "vgg16_bn"
+    assert cfg.model.regularization.label_smoothing == 0.0
     assert cfg.optimizer.lr > 0
     assert cfg.scheduler.lr_drop > 0
 

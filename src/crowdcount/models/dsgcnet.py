@@ -29,11 +29,13 @@ from crowdcount.models.head import (
     ForegroundSuppressionBranch,
     GatedDensityAttention,
     FreqDecoupledRouter,
+    PointGuidedDensityRefiner,
     PointRefineModule,
     RegressionModel,
     ResidualDensityAttention,
     SharedPredictionTrunk,
     SubPixelRefineModule,
+    point_predictions_to_density_map,
     DensityPred_Block3,
     DensityPred_Block4,
     DensityPred_Block5,
@@ -44,6 +46,7 @@ from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.concat_gate_fusion import ConcatGateFusion
 from crowdcount.plugins.depth_cross_attention import DepthCrossAttentionFusion
+from crowdcount.plugins.deformable_dual import DeformableDualFusion
 from crowdcount.plugins.depth_residual_gating import (
     DepthResidualGating,
     DepthResidualGatingV2,
@@ -282,9 +285,11 @@ class DSGCnet(nn.Module):
         self.use_mamba_vss_dual = fusion_mode == "mamba_vss_dual"
         self.use_sdd_moe = fusion_mode == "sdd_moe"
         self.use_sa_dgat = fusion_mode == "sa_dgat"
+        self.use_deformable_dual = fusion_mode == "deformable_dual"
         self.mamba_vss_dual: MambaVSSDualFusion | None = None
         self.sdd_moe: SDDMoE | None = None
         self.sa_dgat_fusion: SADGATFusion | None = None
+        self.deformable_dual_fusion: DeformableDualFusion | None = None
         self.graph_moe: GraphMoE | None = None
         self.use_depth = use_depth
         self.use_depth_geo = use_depth_geo
@@ -331,6 +336,69 @@ class DSGCnet(nn.Module):
         self.use_lfem_neck = use_lfem_neck
         self.use_neck_moe = use_neck_moe
         self.use_density_adaptive_fusion = use_density_adaptive_fusion
+
+        model_cfg = getattr(cfg, "model", cfg) if cfg is not None else None
+        point_feedback_cfg = (
+            getattr(model_cfg, "point_density_feedback", None)
+            if model_cfg is not None
+            else None
+        )
+        self.point_density_feedback_enabled = bool(
+            getattr(point_feedback_cfg, "enabled", False)
+            if point_feedback_cfg is not None
+            else False
+        )
+        self.point_density_feedback_detach_points = bool(
+            getattr(point_feedback_cfg, "detach_points", True)
+            if point_feedback_cfg is not None
+            else True
+        )
+        self.point_density_feedback_detach_scores = bool(
+            getattr(point_feedback_cfg, "detach_scores", True)
+            if point_feedback_cfg is not None
+            else True
+        )
+        self.point_density_feedback_score_threshold = float(
+            getattr(point_feedback_cfg, "score_threshold", 0.0)
+            if point_feedback_cfg is not None
+            else 0.0
+        )
+        self.point_density_feedback_gaussian_sigma = float(
+            getattr(point_feedback_cfg, "gaussian_sigma", 1.0)
+            if point_feedback_cfg is not None
+            else 1.0
+        )
+        self.point_density_feedback_debug = bool(
+            getattr(point_feedback_cfg, "debug", False)
+            if point_feedback_cfg is not None
+            else False
+        )
+        if self.point_density_feedback_gaussian_sigma < 0.0:
+            raise ValueError("point_density_feedback.gaussian_sigma must be non-negative")
+        if self.point_density_feedback_score_threshold < 0.0:
+            raise ValueError("point_density_feedback.score_threshold must be non-negative")
+        self.point_density_refiner: PointGuidedDensityRefiner | None = (
+            PointGuidedDensityRefiner(
+                feature_channels=256,
+                hidden_channels=int(
+                    getattr(point_feedback_cfg, "hidden_channels", 32)
+                    if point_feedback_cfg is not None
+                    else 32
+                ),
+                max_delta=float(
+                    getattr(point_feedback_cfg, "max_delta", 0.5)
+                    if point_feedback_cfg is not None
+                    else 0.5
+                ),
+                strength_init=float(
+                    getattr(point_feedback_cfg, "strength_init", 1e-3)
+                    if point_feedback_cfg is not None
+                    else 1e-3
+                ),
+            )
+            if self.point_density_feedback_enabled
+            else None
+        )
 
         _neck_flags = sum(
             [
@@ -437,9 +505,10 @@ class DSGCnet(nn.Module):
             "mamba_vss_dual",
             "sdd_moe",
             "sa_dgat",
+            "deformable_dual",
         }:
             raise ValueError(
-                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', 'graph_attn_moe', 'graph_moe', 'mamba_moe', 'mamba_vss_dual', 'sdd_moe', or 'sa_dgat'"
+                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', 'graph_attn_moe', 'graph_moe', 'mamba_moe', 'mamba_vss_dual', 'sdd_moe', 'sa_dgat', or 'deformable_dual'"
             )
         if self.feature_stream_type not in {"gcn", "transformer", "window_transformer"}:
             raise ValueError(
@@ -1165,6 +1234,44 @@ class DSGCnet(nn.Module):
             self.sdd_moe: SDDMoE | None = SDDMoE(
                 in_channels=256,
                 cfg=sdd_moe_cfg,
+            )
+            self.esca = None
+            self.moe = None
+            self.density_gcn = None
+            self.feature_gcn = None
+            self.alpha = None
+            self.gm = None
+            self.graph_attn_moe = None
+            self.mamba_moe = None
+            self.supernode_gcn = None
+            self.cross_stream_gcn = None
+        elif self.use_deformable_dual:
+            _dd_cfg_root = getattr(cfg, "model", cfg) if cfg is not None else None
+            _dd_cfg = (
+                getattr(_dd_cfg_root, "deformable_dual", None)
+                if _dd_cfg_root is not None
+                else None
+            )
+
+            def _get_dd(key: str, default):
+                return getattr(_dd_cfg, key, default) if _dd_cfg else default
+
+            _fusion_init = _get_dd("fusion_init_weights", [0.8, 0.1, 0.1])
+            self.deformable_dual_fusion = DeformableDualFusion(
+                in_channels=256,
+                num_points=int(_get_dd("num_points", 4)),
+                num_heads=int(_get_dd("num_heads", 4)),
+                max_offset=float(_get_dd("max_offset", 4.0)),
+                density_offset_rho=float(_get_dd("density_offset_rho", 0.5)),
+                density_gamma_init=float(_get_dd("density_gamma_init", 0.5)),
+                distance_lambda_init=float(_get_dd("distance_lambda_init", 1.0)),
+                dropout=float(_get_dd("dropout", 0.1)),
+                density_embed_dim=int(_get_dd("density_embed_dim", 32)),
+                fusion_hidden_channels=int(_get_dd("fusion_hidden_channels", 128)),
+                fusion_init_weights=tuple(float(w) for w in _fusion_init),
+                fusion_spatial=bool(_get_dd("fusion_spatial", True)),
+                residual_gate_init=float(_get_dd("residual_gate_init", 0.001)),
+                debug=bool(_get_dd("debug", False)),
             )
             self.esca = None
             self.moe = None
@@ -2186,6 +2293,13 @@ class DSGCnet(nn.Module):
             output_dict["moe_aux_losses"] = sdd_aux_losses
             output_dict["moe_aux_total"] = sdd_aux_losses.get("total_aux")
             output_dict["moe_weights"] = sdd_weights
+        elif self.use_deformable_dual:
+            assert self.deformable_dual_fusion is not None
+            feature_fl, deformable_dual_aux = self.deformable_dual_fusion(
+                features_pa,
+                density,
+            )
+            output_dict["deformable_dual_aux"] = deformable_dual_aux
         elif self.use_sa_dgat:
             assert self.sa_dgat_fusion is not None
             feature_fl, sa_dgat_aux = self.sa_dgat_fusion(
@@ -2351,5 +2465,38 @@ class DSGCnet(nn.Module):
                 img_h=img_h,
                 img_w=img_w,
             )
+
+        if self.point_density_refiner is not None:
+            density_base = output_dict["density_out"]
+            fg_scores = F.softmax(output_dict["pred_logits"], dim=-1)[:, :, 1]
+            point_heatmap = point_predictions_to_density_map(
+                output_dict["pred_points"],
+                fg_scores,
+                density_size=density_base.shape[-2:],
+                image_size=(samples.shape[-2], samples.shape[-1]),
+                gaussian_sigma=self.point_density_feedback_gaussian_sigma,
+                score_threshold=self.point_density_feedback_score_threshold,
+                detach_points=self.point_density_feedback_detach_points,
+                detach_scores=self.point_density_feedback_detach_scores,
+            ).to(dtype=density_base.dtype)
+            output_dict["density_base"] = density_base
+            output_dict["point_feedback_heatmap"] = point_heatmap
+            output_dict["density_out"] = self.point_density_refiner(
+                features_pa,
+                density_base,
+                point_heatmap,
+            )
+            if self.point_density_feedback_debug:
+                density_delta = self.point_density_refiner.last_delta
+                output_dict["point_feedback_stats"] = {
+                    "heatmap_sum": point_heatmap.sum(dim=(-2, -1)).mean().detach(),
+                    "heatmap_max": point_heatmap.amax(dim=(-2, -1)).mean().detach(),
+                    "delta_abs_mean": density_delta.abs().mean().detach()
+                    if density_delta is not None
+                    else density_base.new_tensor(0.0),
+                    "strength": self.point_density_refiner.last_strength
+                    if self.point_density_refiner.last_strength is not None
+                    else density_base.new_tensor(0.0),
+                }
 
         return output_dict

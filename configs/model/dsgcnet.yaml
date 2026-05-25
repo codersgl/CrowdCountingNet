@@ -11,6 +11,24 @@ eos_coef: 0.5
 count_loss_coef: 0.0 # Global counting L1 loss weight; set >0 to enable (recommended: 0.001~0.01)
 consistency_loss_coef: 0.0 # Density-point consistency loss weight; set >0 to enable (recommended: 0.001~0.01)
 
+# Point-to-density feedback: refine density_out with a confidence-weighted
+# heatmap splatted from final point predictions. Disabled by default so
+# existing density-guided main-branch behavior and baselines are unchanged.
+point_density_feedback:
+  enabled: false
+  hidden_channels: 32
+  gaussian_sigma: 1.0 # In density-map cells; 0 disables smoothing
+  score_threshold: 0.0 # Ignore low-confidence foreground scores in the heatmap
+  detach_points: true # Keep density feedback from perturbing point coordinates by default
+  detach_scores: true # Keep density feedback from perturbing classification by default
+  max_delta: 0.5 # Absolute residual bound added to density_base
+  strength_init: 0.001 # Near-identity initial refinement
+  loss_weight: 0.0 # Global criterion weight for match-aware point->density feedback
+  loss_margin: 1.0 # Density sampled at matched predicted points should exceed this
+  count_weight: 0.1 # Relative normalized count term inside feedback loss
+  warmup_epochs: 0 # Ramp loss weight from 0 to loss_weight over N epochs
+  debug: false # Return point_feedback_* tensors/stats in model outputs
+
 # Regularization knobs. Defaults preserve existing behavior.
 # Set numeric values via CLI, e.g. model.regularization.head_dropout=0.1.
 regularization:
@@ -80,12 +98,13 @@ clip_prompt_density:
 use_rccformer_neck: false
 rccformer_deab_blocks: 2 # Number of DEAB blocks in density prediction branch
 
-# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe | graph_moe | mamba_moe | mamba_vss_dual | sa_dgat
+# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe | graph_moe | mamba_moe | mamba_vss_dual | sdd_moe | sa_dgat | deformable_dual
 # gcn_moe: GCN dual-stream + LightMoE post-refinement (recommended)
 # graph_attn_moe: 2-expert MoE (local conv + graph-biased attention)
 # graph_moe: 5-expert unified GraphMoE replacement for dual-stream GCN
 # mamba_moe: routed directional Mamba experts + shared channel scan
 # mamba_vss_dual: density-guided VSS stream + MambaMoE feature stream
+# deformable_dual: dual-stream residual deformable attention replacement for GCN
 # sa_dgat: Scale-Aware Deformable Graph Attention Network
 fusion_mode: gcn
 
@@ -158,6 +177,25 @@ feature_transformer:
   dropout: 0.0
   gate_init: 0.0 # tanh gate init; 0 starts as identity for stable ablations
   mode: window # window | global
+
+# Dual-stream deformable attention fusion (only used when fusion_mode: deformable_dual)
+# Replaces DensityGCN/FeatureGCN with density-guided and feature-guided
+# deformable attention branches. Initial sampling is the four-neighbour cross
+# pattern so the first ablation is close to local message passing.
+deformable_dual:
+  num_points: 4 # aligns with default gcn_k=4 for fair first-pass ablations
+  num_heads: 4
+  max_offset: 4.0 # maximum learned residual offset in feature-grid cells
+  density_offset_rho: 0.5 # high-density regions can learn a larger sampling radius
+  density_gamma_init: 0.5 # learnable density-similarity bias strength
+  distance_lambda_init: 1.0 # learnable distance penalty strength
+  dropout: 0.1
+  density_embed_dim: 32
+  fusion_hidden_channels: 128
+  fusion_spatial: true # true: per-pixel [B,3,H,W] gate | false: per-image gate
+  fusion_init_weights: [0.8, 0.1, 0.1] # initial weights for PA/density/feature streams
+  residual_gate_init: 0.001 # near-identity branch updates at training start
+  debug: false # include sample coordinates in deformable_dual_aux
 
 moe:
   top_k: 3 # all experts active (soft routing); kept for API compat

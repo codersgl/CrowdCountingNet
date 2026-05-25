@@ -656,6 +656,95 @@ def test_consistency_loss_without_density(dummy_targets, cfg):
     assert losses["loss_consistency"].item() == 0.0
 
 
+def test_point_density_feedback_loss_scalar_finite(dummy_outputs, dummy_targets, cfg):
+    """Point-density feedback loss should be finite when enabled."""
+    matcher = build_matcher_crowd(cfg)
+    dummy_outputs["img_size"] = (128, 128)
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_point_density_feedback": 0.005},
+        eos_coef=cfg.model.eos_coef,
+        losses=["point_density_feedback"],
+    )
+    losses = criterion(dummy_outputs, dummy_targets)
+    value = losses["loss_point_density_feedback"]
+    assert value.dim() == 0
+    assert torch.isfinite(value)
+
+
+def test_point_density_feedback_high_density_lower_loss(cfg):
+    """Density at matched predicted points should reduce the feedback loss."""
+    matcher = build_matcher_crowd(cfg)
+    targets = [
+        {
+            "labels": torch.ones(1, dtype=torch.long),
+            "point": torch.tensor([[32.0, 32.0]], dtype=torch.float32),
+        }
+    ]
+    base_outputs = {
+        "pred_logits": torch.tensor([[[0.0, 5.0], [5.0, 0.0]]]),
+        "pred_points": torch.tensor([[[32.0, 32.0], [0.0, 0.0]]]),
+        "img_size": (64, 64),
+    }
+    zero_density = torch.zeros(1, 1, 4, 4)
+    high_density = torch.full((1, 1, 4, 4), 2.0)
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_point_density_feedback": 1.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["point_density_feedback"],
+        point_density_feedback_count_weight=0.0,
+    )
+
+    zero_loss = criterion(
+        {**base_outputs, "density_out": zero_density},
+        targets,
+    )["loss_point_density_feedback"]
+    high_loss = criterion(
+        {**base_outputs, "density_out": high_density},
+        targets,
+    )["loss_point_density_feedback"]
+
+    assert high_loss < zero_loss
+
+
+def test_point_density_feedback_detaches_point_branch_by_default(cfg):
+    """The feedback loss should not backpropagate into point predictions by default."""
+    matcher = build_matcher_crowd(cfg)
+    pred_logits = torch.tensor([[[0.0, 5.0]]], requires_grad=True)
+    pred_points = torch.tensor([[[32.0, 32.0]]], requires_grad=True)
+    density = torch.zeros(1, 1, 4, 4, requires_grad=True)
+    outputs = {
+        "pred_logits": pred_logits,
+        "pred_points": pred_points,
+        "density_out": density,
+        "img_size": (64, 64),
+    }
+    targets = [
+        {
+            "labels": torch.ones(1, dtype=torch.long),
+            "point": torch.tensor([[32.0, 32.0]], dtype=torch.float32),
+        }
+    ]
+    criterion = SetCriterion_Crowd(
+        num_classes=1,
+        matcher=matcher,
+        weight_dict={"loss_point_density_feedback": 1.0},
+        eos_coef=cfg.model.eos_coef,
+        losses=["point_density_feedback"],
+        point_density_feedback_count_weight=0.0,
+    )
+
+    loss = criterion(outputs, targets)["loss_point_density_feedback"]
+    loss.backward()
+
+    assert density.grad is not None
+    assert pred_points.grad is None
+    assert pred_logits.grad is None
+
+
 def test_consistency_img_size_coordinate_mapping(cfg):
     """Verify that img_size correctly maps pixel coords to density map cells.
 

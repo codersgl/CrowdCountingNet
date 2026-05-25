@@ -336,6 +336,23 @@ def train_one_epoch(
         or use_depth_graph_prior
     )
     needs_depth_batch = use_depth_input or use_depth_aux
+    point_feedback_cfg = (
+        getattr(getattr(cfg, "model", None), "point_density_feedback", None)
+        if cfg is not None
+        else None
+    )
+    point_feedback_warmup_epochs = int(
+        getattr(point_feedback_cfg, "warmup_epochs", 0)
+        if point_feedback_cfg is not None
+        else 0
+    )
+    if point_feedback_warmup_epochs > 0:
+        point_feedback_warmup_factor = min(
+            1.0,
+            float(epoch + 1) / float(point_feedback_warmup_epochs),
+        )
+    else:
+        point_feedback_warmup_factor = 1.0
 
     for batch in data_loader:
         if needs_depth_batch:
@@ -358,7 +375,12 @@ def train_one_epoch(
             gt_density=gt_dmap,
         )
         loss_dict = criterion(outputs, targets)
-        weight_dict = cast(dict[str, torch.Tensor | float], criterion.weight_dict)
+        weight_dict = dict(cast(dict[str, torch.Tensor | float], criterion.weight_dict))
+        if "loss_point_density_feedback" in weight_dict:
+            weight_dict["loss_point_density_feedback"] = (
+                weight_dict["loss_point_density_feedback"]
+                * point_feedback_warmup_factor
+            )
 
         # When uncertainty weighter is active, CE and regression losses are
         # weighted by learned σ parameters instead of fixed weight_dict values.
@@ -742,6 +764,13 @@ def train_one_epoch(
                 depth_aux_pixel_loss=depth_aux_pixel_loss.item(),
                 depth_aux_grad_loss=depth_aux_grad_loss.item(),
                 depth_aux_warmup=depth_aux_warmup,
+            )
+        if (
+            point_feedback_warmup_epochs > 0
+            and "loss_point_density_feedback" in loss_dict
+        ):
+            metric_logger.update(
+                point_density_feedback_warmup=point_feedback_warmup_factor
             )
 
         if fusion_mode == "sa_dgat":

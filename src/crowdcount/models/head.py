@@ -112,6 +112,194 @@ class ResidualDensityAttention(nn.Module):
         return feature * scale.to(dtype=feature.dtype)
 
 
+def _normalise_spatial_map(value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    value_log = torch.log1p(value.clamp_min(0.0))
+    mean = value_log.mean(dim=(-2, -1), keepdim=True)
+    std = value_log.std(dim=(-2, -1), keepdim=True, unbiased=False)
+    return (value_log - mean) / (std + eps)
+
+
+def point_predictions_to_density_map(
+    pred_points: torch.Tensor,
+    pred_scores: torch.Tensor,
+    density_size: tuple[int, int],
+    image_size: tuple[int, int],
+    gaussian_sigma: float = 1.0,
+    score_threshold: float = 0.0,
+    detach_points: bool = True,
+    detach_scores: bool = True,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Splat point predictions into a count-preserving density-sized heatmap."""
+    if pred_points.dim() != 3 or pred_points.shape[-1] != 2:
+        raise ValueError("pred_points must have shape [B, Q, 2]")
+    if pred_scores.dim() == 3 and pred_scores.shape[-1] == 1:
+        pred_scores = pred_scores.squeeze(-1)
+    if pred_scores.dim() != 2:
+        raise ValueError("pred_scores must have shape [B, Q]")
+    if pred_points.shape[:2] != pred_scores.shape:
+        raise ValueError("pred_points and pred_scores must share [B, Q]")
+
+    height, width = int(density_size[0]), int(density_size[1])
+    img_height, img_width = int(image_size[0]), int(image_size[1])
+    if height <= 0 or width <= 0:
+        raise ValueError("density_size must contain positive values")
+    if img_height <= 0 or img_width <= 0:
+        raise ValueError("image_size must contain positive values")
+    if gaussian_sigma < 0:
+        raise ValueError("gaussian_sigma must be non-negative")
+    if eps <= 0:
+        raise ValueError("eps must be positive")
+
+    points = pred_points.detach() if detach_points else pred_points
+    scores = pred_scores.detach() if detach_scores else pred_scores
+    scores = scores.to(dtype=points.dtype).clamp_min(0.0)
+
+    batch_size, num_points, _ = points.shape
+    heatmap_flat = points.new_zeros(batch_size, height * width)
+    if num_points == 0:
+        return heatmap_flat.view(batch_size, 1, height, width)
+
+    x = points[..., 0]
+    y = points[..., 1]
+    valid = (
+        (scores >= float(score_threshold))
+        & (x >= 0.0)
+        & (y >= 0.0)
+        & (x <= float(max(img_width - 1, 0)))
+        & (y <= float(max(img_height - 1, 0)))
+    )
+    scores = scores * valid.to(dtype=scores.dtype)
+
+    x_grid = x / float(max(img_width - 1, 1)) * float(max(width - 1, 0))
+    y_grid = y / float(max(img_height - 1, 1)) * float(max(height - 1, 0))
+    x_grid = x_grid.clamp(0.0, float(max(width - 1, 0)))
+    y_grid = y_grid.clamp(0.0, float(max(height - 1, 0)))
+
+    x0 = x_grid.floor().to(torch.long)
+    y0 = y_grid.floor().to(torch.long)
+    x1 = (x0 + 1).clamp(max=width - 1)
+    y1 = (y0 + 1).clamp(max=height - 1)
+
+    wx1 = x_grid - x0.to(dtype=x_grid.dtype)
+    wy1 = y_grid - y0.to(dtype=y_grid.dtype)
+    wx0 = 1.0 - wx1
+    wy0 = 1.0 - wy1
+
+    def _scatter(ix: torch.Tensor, iy: torch.Tensor, weight: torch.Tensor) -> None:
+        index = iy * width + ix
+        heatmap_flat.scatter_add_(1, index, scores * weight)
+
+    _scatter(x0, y0, wx0 * wy0)
+    _scatter(x1, y0, wx1 * wy0)
+    _scatter(x0, y1, wx0 * wy1)
+    _scatter(x1, y1, wx1 * wy1)
+
+    heatmap = heatmap_flat.view(batch_size, 1, height, width)
+    if gaussian_sigma <= 0:
+        return heatmap
+
+    radius = max(int(math.ceil(3.0 * float(gaussian_sigma))), 1)
+    offsets = torch.arange(
+        -radius,
+        radius + 1,
+        device=heatmap.device,
+        dtype=heatmap.dtype,
+    )
+    kernel_1d = torch.exp(-(offsets * offsets) / (2.0 * float(gaussian_sigma) ** 2))
+    kernel_1d = kernel_1d / kernel_1d.sum().clamp_min(eps)
+    kernel_x = kernel_1d.view(1, 1, 1, -1)
+    kernel_y = kernel_1d.view(1, 1, -1, 1)
+
+    target_sum = heatmap.sum(dim=(-2, -1), keepdim=True)
+    heatmap = F.conv2d(heatmap, kernel_x, padding=(0, radius))
+    heatmap = F.conv2d(heatmap, kernel_y, padding=(radius, 0))
+    blurred_sum = heatmap.sum(dim=(-2, -1), keepdim=True)
+    return heatmap * (target_sum / blurred_sum.clamp_min(eps))
+
+
+class PointGuidedDensityRefiner(nn.Module):
+    """Residual density refinement driven by detached point-localisation priors."""
+
+    def __init__(
+        self,
+        feature_channels: int = 256,
+        hidden_channels: int = 32,
+        max_delta: float = 0.5,
+        strength_init: float = 1e-3,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if feature_channels <= 0:
+            raise ValueError("feature_channels must be positive")
+        if hidden_channels <= 0:
+            raise ValueError("hidden_channels must be positive")
+        if max_delta <= 0:
+            raise ValueError("max_delta must be positive")
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+
+        self.max_delta = float(max_delta)
+        self.eps = float(eps)
+        self.feature_proj = nn.Sequential(
+            nn.Conv2d(feature_channels, hidden_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.map_proj = nn.Sequential(
+            nn.Conv2d(2, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(hidden_channels * 2, hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+        )
+        nn.init.zeros_(self.fuse[2].weight)
+        nn.init.zeros_(self.fuse[2].bias)
+        self.strength = nn.Parameter(torch.tensor(float(strength_init)))
+        self.last_delta: torch.Tensor | None = None
+        self.last_strength: torch.Tensor | None = None
+
+    def forward(
+        self,
+        feature: torch.Tensor,
+        density_base: torch.Tensor,
+        point_heatmap: torch.Tensor,
+    ) -> torch.Tensor:
+        if density_base.dim() != 4 or density_base.shape[1] != 1:
+            raise ValueError("density_base must have shape [B, 1, H, W]")
+        if point_heatmap.dim() != 4 or point_heatmap.shape[1] != 1:
+            raise ValueError("point_heatmap must have shape [B, 1, H, W]")
+        target_size = density_base.shape[-2:]
+        if feature.shape[-2:] != target_size:
+            feature = F.interpolate(
+                feature,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        if point_heatmap.shape[-2:] != target_size:
+            point_heatmap = F.interpolate(
+                point_heatmap,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        density_norm = _normalise_spatial_map(density_base, self.eps)
+        point_norm = _normalise_spatial_map(point_heatmap, self.eps)
+        map_input = torch.cat([density_norm, point_norm], dim=1).to(dtype=feature.dtype)
+        fused = torch.cat([self.feature_proj(feature), self.map_proj(map_input)], dim=1)
+        residual = torch.tanh(self.fuse(fused)).to(dtype=density_base.dtype)
+        strength = torch.tanh(self.strength).to(dtype=density_base.dtype)
+        delta = strength * self.max_delta * residual
+        self.last_delta = delta.detach()
+        self.last_strength = strength.detach().reshape(())
+        return torch.relu(density_base + delta)
+
+
 class EnhancedDensityAttention(nn.Module):
     """Multi-scale, channel+spatial density attention with gradient-aware boundary enhancement.
 

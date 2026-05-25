@@ -24,6 +24,12 @@ def build_model(cfg: DictConfig, training: bool = False):
         getattr(cfg.model, "use_clip_prompt_density", False)
     ) or bool(getattr(clip_prompt_density_cfg, "enabled", False))
     regularization_cfg = getattr(cfg.model, "regularization", None)
+    point_feedback_cfg = getattr(cfg.model, "point_density_feedback", None)
+    point_feedback_loss_weight = float(
+        getattr(point_feedback_cfg, "loss_weight", 0.0)
+        if point_feedback_cfg is not None
+        else 0.0
+    )
 
     def _reg_float(key: str, default: float) -> float:
         if regularization_cfg is None:
@@ -162,10 +168,13 @@ def build_model(cfg: DictConfig, training: bool = False):
         if getattr(cfg.model, "use_refine", False)
         else 0.0,
         "loss_consistency": float(getattr(cfg.model, "consistency_loss_coef", 0.0)),
+        "loss_point_density_feedback": point_feedback_loss_weight,
     }
     losses = ["labels", "points", "count", "consistency"]
     if getattr(cfg.model, "use_refine", False):
         losses.append("refine")
+    if point_feedback_loss_weight > 0.0:
+        losses.append("point_density_feedback")
     matcher = build_matcher_crowd(cfg)
 
     # Focal loss config
@@ -199,6 +208,26 @@ def build_model(cfg: DictConfig, training: bool = False):
             getattr(cfg.model, "point_smooth_l1_beta", 1.0)
         ),
         label_smoothing=_reg_float("label_smoothing", 0.0),
+        point_density_feedback_margin=float(
+            getattr(point_feedback_cfg, "loss_margin", 1.0)
+            if point_feedback_cfg is not None
+            else 1.0
+        ),
+        point_density_feedback_count_weight=float(
+            getattr(point_feedback_cfg, "count_weight", 0.1)
+            if point_feedback_cfg is not None
+            else 0.1
+        ),
+        point_density_feedback_detach_points=bool(
+            getattr(point_feedback_cfg, "detach_points", True)
+            if point_feedback_cfg is not None
+            else True
+        ),
+        point_density_feedback_detach_scores=bool(
+            getattr(point_feedback_cfg, "detach_scores", True)
+            if point_feedback_cfg is not None
+            else True
+        ),
     )
 
     # Uncertainty weighting (Kendall et al. 2018)

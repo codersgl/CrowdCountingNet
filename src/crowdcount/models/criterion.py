@@ -135,6 +135,10 @@ class SetCriterion_Crowd(nn.Module):
         label_smoothing: float = 0.0,
         point_loss_type: str = "smooth_l1",
         point_smooth_l1_beta: float = 1.0,
+        point_density_feedback_margin: float = 1.0,
+        point_density_feedback_count_weight: float = 0.1,
+        point_density_feedback_detach_points: bool = True,
+        point_density_feedback_detach_scores: bool = True,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -171,6 +175,20 @@ class SetCriterion_Crowd(nn.Module):
             )
         self.point_loss_type = point_loss_type
         self.point_smooth_l1_beta = point_smooth_l1_beta
+        if point_density_feedback_margin <= 0:
+            raise ValueError("point_density_feedback_margin must be positive")
+        if point_density_feedback_count_weight < 0:
+            raise ValueError("point_density_feedback_count_weight must be non-negative")
+        self.point_density_feedback_margin = float(point_density_feedback_margin)
+        self.point_density_feedback_count_weight = float(
+            point_density_feedback_count_weight
+        )
+        self.point_density_feedback_detach_points = bool(
+            point_density_feedback_detach_points
+        )
+        self.point_density_feedback_detach_scores = bool(
+            point_density_feedback_detach_scores
+        )
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[0] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
@@ -396,6 +414,71 @@ class SetCriterion_Crowd(nn.Module):
 
         return {"loss_consistency": loss_point_density + loss_count_consistency}
 
+    def loss_point_density_feedback(self, outputs, targets, indices, num_points):
+        """Use matched predicted points as a detached localisation prior for density."""
+        density_out = outputs.get("density_out")
+        if density_out is None:
+            device = outputs["pred_logits"].device
+            return {"loss_point_density_feedback": torch.tensor(0.0, device=device)}
+
+        device = density_out.device
+        pred_points = outputs["pred_points"]
+        pred_logits = outputs["pred_logits"]
+        img_size = outputs.get("img_size")
+        if img_size is not None:
+            H_norm, W_norm = float(img_size[0]), float(img_size[1])
+        else:
+            H_norm = float(density_out.shape[2])
+            W_norm = float(density_out.shape[3])
+
+        sampled_density: list[torch.Tensor] = []
+        sampled_weight: list[torch.Tensor] = []
+        fg_scores = pred_logits.softmax(-1)[:, :, 1]
+        for b_val, (src_idx, _) in enumerate(indices):
+            if src_idx.numel() == 0:
+                continue
+            src_idx = src_idx.to(device=device)
+            pts = pred_points[b_val, src_idx]
+            scores = fg_scores[b_val, src_idx].clamp_min(0.0)
+            if self.point_density_feedback_detach_points:
+                pts = pts.detach()
+            if self.point_density_feedback_detach_scores:
+                scores = scores.detach()
+
+            grid_x = (pts[:, 0] / max(W_norm - 1, 1)) * 2.0 - 1.0
+            grid_y = (pts[:, 1] / max(H_norm - 1, 1)) * 2.0 - 1.0
+            grid = torch.stack([grid_x, grid_y], dim=-1).view(1, 1, -1, 2)
+            sampled = F.grid_sample(
+                density_out[b_val : b_val + 1],
+                grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=True,
+            )
+            sampled_density.append(sampled.view(-1))
+            sampled_weight.append(scores)
+
+        if sampled_density:
+            all_density = torch.cat(sampled_density, dim=0)
+            all_weight = torch.cat(sampled_weight, dim=0)
+            point_loss = (
+                torch.clamp(
+                    self.point_density_feedback_margin - all_density,
+                    min=0.0,
+                )
+                * all_weight
+            ).sum() / all_weight.sum().clamp_min(1.0)
+        else:
+            point_loss = torch.tensor(0.0, device=device)
+
+        gt_count = density_out.new_tensor([len(t["labels"]) for t in targets])
+        density_count = density_out.sum(dim=[1, 2, 3])
+        count_loss = (
+            (density_count - gt_count).abs() / gt_count.clamp_min(1.0)
+        ).mean()
+        total = point_loss + self.point_density_feedback_count_weight * count_loss
+        return {"loss_point_density_feedback": total}
+
     def _get_src_permutation_idx(self, indices):
         batch_idx = torch.cat(
             [torch.full_like(src, i) for i, (src, _) in enumerate(indices)]
@@ -417,6 +500,7 @@ class SetCriterion_Crowd(nn.Module):
             "count": self.loss_count,
             "refine": self.loss_refine,
             "consistency": self.loss_consistency,
+            "point_density_feedback": self.loss_point_density_feedback,
         }
         assert loss in loss_map, f"Unknown loss: {loss}"
         return loss_map[loss](outputs, targets, indices, num_points, **kwargs)
@@ -428,6 +512,8 @@ class SetCriterion_Crowd(nn.Module):
             "refine_intermediates": outputs.get("refine_intermediates"),
             "uncertainty_map": outputs.get("uncertainty_map"),
             "density_out": outputs.get("density_out"),
+            "density_base": outputs.get("density_base"),
+            "point_feedback_heatmap": outputs.get("point_feedback_heatmap"),
             "img_size": outputs.get("img_size"),
         }
         indices1 = self.matcher(output1, targets)

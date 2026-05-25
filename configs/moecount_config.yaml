@@ -1,0 +1,69 @@
+defaults:
+  - data: shha
+  - model: moecount
+  - optimizer: adamw
+  - scheduler: cosine_annealing
+  - _self_
+
+# Runtime
+seed: 42
+gpu_id: 0
+num_workers: 8
+eval_freq: 1
+
+# Training
+epochs: 600
+clip_max_norm: 0.1
+frozen_weights: null
+resume: ""
+reset_optimizer: false
+start_epoch: 0
+
+# Output dirs, relative to Hydra run dir
+checkpoints_dir: checkpoints
+tensorboard_dir: runs/moecount
+
+mixed_precision:
+  enabled: true
+
+optimizer:
+  name: adamw
+  lr: 0.0001
+  lr_backbone: 0.00001
+  lr_gate: 0.0001
+  weight_decay: 0.01
+  amsgrad: false
+
+scheduler:
+  name: cosine_annealing
+  T_max: ${epochs}
+  eta_min: 1e-6
+  warmup_epochs: 0
+  warmup_start_factor: 0.001
+
+moecount_loss:
+  bayesian:
+    sigma: 8.0
+    use_background: true
+    bg_ratio: 0.15
+    count_loss_type: l1
+    max_pixels_per_chunk: 16384
+  log_count:
+    initial_weight: 0.1
+    decay_epochs: 50
+    decay_rate: 0.5
+    min_weight: 0.05
+  balance:
+    lambda_importance: 0.01
+    lambda_load: 0.01
+
+monitor:
+  log_interval: 100
+  vis_interval: 500
+  vis_dir: visuals/moecount
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false

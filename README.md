@@ -123,6 +123,23 @@ uv run python scripts/train.py data=ucf_qnrf data.data_root=data/UCF-QNRF_ECCV18
 
 # Use DINOv2 backbone
 python scripts/train.py data.data_root=DATA_ROOT model.backbone=dinov2_s model.backbone_type=dinov2
+
+# Train the pure-density MoECountNet architecture
+uv run python scripts/train_moecount.py data.data_root=DATA_ROOT
+
+# Use a local ConvNeXt-tiny pretrained archive in offline environments
+uv run python scripts/train_moecount.py \
+  data.data_root=DATA_ROOT \
+  model.backbone.pretrained_path=convnext_tiny_fb22k_ft_in1k.tar.gz
+
+# No-download smoke test for MoECountNet
+uv run python scripts/train_moecount.py \
+  data.data_root=DATA_ROOT \
+  model.backbone.pretrained=false \
+  epochs=1 \
+  data.batch_size=1 \
+  data.num_patches=1 \
+  num_workers=0
 ```
 
 Outputs (logs, configs, checkpoints) are written to `outputs/<date>/<time>/` automatically.

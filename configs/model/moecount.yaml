@@ -1,0 +1,32 @@
+name: moecount
+output_stride: 8
+
+backbone:
+  arch: convnext_tiny # convnext_tiny | convnext_small | convnext_base | convnext_large
+  model_name: null # optional timm model name override
+  pretrained: true
+  pretrained_path: null # optional local .tar.gz/.safetensors/.pth file; disables online download
+  out_indices: [1, 2] # stride-8 and stride-16 ConvNeXt feature levels
+
+neck:
+  out_channels: 256
+  branch_channels: [128, 64, 64]
+  dilations: [1, 2, 5]
+
+moe:
+  top_k: 2
+  gate_hidden_channels: 128
+  temperature_init: 1.0
+  temperature_min: 0.1
+  temperature_decay: 0.98
+  warmup_fraction: 0.2
+  warmup_epochs: null
+  cbam_reduction: 16
+  lambda_importance: 0.01
+  lambda_load: 0.01
+
+head:
+  hidden_channels: 64
+  final_activation: softplus # relu | softplus | none
+  initial_density: 0.05 # expected count per stride-8 density cell at init
+  final_weight_std: 0.0001

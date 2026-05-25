@@ -58,14 +58,27 @@ class SparseTop2Gate(nn.Module):
             nn.Conv2d(hidden_channels, num_experts, kernel_size=1),
         )
 
+    def _warmup_end(self) -> int:
+        if self.warmup_epochs is not None:
+            return int(self.warmup_epochs)
+        if self.total_epochs is not None:
+            return int(math.ceil(self.total_epochs * self.warmup_fraction))
+        return 0
+
     def set_epoch(self, epoch: int, total_epochs: int | None = None) -> None:
         self.current_epoch = int(epoch)
         if total_epochs is not None:
             self.total_epochs = int(total_epochs)
-        self.temperature = max(
-            self.temperature_init * (self.temperature_decay ** max(self.current_epoch, 0)),
-            self.temperature_min,
-        )
+
+        warmup_end = self._warmup_end()
+        if self.current_epoch < warmup_end:
+            self.temperature = self.temperature_init
+        else:
+            decay_epochs = self.current_epoch - warmup_end
+            self.temperature = max(
+                self.temperature_init * (self.temperature_decay ** decay_epochs),
+                self.temperature_min,
+            )
 
     def update_temperature(self, decay_rate: float | None = None) -> None:
         rate = self.temperature_decay if decay_rate is None else float(decay_rate)

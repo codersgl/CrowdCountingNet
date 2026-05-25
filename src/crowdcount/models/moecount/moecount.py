@@ -100,7 +100,6 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         temperature_decay=float(getattr(moe_cfg, "temperature_decay", 0.98)),
         warmup_fraction=float(getattr(moe_cfg, "warmup_fraction", 0.2)),
         warmup_epochs=getattr(moe_cfg, "warmup_epochs", None),
-        cbam_reduction=int(getattr(moe_cfg, "cbam_reduction", 16)),
         lambda_importance=float(getattr(moe_cfg, "lambda_importance", 0.01)),
         lambda_load=float(getattr(moe_cfg, "lambda_load", 0.01)),
     )

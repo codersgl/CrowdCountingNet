@@ -48,12 +48,11 @@ class SparseTop2Gate(nn.Module):
         self.total_epochs: int | None = None
         self.temperature = float(temperature_init)
 
+        self.register_buffer("expert_bias", torch.zeros(num_experts))
         self.router = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, dilation=1),
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=3, dilation=3),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=5, dilation=5),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, num_experts, kernel_size=1),
         )
@@ -93,12 +92,18 @@ class SparseTop2Gate(nn.Module):
             return False
         return self.current_epoch < int(math.ceil(self.total_epochs * self.warmup_fraction))
 
+    def update_expert_bias(self, load_fraction: torch.Tensor, bias_lr: float = 0.01) -> None:
+        """DeepSeek-V2 style bias adjustment: boost underloaded, penalize overloaded experts."""
+        target_load = self.top_k / self.num_experts
+        error = target_load - load_fraction.detach()
+        self.expert_bias = self.expert_bias + bias_lr * error.to(device=self.expert_bias.device)
+
     def _sample_gumbel(self, logits: torch.Tensor) -> torch.Tensor:
         uniform = torch.rand_like(logits).clamp_(self.eps, 1.0 - self.eps)
         return -torch.log(-torch.log(uniform))
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | bool]:
-        logits = self.router(features)
+        logits = self.router(features) + self.expert_bias.view(1, -1, 1, 1)
         warmup_active = self._in_warmup()
         temperature = max(float(self.temperature), self.temperature_min)
 

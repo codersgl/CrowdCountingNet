@@ -15,13 +15,12 @@ neck:
 
 moe:
   top_k: 2
-  gate_hidden_channels: 128
+  gate_hidden_channels: 64
   temperature_init: 1.0
   temperature_min: 0.1
   temperature_decay: 0.98
   warmup_fraction: 0.2
   warmup_epochs: null
-  cbam_reduction: 16
   lambda_importance: 0.01
   lambda_load: 0.01
 

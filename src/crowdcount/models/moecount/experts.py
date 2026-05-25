@@ -9,8 +9,8 @@ from crowdcount.models.moecount.gate import SparseTop2Gate
 from crowdcount.models.moecount.losses import LoadBalanceLoss
 
 
-class SharedExpertStem(nn.Module):
-    """Two shared 3x3 convolution layers before expert-specific branches."""
+class SharedExpert(nn.Module):
+    """Shared expert always active for all spatial positions (DeepSeekMoE/ViMoE pattern)."""
 
     def __init__(self, channels: int = 256) -> None:
         super().__init__()
@@ -28,11 +28,14 @@ class SharedExpertStem(nn.Module):
 
 
 class LocalDenseExpert(nn.Module):
-    """Small-scale dense expert preserving local detail."""
+    """Local detail expert with stacked 3x3 convolutions."""
 
     def __init__(self, channels: int = 256) -> None:
         super().__init__()
         self.layers = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, channels),
+            nn.ReLU(inplace=True),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1),
             nn.GroupNorm(32, channels),
             nn.ReLU(inplace=True),
@@ -60,59 +63,22 @@ class DilatedSparseExpert(nn.Module):
         return self.layers(features)
 
 
-class ChannelAttention(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16) -> None:
+class LargeContextExpert(nn.Module):
+    """Large-receptive-field expert for global scene context and occlusion disambiguation."""
+
+    def __init__(self, channels: int = 256) -> None:
         super().__init__()
-        hidden_channels = max(1, channels // reduction)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.shared_mlp = nn.Sequential(
-            nn.Conv2d(channels, hidden_channels, kernel_size=1, bias=False),
+        self.layers = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=6, dilation=6),
+            nn.GroupNorm(32, channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=12, dilation=12),
+            nn.GroupNorm(32, channels),
+            nn.ReLU(inplace=True),
         )
-        self.sigmoid = nn.Sigmoid()
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        avg_out = self.shared_mlp(self.avg_pool(features))
-        max_out = self.shared_mlp(self.max_pool(features))
-        return self.sigmoid(avg_out + max_out)
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size: int = 7) -> None:
-        super().__init__()
-        padding = kernel_size // 2
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        avg_out = features.mean(dim=1, keepdim=True)
-        max_out, _ = features.max(dim=1, keepdim=True)
-        return self.sigmoid(self.conv(torch.cat([avg_out, max_out], dim=1)))
-
-
-class CBAM(nn.Module):
-    def __init__(self, channels: int = 256, reduction: int = 16) -> None:
-        super().__init__()
-        self.channel_attention = ChannelAttention(channels, reduction=reduction)
-        self.spatial_attention = SpatialAttention(kernel_size=7)
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        attended = self.channel_attention(features) * features
-        return self.spatial_attention(attended) * attended
-
-
-class OcclusionAwareExpert(nn.Module):
-    """Occlusion-aware expert based on channel and spatial attention."""
-
-    def __init__(self, channels: int = 256, reduction: int = 16) -> None:
-        super().__init__()
-        self.cbam = CBAM(channels, reduction=reduction)
-        self.norm = nn.GroupNorm(32, channels)
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.cbam(features))
+        return self.layers(features)
 
 
 class HeterogeneousSparseMoE(nn.Module):
@@ -128,18 +94,17 @@ class HeterogeneousSparseMoE(nn.Module):
         temperature_decay: float = 0.98,
         warmup_fraction: float = 0.2,
         warmup_epochs: int | None = None,
-        cbam_reduction: int = 16,
         lambda_importance: float = 0.01,
         lambda_load: float = 0.01,
     ) -> None:
         super().__init__()
         self.num_experts = 3
-        self.stem = SharedExpertStem(channels)
+        self.stem = SharedExpert(channels)
         self.experts = nn.ModuleList(
             [
                 LocalDenseExpert(channels),
                 DilatedSparseExpert(channels),
-                OcclusionAwareExpert(channels, reduction=cbam_reduction),
+                LargeContextExpert(channels),
             ]
         )
         self.gate = SparseTop2Gate(
@@ -170,17 +135,21 @@ class HeterogeneousSparseMoE(nn.Module):
         self.gate.update_temperature(decay_rate=decay_rate)
 
     def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor | bool]]:
-        shared_features = self.stem(features)
+        shared_out = self.stem(features)
         expert_outputs = torch.stack(
-            [expert(shared_features) for expert in self.experts],
+            [expert(features) for expert in self.experts],
             dim=1,
         )
         route = self.gate(features)
+        if self.training:
+            load_fraction = route["load_fraction"]
+            if isinstance(load_fraction, torch.Tensor):
+                self.gate.update_expert_bias(load_fraction)
         route_weights = route["weights"]
         if not isinstance(route_weights, torch.Tensor):
             raise TypeError("gate route weights must be a tensor")
-        fused = (expert_outputs * route_weights.unsqueeze(2)).sum(dim=1)
-        fused = self.output_norm(fused)
+        routed = (expert_outputs * route_weights.unsqueeze(2)).sum(dim=1)
+        fused = self.output_norm(shared_out + routed)
         soft_probs = route["soft_probs"]
         hard_mask = route["hard_mask"]
         if not isinstance(soft_probs, torch.Tensor) or not isinstance(hard_mask, torch.Tensor):

@@ -28,14 +28,13 @@ class TinyMoEBackbone(nn.Module):
 def build_tiny_moecount(final_activation: str = "softplus") -> MoECountNet:
     return MoECountNet(
         TinyMoEBackbone(),
-        EnhancedFPNNeck(8, 16, out_channels=16, branch_channels=(8, 4, 4)),
+        EnhancedFPNNeck(8, 16, out_channels=32, branch_channels=(16, 8, 8)),
         HeterogeneousSparseMoE(
-            channels=16,
+            channels=32,
             gate_hidden_channels=8,
             warmup_epochs=0,
-            cbam_reduction=4,
         ),
-        DensityHead(in_channels=16, hidden_channels=8, final_activation=final_activation),
+        DensityHead(in_channels=32, hidden_channels=8, final_activation=final_activation),
     )
 
 

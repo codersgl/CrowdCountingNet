@@ -8,7 +8,11 @@
       "Edit(/.claude/skills/dl-training-debug/**)",
       "Bash(rm /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/references/api_reference.md 2>/dev/null; ls -la /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/)",
       "Bash(cat > *)",
-      "Bash(rmdir /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/assets /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/scripts)"
+      "Bash(rmdir /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/assets /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/scripts)",
+      "Bash(python /tmp/param_count.py)",
+      "mcp__plugin_context7_context7__query-docs",
+      "Bash(git stash *)",
+      "Bash(nvidia-smi --query-gpu=name --format=csv,noheader)"
     ],
     "additionalDirectories": [
       "/home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/scripts",

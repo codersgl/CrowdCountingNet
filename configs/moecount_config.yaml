@@ -13,7 +13,7 @@ eval_freq: 1
 
 # Training
 epochs: 600
-clip_max_norm: 0.1
+clip_max_norm: 5.0
 frozen_weights: null
 resume: ""
 reset_optimizer: false
@@ -44,8 +44,8 @@ scheduler:
 moecount_loss:
   bayesian:
     sigma: 8.0
-    use_background: true
-    bg_ratio: 0.15
+    use_background: false
+    bg_ratio: 0.05
     count_loss_type: l1
     max_pixels_per_chunk: 16384
   log_count:

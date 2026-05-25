@@ -28,5 +28,5 @@ moe:
 head:
   hidden_channels: 64
   final_activation: softplus # relu | softplus | none
-  initial_density: 0.05 # expected count per stride-8 density cell at init
-  final_weight_std: 0.0001
+  initial_density: 0.01 # expected count per stride-8 density cell at init
+  final_weight_std: 1.0

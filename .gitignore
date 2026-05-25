@@ -23,6 +23,6 @@ wheels/
 /*.png
 docs/
 assets/
-
+.superpowers
 
 convnext_tiny_fb22k_ft_in1k.tar.gz

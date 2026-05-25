@@ -54,8 +54,9 @@ class EnhancedFPNNeck(nn.Module):
                 for index in range(3)
             ]
         )
-        self.context_norm = nn.BatchNorm2d(out_channels)
+        self.context_norm = nn.GroupNorm(32, out_channels)
         self.context_fuse = nn.Conv2d(out_channels, out_channels, kernel_size=1)
+        self.output_norm = nn.GroupNorm(32, out_channels)
         self.output_channels = out_channels
 
     def forward(self, c2_feature: torch.Tensor, c3_feature: torch.Tensor) -> torch.Tensor:
@@ -74,4 +75,4 @@ class EnhancedFPNNeck(nn.Module):
         )
         context_feature = self.context_norm(context_feature)
         context_feature = self.context_fuse(context_feature)
-        return base_feature + context_feature
+        return self.output_norm(base_feature + context_feature)

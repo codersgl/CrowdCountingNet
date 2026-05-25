@@ -16,8 +16,10 @@ class SharedExpertStem(nn.Module):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, channels),
             nn.ReLU(inplace=True),
         )
 
@@ -32,6 +34,7 @@ class LocalDenseExpert(nn.Module):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, channels),
             nn.ReLU(inplace=True),
         )
 
@@ -46,8 +49,10 @@ class DilatedSparseExpert(nn.Module):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=3, padding=2, dilation=2),
+            nn.GroupNorm(32, channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(channels, channels, kernel_size=3, padding=4, dilation=4),
+            nn.GroupNorm(32, channels),
             nn.ReLU(inplace=True),
         )
 
@@ -104,9 +109,10 @@ class OcclusionAwareExpert(nn.Module):
     def __init__(self, channels: int = 256, reduction: int = 16) -> None:
         super().__init__()
         self.cbam = CBAM(channels, reduction=reduction)
+        self.norm = nn.GroupNorm(32, channels)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.cbam(features)
+        return self.norm(self.cbam(features))
 
 
 class HeterogeneousSparseMoE(nn.Module):
@@ -151,6 +157,7 @@ class HeterogeneousSparseMoE(nn.Module):
             lambda_importance=lambda_importance,
             lambda_load=lambda_load,
         )
+        self.output_norm = nn.GroupNorm(32, channels)
 
     @property
     def temperature(self) -> float:
@@ -173,6 +180,7 @@ class HeterogeneousSparseMoE(nn.Module):
         if not isinstance(route_weights, torch.Tensor):
             raise TypeError("gate route weights must be a tensor")
         fused = (expert_outputs * route_weights.unsqueeze(2)).sum(dim=1)
+        fused = self.output_norm(fused)
         soft_probs = route["soft_probs"]
         hard_mask = route["hard_mask"]
         if not isinstance(soft_probs, torch.Tensor) or not isinstance(hard_mask, torch.Tensor):

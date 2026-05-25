@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"compile\\(open\\('/home/codersgl/sci-research/CrowdCounting-DSGCNet/scripts/diag3.py'\\).read\\(\\), 'diag3.py', 'exec'\\); print\\('OK'\\)\")",
+      "Bash(awk '{print NR, $0}')",
+      "Bash(python /root/.claude/plugins/cache/claude-plugins-official/skill-creator/8deab8460a9d/skills/skill-creator/scripts/init_skill.py dl-training-debug --path /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug)",
+      "Bash(rm /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/scripts/example.py /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/assets/example_asset.txt)",
+      "Edit(/.claude/skills/dl-training-debug/**)",
+      "Bash(rm /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/references/api_reference.md 2>/dev/null; ls -la /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/)",
+      "Bash(cat > *)",
+      "Bash(rmdir /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/assets /home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/scripts)"
+    ],
+    "additionalDirectories": [
+      "/home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/scripts",
+      "/home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/references",
+      "/home/codersgl/sci-research/CrowdCounting-DSGCNet/.claude/skills/dl-training-debug/dl-training-debug/assets"
+    ]
+  }
+}

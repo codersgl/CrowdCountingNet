@@ -11,7 +11,7 @@ from torch import nn
 from crowdcount.models.moecount.backbone import MoEConvNeXtBackbone
 from crowdcount.models.moecount.experts import HeterogeneousSparseMoE
 from crowdcount.models.moecount.head import DensityHead
-from crowdcount.models.moecount.neck import EnhancedFPNNeck
+from crowdcount.models.moecount.neck import DeepBiFPNNeck, EnhancedFPNNeck
 
 
 class MoECountNet(nn.Module):
@@ -20,7 +20,7 @@ class MoECountNet(nn.Module):
     def __init__(
         self,
         backbone: MoEConvNeXtBackbone,
-        neck: EnhancedFPNNeck,
+        neck: EnhancedFPNNeck | DeepBiFPNNeck,
         moe: HeterogeneousSparseMoE,
         density_head: DensityHead,
     ) -> None:
@@ -48,7 +48,10 @@ class MoECountNet(nn.Module):
         if epoch is not None:
             self.moe.set_epoch(epoch)
         feature_maps = self.backbone(samples)
-        fused_neck = self.neck(feature_maps["c2"], feature_maps["c3"])
+        if "c4" in feature_maps:
+            fused_neck = self.neck(feature_maps["c2"], feature_maps["c3"], feature_maps["c4"])
+        else:
+            fused_neck = self.neck(feature_maps["c2"], feature_maps["c3"])
         moe_features, moe_aux_losses, route = self.moe(fused_neck)
         density = self.density_head(moe_features)
         moe_aux_total = moe_aux_losses.get("total_aux") if moe_aux_losses else None
@@ -84,13 +87,27 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         pretrained_path=getattr(backbone_cfg, "pretrained_path", None),
         out_indices=tuple(getattr(backbone_cfg, "out_indices", (1, 2))),
     )
-    neck = EnhancedFPNNeck(
-        c2_channels=backbone.out_channels[0],
-        c3_channels=backbone.out_channels[1],
-        out_channels=int(getattr(neck_cfg, "out_channels", 256)),
-        branch_channels=tuple(getattr(neck_cfg, "branch_channels", (128, 64, 64))),
-        dilations=tuple(getattr(neck_cfg, "dilations", (1, 2, 5))),
-    )
+    num_backbone_levels = len(backbone.out_channels)
+    if num_backbone_levels == 3:
+        neck = DeepBiFPNNeck(
+            c2_channels=backbone.out_channels[0],
+            c3_channels=backbone.out_channels[1],
+            c4_channels=backbone.out_channels[2],
+            out_channels=int(getattr(neck_cfg, "out_channels", 256)),
+            num_bifpn_blocks=int(getattr(neck_cfg, "num_bifpn_blocks", 1)),
+            branch_channels=tuple(getattr(neck_cfg, "branch_channels", (128, 64, 64))),
+            dilations=tuple(getattr(neck_cfg, "dilations", (1, 2, 5))),
+            use_spd_downsample=bool(getattr(neck_cfg, "use_spd_downsample", True)),
+            use_depthwise_refine=bool(getattr(neck_cfg, "use_depthwise_refine", True)),
+        )
+    else:
+        neck = EnhancedFPNNeck(
+            c2_channels=backbone.out_channels[0],
+            c3_channels=backbone.out_channels[1],
+            out_channels=int(getattr(neck_cfg, "out_channels", 256)),
+            branch_channels=tuple(getattr(neck_cfg, "branch_channels", (128, 64, 64))),
+            dilations=tuple(getattr(neck_cfg, "dilations", (1, 2, 5))),
+        )
     moe = HeterogeneousSparseMoE(
         channels=int(getattr(neck_cfg, "out_channels", 256)),
         gate_hidden_channels=int(getattr(moe_cfg, "gate_hidden_channels", 128)),

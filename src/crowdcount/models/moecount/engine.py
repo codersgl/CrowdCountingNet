@@ -156,9 +156,10 @@ def train_moecount_one_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             optimizer.step()
 
+        density_loss_key = "loss_pml" if "loss_pml" in loss_dict else "loss_bayesian"
         metrics: dict[str, float] = {
             "loss_total": float(loss_dict["loss_total"].detach().item()),
-            "loss_bayesian": float(loss_dict["loss_bayesian"].detach().item()),
+            density_loss_key: float(loss_dict[density_loss_key].detach().item()),
             "loss_count": float(loss_dict["loss_count"].detach().item()),
             "loss_balance": float(loss_dict["loss_balance"].detach().item()),
             "lambda_count": float(loss_dict["lambda_count"].detach().item()),

@@ -23,8 +23,8 @@ _CONVNEXT_MODEL_NAMES = {
 
 @dataclass(frozen=True)
 class BackboneOutputInfo:
-    channels: tuple[int, int]
-    reductions: tuple[int, int]
+    channels: tuple[int, ...]
+    reductions: tuple[int, ...]
     model_name: str
 
 
@@ -37,11 +37,12 @@ class MoEConvNeXtBackbone(nn.Module):
         model_name: str | None = None,
         pretrained: bool = True,
         pretrained_path: str | None = None,
-        out_indices: tuple[int, int] = (1, 2),
+        out_indices: tuple[int, ...] = (1, 2),
     ) -> None:
         super().__init__()
-        if len(out_indices) != 2:
-            raise ValueError("out_indices must contain exactly two feature levels")
+        num_levels = len(out_indices)
+        if num_levels not in (2, 3):
+            raise ValueError(f"out_indices must contain 2 or 3 feature levels, got {num_levels}")
         resolved_name = model_name or _CONVNEXT_MODEL_NAMES.get(arch)
         if resolved_name is None:
             choices = ", ".join(sorted(_CONVNEXT_MODEL_NAMES))
@@ -70,9 +71,9 @@ class MoEConvNeXtBackbone(nn.Module):
         feature_info = cast(Any, self.body.feature_info)
         channels = tuple(int(value) for value in feature_info.channels())
         reductions = tuple(int(value) for value in feature_info.reduction())
-        if len(channels) != 2 or len(reductions) != 2:
+        if len(channels) != num_levels or len(reductions) != num_levels:
             raise RuntimeError(
-                "MoEConvNeXtBackbone expected two feature maps, "
+                f"MoEConvNeXtBackbone expected {num_levels} feature maps, "
                 f"got channels={channels}, reductions={reductions}"
             )
         self.output_info = BackboneOutputInfo(
@@ -82,18 +83,22 @@ class MoEConvNeXtBackbone(nn.Module):
         )
 
     @property
-    def out_channels(self) -> tuple[int, int]:
+    def out_channels(self) -> tuple[int, ...]:
         return self.output_info.channels
 
     @property
-    def out_reductions(self) -> tuple[int, int]:
+    def out_reductions(self) -> tuple[int, ...]:
         return self.output_info.reductions
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
         features = self.body(images)
-        if len(features) != 2:
-            raise RuntimeError(f"Expected two ConvNeXt features, got {len(features)}")
-        return {"c2": features[0], "c3": features[1]}
+        num_levels = len(self.output_info.channels)
+        if len(features) != num_levels:
+            raise RuntimeError(f"Expected {num_levels} ConvNeXt features, got {len(features)}")
+        result: dict[str, torch.Tensor] = {}
+        for idx, key in enumerate(["c2", "c3", "c4"][:num_levels]):
+            result[key] = features[idx]
+        return result
 
 
 def _load_tensor_file(path: Path) -> dict[str, torch.Tensor]:

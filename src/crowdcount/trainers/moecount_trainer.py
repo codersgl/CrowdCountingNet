@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import time
@@ -21,10 +22,10 @@ from crowdcount.models.moecount import build_moecount
 from crowdcount.models.moecount.engine import evaluate_moecount, train_moecount_one_epoch
 from crowdcount.models.moecount.losses import (
     BayesianLoss,
+    CountLoss,
     LoadBalanceLoss,
-    LogCountLoss,
-    LogCountWeightSchedule,
     MoECountLoss,
+    ProximalMappingLoss,
 )
 from crowdcount.utils.logging import logger, setup_logger
 from crowdcount.utils.misc import get_rank, nested_tensor_from_tensor_list
@@ -134,28 +135,55 @@ class MoECountTrainer:
 
     def _build_loss(self) -> MoECountLoss:
         loss_cfg = getattr(self.cfg, "moecount_loss", None)
-        bayes_cfg = getattr(loss_cfg, "bayesian", None) if loss_cfg is not None else None
-        count_cfg = getattr(loss_cfg, "log_count", None) if loss_cfg is not None else None
-        balance_cfg = getattr(loss_cfg, "balance", None) if loss_cfg is not None else None
-        return MoECountLoss(
-            bayesian_loss=BayesianLoss(
+        if loss_cfg is None:
+            return MoECountLoss()
+
+        use_pml = bool(getattr(loss_cfg, "use_pml", True))
+        pml_cfg = getattr(loss_cfg, "pml", None)
+        bayes_cfg = getattr(loss_cfg, "bayesian", None)
+        count_cfg = getattr(loss_cfg, "count", None)
+        balance_cfg = getattr(loss_cfg, "balance", None)
+
+        pml_loss = None
+        bayesian_loss = None
+        if use_pml:
+            pml_loss = ProximalMappingLoss(
+                sigma=float(getattr(pml_cfg, "sigma", 8.0)),
+                use_background=bool(getattr(pml_cfg, "use_background", False)),
+                bg_threshold=float(getattr(pml_cfg, "bg_threshold", 3.0)),
+                max_pixels_per_chunk=int(getattr(pml_cfg, "max_pixels_per_chunk", 16384)),
+            )
+        else:
+            bayesian_loss = BayesianLoss(
                 sigma=float(getattr(bayes_cfg, "sigma", 8.0)),
                 use_background=bool(getattr(bayes_cfg, "use_background", True)),
                 bg_ratio=float(getattr(bayes_cfg, "bg_ratio", 0.15)),
                 count_loss_type=str(getattr(bayes_cfg, "count_loss_type", "l1")),
                 max_pixels_per_chunk=int(getattr(bayes_cfg, "max_pixels_per_chunk", 16384)),
-            ),
-            log_count_loss=LogCountLoss(),
-            log_count_schedule=LogCountWeightSchedule(
-                initial_weight=float(getattr(count_cfg, "initial_weight", 0.1)),
-                decay_epochs=int(getattr(count_cfg, "decay_epochs", 50)),
-                decay_rate=float(getattr(count_cfg, "decay_rate", 0.5)),
-                min_weight=float(getattr(count_cfg, "min_weight", 0.05)),
-            ),
+            )
+
+        count_weight = float(getattr(count_cfg, "weight", 1.0))
+
+        # Compute warmup end for balance loss decay
+        moe_cfg = getattr(self.cfg.model, "moe", None)
+        warmup_epochs = getattr(moe_cfg, "warmup_epochs", None) if moe_cfg is not None else None
+        if warmup_epochs is not None:
+            warmup_end = int(warmup_epochs)
+        else:
+            warmup_fraction = float(getattr(moe_cfg, "warmup_fraction", 0.2)) if moe_cfg is not None else 0.2
+            warmup_end = int(math.ceil(float(self.cfg.epochs) * warmup_fraction))
+
+        return MoECountLoss(
+            pml_loss=pml_loss,
+            bayesian_loss=bayesian_loss,
+            count_loss=CountLoss(),
+            count_weight=count_weight,
             balance_loss=LoadBalanceLoss(
                 lambda_importance=float(getattr(balance_cfg, "lambda_importance", 0.01)),
                 lambda_load=float(getattr(balance_cfg, "lambda_load", 0.01)),
             ),
+            warmup_end=warmup_end,
+            balance_decay_epochs=int(getattr(balance_cfg, "decay_epochs", 50)),
         )
 
     def _build_optimizer(self) -> torch.optim.Optimizer:

@@ -38,24 +38,28 @@ scheduler:
   name: cosine_annealing
   T_max: ${epochs}
   eta_min: 1e-6
-  warmup_epochs: 0
+  warmup_epochs: 5
   warmup_start_factor: 0.001
 
 moecount_loss:
-  bayesian:
+  use_pml: true  # true = ProximalMappingLoss, false = BayesianLoss
+  pml:
+    sigma: 8.0
+    use_background: false
+    bg_threshold: 3.0
+    max_pixels_per_chunk: 16384
+  bayesian:  # fallback when use_pml=false
     sigma: 8.0
     use_background: false
     bg_ratio: 0.05
     count_loss_type: l1
     max_pixels_per_chunk: 16384
-  log_count:
-    initial_weight: 0.1
-    decay_epochs: 50
-    decay_rate: 0.5
-    min_weight: 0.05
+  count:
+    weight: 0.4  # fixed count loss weight (reduced to balance PML gradient)
   balance:
     lambda_importance: 0.01
     lambda_load: 0.01
+    decay_epochs: 50  # epochs over which CV^2 loss decays to 0 after warmup
 
 monitor:
   log_interval: 100

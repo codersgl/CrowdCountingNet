@@ -19,6 +19,7 @@ from crowdcount.utils.misc import MetricLogger
 
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD = [0.229, 0.224, 0.225]
+_EVAL_REFLECT_BORDER = 32  # reflect-pad input by 32px → 4px at stride-8
 
 
 def _move_targets(
@@ -310,14 +311,19 @@ def evaluate_moecount(
     model.eval()
     maes: list[float] = []
     mses: list[float] = []
+    border = _EVAL_REFLECT_BORDER
+    crop = border // output_stride  # px at stride-8 density resolution
 
     for batch in data_loader:
         samples, targets = batch[:2]
         samples = samples.to(device)
-        outputs = model(samples)
+        # Reflect-pad input to avoid zero-padding edge artifacts at inference.
+        samples_padded = F.pad(samples, (border, border, border, border), mode="reflect")
+        outputs = model(samples_padded)
         pred_density = outputs["density_out"]
         if not isinstance(pred_density, torch.Tensor):
             raise TypeError("model output density_out must be a tensor")
+        pred_density = pred_density[:, :, crop:-crop or None, crop:-crop or None]
         pred_density = _crop_density_for_eval(pred_density, targets[0], output_stride)
         pred_count = float(pred_density.sum().item())
         gt_count = float(targets[0]["point"].shape[0])

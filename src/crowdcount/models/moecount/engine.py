@@ -12,9 +12,13 @@ import torch.nn.functional as F
 from PIL import Image
 from torch import nn
 
+from crowdcount.data.transforms import DeNormalize
 from crowdcount.models.moecount.losses import MoECountLoss
 from crowdcount.utils.logging import logger
 from crowdcount.utils.misc import MetricLogger
+
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 def _move_targets(
@@ -85,6 +89,71 @@ def _save_expert_route_image(top1: torch.Tensor, output_path: Path) -> torch.Ten
     rgb = palette.cpu()[top1_cpu]
     Image.fromarray(rgb.numpy()).save(output_path)
     return rgb.permute(2, 0, 1).float() / 255.0
+
+
+def _density_heatmap(density: torch.Tensor) -> torch.Tensor:
+    """Convert a 2D density map to a JET-like RGB heatmap [3, H, W] in [0, 1]."""
+    d = density.detach().cpu().float()
+    d = d / d.max().clamp_min(1e-8)
+    d = d.clamp(0, 1)
+
+    # Simple JET approximation: blue -> cyan -> green -> yellow -> red
+    # 4 knots at t=0, 0.25, 0.5, 0.75, 1.0
+    r = (d * 2.5 - 0.625).clamp(0, 1) - (d * 2.5 - 1.875).clamp(0, 1) + (d * 2.5 - 3.125).clamp(0, 1)
+    g = (d * 2.5 - 0.625).clamp(0, 1) - (d * 2.5 - 1.875).clamp(0, 1)
+    b = (d * 2.5 - 0.625).clamp(0, 1) * -1 + 1 - (d * 2.5 - 1.875).clamp(0, 1) + (d * 2.5 - 3.125).clamp(0, 1)
+
+    heatmap = torch.stack([r, g, b], dim=0)  # [3, H, W]
+    return heatmap.clamp(0, 1)
+
+
+def _save_density_overlay(
+    sample: torch.Tensor,
+    pred_density: torch.Tensor,
+    gt_density: torch.Tensor,
+    output_path: Path,
+) -> torch.Tensor:
+    """Save original image with predicted and GT density overlaid side-by-side.
+
+    Returns a [3, H, 3*W] tensor for TensorBoard logging.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    denorm = DeNormalize(_IMAGENET_MEAN, _IMAGENET_STD)
+    img = denorm(sample[0].detach().cpu().clone())  # [3, H_img, W_img]
+    img = img.clamp(0, 1)
+
+    pred = pred_density[0].detach().cpu()  # [1, H8, W8]
+    gt = gt_density[0].detach().cpu()      # [1, H_img, W_img]
+
+    # Upsample prediction and GT density to image resolution
+    pred_full = F.interpolate(
+        pred.unsqueeze(0),
+        size=img.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)  # [1, H_img, W_img]
+    gt_full = F.interpolate(
+        gt.unsqueeze(0).float(),
+        size=img.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)  # [1, H_img, W_img]
+
+    # Build overlays
+    def _overlay(image: torch.Tensor, density: torch.Tensor, alpha: float = 0.45) -> torch.Tensor:
+        hm = _density_heatmap(density.squeeze(0))  # [3, H, W]
+        return image * (1 - alpha) + hm * alpha
+
+    overlay_pred = _overlay(img, pred_full)
+    overlay_gt = _overlay(img, gt_full)
+
+    # Concatenate: [Original | Pred Overlay | GT Overlay]
+    combined = torch.cat([img, overlay_pred, overlay_gt], dim=-1)  # [3, H, 3*W]
+    combined_uint8 = (combined.clamp(0, 1) * 255).permute(1, 2, 0).byte().numpy()
+    Image.fromarray(combined_uint8).save(output_path)
+
+    return combined
 
 
 def train_moecount_one_epoch(
@@ -177,6 +246,11 @@ def train_moecount_one_epoch(
             load_fraction_cpu = load_fraction.detach().cpu()
             for expert_index, value in enumerate(load_fraction_cpu.tolist(), start=1):
                 metrics[f"moe_e{expert_index}_load"] = float(value)
+        expert_similarity = outputs.get("expert_similarity", {})
+        if isinstance(expert_similarity, dict):
+            for sim_key, sim_value in expert_similarity.items():
+                if isinstance(sim_value, torch.Tensor):
+                    metrics[f"expert_{sim_key}"] = float(sim_value.detach().item())
         metric_logger.update(**metrics)
 
         if writer is not None:
@@ -191,6 +265,21 @@ def train_moecount_one_epoch(
             image_tensor = _save_expert_route_image(outputs["moe_top1"], route_image_path)
             if writer is not None:
                 writer.add_image("moe/top1_expert", image_tensor, global_step)
+
+        if (
+            vis_dir is not None
+            and vis_interval > 0
+            and global_step % vis_interval == 0
+            and isinstance(outputs.get("pred_density"), torch.Tensor)
+        ):
+            density_overlay_path = Path(vis_dir) / f"density_overlay_step{global_step}.png"
+            overlay_tensor = _save_density_overlay(
+                samples, outputs["pred_density"], gt_density,
+                density_overlay_path,
+            )
+            if writer is not None:
+                writer.add_image("moe/density_overlay", overlay_tensor, global_step)
+
         global_step += 1
 
     metric_logger.synchronize_between_processes()

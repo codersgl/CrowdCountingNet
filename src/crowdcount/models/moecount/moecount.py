@@ -70,6 +70,7 @@ class MoECountNet(nn.Module):
             "moe_entropy": route["entropy"],
             "moe_temperature": route["temperature"],
             "moe_warmup_active": route["warmup_active"],
+            "expert_similarity": route.get("expert_similarity", {}),
         }
 
 

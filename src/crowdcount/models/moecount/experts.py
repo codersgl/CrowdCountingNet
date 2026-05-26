@@ -250,6 +250,18 @@ class HeterogeneousSparseMoE(nn.Module):
             dim=1,
         )  # [B, 3, C, H/8, W/8]
 
+        with torch.no_grad():
+            eo = expert_outputs.detach()  # [B, 3, C, H, W]
+            eo_flat = eo.reshape(eo.shape[0], 3, -1)  # [B, 3, C*H*W]
+            eo_norm = F.normalize(eo_flat, dim=-1)
+            cos_matrix = torch.bmm(eo_norm, eo_norm.transpose(1, 2))  # [B, 3, 3]
+            avg_cos = cos_matrix.mean(0)  # [3, 3]
+            expert_similarity = {
+                "cos_01": avg_cos[0, 1].clone(),
+                "cos_02": avg_cos[0, 2].clone(),
+                "cos_12": avg_cos[1, 2].clone(),
+            }
+
         route = self.gate(features)
         if self.training:
             load_fraction = route["load_fraction"]
@@ -267,4 +279,5 @@ class HeterogeneousSparseMoE(nn.Module):
         if not isinstance(soft_probs, torch.Tensor) or not isinstance(hard_mask, torch.Tensor):
             raise TypeError("gate probabilities and hard mask must be tensors")
         aux_losses = self.balance_loss(soft_probs, hard_mask) if self.training else {}
+        route["expert_similarity"] = expert_similarity
         return fused, aux_losses, route

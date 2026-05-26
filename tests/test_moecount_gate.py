@@ -38,6 +38,7 @@ def test_sparse_gate_temperature_clamps() -> None:
         temperature_init=1.0,
         temperature_min=0.1,
         temperature_decay=0.5,
+        warmup_fraction=0.0,
     )
     gate.set_epoch(20, total_epochs=100)
     assert gate.temperature == 0.1

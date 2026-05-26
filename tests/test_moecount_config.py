@@ -13,7 +13,7 @@ def test_moecount_model_config_loads() -> None:
     assert cfg.backbone.pretrained_path is None
     assert cfg.moe.top_k == 2
     assert cfg.head.final_activation == "softplus"
-    assert cfg.head.initial_density == 0.05
+    assert cfg.head.initial_density == 0.01
 
 
 def test_moecount_root_config_loads_with_interpolation() -> None:

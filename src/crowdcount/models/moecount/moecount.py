@@ -119,6 +119,7 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         warmup_epochs=getattr(moe_cfg, "warmup_epochs", None),
         lambda_importance=float(getattr(moe_cfg, "lambda_importance", 0.01)),
         lambda_load=float(getattr(moe_cfg, "lambda_load", 0.01)),
+        shared_scale=float(getattr(moe_cfg, "shared_scale", 0.3)),
     )
     density_head = DensityHead(
         in_channels=int(getattr(neck_cfg, "out_channels", 256)),

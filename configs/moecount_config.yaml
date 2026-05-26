@@ -57,8 +57,8 @@ moecount_loss:
   count:
     weight: 0.4  # fixed count loss weight (reduced to balance PML gradient)
   balance:
-    lambda_importance: 0.01
-    lambda_load: 0.01
+    lambda_importance: 0.001
+    lambda_load: 0.001
     decay_epochs: 50  # epochs over which CV^2 loss decays to 0 after warmup
 
 monitor:

@@ -22,14 +22,19 @@ moe:
   temperature_init: 0.5
   temperature_min: 0.1
   temperature_decay: 0.9
-  warmup_fraction: 0.0
-  warmup_epochs: null
+  warmup_fraction: 0.1
+  warmup_epochs: 60
   lambda_importance: 0.001
   lambda_load: 0.001
   shared_scale: 0.3
 
 head:
-  hidden_channels: 64
+  hidden_channels: 128
   final_activation: softplus # relu | softplus | none
   initial_density: 0.01 # expected count per stride-8 density cell at init
   final_weight_std: 1.0
+  use_point_head: true  # P2PNet-style point prediction auxiliary head
+  point_hidden_channels: 128
+
+use_gcn: false  # enable density-guided GCN feature refinement
+gcn_k: 4  # k for density k-NN graph building

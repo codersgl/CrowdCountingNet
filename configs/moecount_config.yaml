@@ -12,7 +12,7 @@ num_workers: 8
 eval_freq: 1
 
 # Training
-epochs: 600
+epochs: 1500
 clip_max_norm: 5.0
 frozen_weights: null
 resume: ""
@@ -60,6 +60,19 @@ moecount_loss:
     lambda_importance: 0.001
     lambda_load: 0.001
     decay_epochs: 50  # epochs over which CV^2 loss decays to 0 after warmup
+  point:
+    weight: 0.5  # point auxiliary loss weight (0 = disabled)
+    cost_class: 1.0  # Hungarian matcher classification cost weight
+    cost_l1: 1.0  # Hungarian matcher L1 distance cost weight
+    focal_alpha: 0.75  # focal loss alpha for foreground class
+    focal_gamma: 2.0  # focal loss gamma
+    eos_coef: 0.1  # background class weight in empty_weight
+  ot:
+    enabled: false  # set true to enable Sinkhorn OT auxiliary loss
+    weight: 0.05  # OT loss weight in total loss
+    epsilon: 0.1  # Sinkhorn entropic regularization
+    num_iters: 50  # Sinkhorn iterations
+    max_grid: 32  # downsample density to max_grid x max_grid for OT cost matrix
 
 monitor:
   log_interval: 100

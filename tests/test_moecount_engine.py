@@ -45,7 +45,7 @@ def test_train_moecount_one_epoch_updates_parameters() -> None:
     samples = torch.randn(1, 3, 128, 128)
     targets = ({"point": torch.tensor([[32.0, 32.0]])},)
     gt_density = (torch.ones(1, 16, 16) / 256.0,)
-    before = model.density_head.proj[0].weight.detach().clone()
+    before = model.density_head.stage1[0].weight.detach().clone()
     stats, global_step = train_moecount_one_epoch(
         model,
         loss_fn,
@@ -59,7 +59,7 @@ def test_train_moecount_one_epoch_updates_parameters() -> None:
         log_interval=1,
         vis_interval=0,
     )
-    after = model.density_head.proj[0].weight.detach()
+    after = model.density_head.stage1[0].weight.detach()
     assert global_step == 1
     assert "loss_total" in stats
     assert not torch.allclose(before, after)

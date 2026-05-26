@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from crowdcount.models.moecount.gate import MultiScaleSparseTop2Gate
-from crowdcount.models.moecount.losses import LoadBalanceLoss
+from crowdcount.models.moecount.gate import PixelSoftGate
+from crowdcount.models.moecount.losses import ExpertImportanceLoss
 from crowdcount.models.neck import SPD
 
 
@@ -189,7 +189,12 @@ class GlobalDensityExpert(nn.Module):
 
 
 class HeterogeneousSparseMoE(nn.Module):
-    """Three scale×paradigm heterogeneous experts + multi-scale gate routing."""
+    """Three scale×paradigm heterogeneous experts with pixel-wise soft gating.
+
+    Uses HMoDE-style per-pixel softmax routing (Du et al., IEEE TIP 2023)
+    instead of hard Top-K selection. All experts always contribute with
+    learned spatial weights, preventing expert collapse.
+    """
 
     def __init__(
         self,
@@ -214,32 +219,25 @@ class HeterogeneousSparseMoE(nn.Module):
             SpatialRelationExpert(channels),
             GlobalDensityExpert(channels),
         ])
-        self.gate = MultiScaleSparseTop2Gate(
+        self.gate = PixelSoftGate(
             in_channels=channels,
-            hidden_channels=gate_hidden_channels,
             num_experts=self.num_experts,
-            top_k=top_k,
-            temperature_init=temperature_init,
-            temperature_min=temperature_min,
-            temperature_decay=temperature_decay,
-            warmup_fraction=warmup_fraction,
-            warmup_epochs=warmup_epochs,
+            hidden_channels=gate_hidden_channels,
         )
-        self.balance_loss = LoadBalanceLoss(
+        self.eim_loss = ExpertImportanceLoss(
             lambda_importance=lambda_importance,
-            lambda_load=lambda_load,
         )
         self.output_norm = nn.GroupNorm(32, channels)
 
     @property
     def temperature(self) -> float:
-        return float(self.gate.temperature)
+        return 1.0
 
     def set_epoch(self, epoch: int, total_epochs: int | None = None) -> None:
-        self.gate.set_epoch(epoch, total_epochs=total_epochs)
+        pass
 
     def update_temperature(self, decay_rate: float | None = None) -> None:
-        self.gate.update_temperature(decay_rate=decay_rate)
+        pass
 
     def forward(
         self, features: torch.Tensor
@@ -251,11 +249,11 @@ class HeterogeneousSparseMoE(nn.Module):
         )  # [B, 3, C, H/8, W/8]
 
         with torch.no_grad():
-            eo = expert_outputs.detach()  # [B, 3, C, H, W]
-            eo_flat = eo.reshape(eo.shape[0], 3, -1)  # [B, 3, C*H*W]
+            eo = expert_outputs.detach()
+            eo_flat = eo.reshape(eo.shape[0], 3, -1)
             eo_norm = F.normalize(eo_flat, dim=-1)
-            cos_matrix = torch.bmm(eo_norm, eo_norm.transpose(1, 2))  # [B, 3, 3]
-            avg_cos = cos_matrix.mean(0)  # [3, 3]
+            cos_matrix = torch.bmm(eo_norm, eo_norm.transpose(1, 2))
+            avg_cos = cos_matrix.mean(0)
             expert_similarity = {
                 "cos_01": avg_cos[0, 1].clone(),
                 "cos_02": avg_cos[0, 2].clone(),
@@ -263,11 +261,6 @@ class HeterogeneousSparseMoE(nn.Module):
             }
 
         route = self.gate(features)
-        if self.training:
-            load_fraction = route["load_fraction"]
-            if isinstance(load_fraction, torch.Tensor):
-                self.gate.update_expert_bias(load_fraction)
-
         route_weights = route["weights"]
         if not isinstance(route_weights, torch.Tensor):
             raise TypeError("gate route weights must be a tensor")
@@ -275,9 +268,8 @@ class HeterogeneousSparseMoE(nn.Module):
         fused = self.output_norm(shared_out + routed)
 
         soft_probs = route["soft_probs"]
-        hard_mask = route["hard_mask"]
-        if not isinstance(soft_probs, torch.Tensor) or not isinstance(hard_mask, torch.Tensor):
-            raise TypeError("gate probabilities and hard mask must be tensors")
-        aux_losses = self.balance_loss(soft_probs, hard_mask) if self.training else {}
+        if not isinstance(soft_probs, torch.Tensor):
+            raise TypeError("gate soft probs must be a tensor")
+        aux_losses = self.eim_loss(soft_probs) if self.training else {}
         route["expert_similarity"] = expert_similarity
         return fused, aux_losses, route

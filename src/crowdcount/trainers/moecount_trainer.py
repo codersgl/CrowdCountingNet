@@ -26,6 +26,7 @@ from crowdcount.models.moecount.losses import (
     LoadBalanceLoss,
     MoECountLoss,
     ProximalMappingLoss,
+    SinkhornOTLoss,
 )
 from crowdcount.utils.logging import logger, setup_logger
 from crowdcount.utils.misc import get_rank, nested_tensor_from_tensor_list
@@ -164,6 +165,29 @@ class MoECountTrainer:
 
         count_weight = float(getattr(count_cfg, "weight", 1.0))
 
+        # Point loss config
+        point_cfg = getattr(loss_cfg, "point", None)
+        point_loss_weight = float(getattr(point_cfg, "weight", 0.0)) if point_cfg is not None else 0.0
+        point_cost_class = float(getattr(point_cfg, "cost_class", 1.0)) if point_cfg is not None else 1.0
+        point_cost_l1 = float(getattr(point_cfg, "cost_l1", 1.0)) if point_cfg is not None else 1.0
+        point_focal_alpha = float(getattr(point_cfg, "focal_alpha", 0.75)) if point_cfg is not None else 0.75
+        point_focal_gamma = float(getattr(point_cfg, "focal_gamma", 2.0)) if point_cfg is not None else 2.0
+        point_eos_coef = float(getattr(point_cfg, "eos_coef", 0.1)) if point_cfg is not None else 0.1
+
+        # OT loss config
+        ot_cfg = getattr(loss_cfg, "ot", None)
+        if ot_cfg is not None and bool(getattr(ot_cfg, "enabled", False)):
+            ot_loss = SinkhornOTLoss(
+                epsilon=float(getattr(ot_cfg, "epsilon", 0.1)),
+                num_iters=int(getattr(ot_cfg, "num_iters", 50)),
+                max_grid=int(getattr(ot_cfg, "max_grid", 32)),
+                weight=1.0,  # weight applied in MoECountLoss
+            )
+            ot_weight = float(getattr(ot_cfg, "weight", 0.05))
+        else:
+            ot_loss = None
+            ot_weight = 0.0
+
         # Compute warmup end for balance loss decay
         moe_cfg = getattr(self.cfg.model, "moe", None)
         warmup_epochs = getattr(moe_cfg, "warmup_epochs", None) if moe_cfg is not None else None
@@ -184,6 +208,14 @@ class MoECountTrainer:
             ),
             warmup_end=warmup_end,
             balance_decay_epochs=int(getattr(balance_cfg, "decay_epochs", 50)),
+            point_loss_weight=point_loss_weight,
+            point_cost_class=point_cost_class,
+            point_cost_l1=point_cost_l1,
+            point_focal_alpha=point_focal_alpha,
+            point_focal_gamma=point_focal_gamma,
+            point_eos_coef=point_eos_coef,
+            ot_loss=ot_loss,
+            ot_weight=ot_weight,
         )
 
     def _build_optimizer(self) -> torch.optim.Optimizer:

@@ -9,7 +9,7 @@ from typing import Iterable
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 from torch import nn
 
 from crowdcount.data.transforms import DeNormalize
@@ -92,19 +92,19 @@ def _save_expert_route_image(top1: torch.Tensor, output_path: Path) -> torch.Ten
 
 
 def _density_heatmap(density: torch.Tensor) -> torch.Tensor:
-    """Convert a 2D density map to a JET-like RGB heatmap [3, H, W] in [0, 1]."""
+    """Convert a 2D density map to a JET RGB heatmap [3, H, W] in [0, 1].
+
+    Uses matplotlib's JET colormap with 99.5th-percentile normalisation to
+    avoid a single outlier pixel washing out the whole map.
+    """
+    import matplotlib
+
     d = density.detach().cpu().float()
-    d = d / d.max().clamp_min(1e-8)
-    d = d.clamp(0, 1)
-
-    # Simple JET approximation: blue -> cyan -> green -> yellow -> red
-    # 4 knots at t=0, 0.25, 0.5, 0.75, 1.0
-    r = (d * 2.5 - 0.625).clamp(0, 1) - (d * 2.5 - 1.875).clamp(0, 1) + (d * 2.5 - 3.125).clamp(0, 1)
-    g = (d * 2.5 - 0.625).clamp(0, 1) - (d * 2.5 - 1.875).clamp(0, 1)
-    b = (d * 2.5 - 0.625).clamp(0, 1) * -1 + 1 - (d * 2.5 - 1.875).clamp(0, 1) + (d * 2.5 - 3.125).clamp(0, 1)
-
-    heatmap = torch.stack([r, g, b], dim=0)  # [3, H, W]
-    return heatmap.clamp(0, 1)
+    vmax = torch.quantile(d, 0.995).clamp_min(1e-8)
+    d = (d / vmax).clamp(0, 1)
+    jet = matplotlib.colormaps["jet"]
+    rgb = jet(d.numpy())[..., :3].copy()  # [H, W, 3] in [0, 1]
+    return torch.from_numpy(rgb).permute(2, 0, 1).float()
 
 
 def _save_density_overlay(
@@ -126,6 +126,9 @@ def _save_density_overlay(
     pred = pred_density[0].detach().cpu()  # [1, H8, W8]
     gt = gt_density[0].detach().cpu()      # [1, H_img, W_img]
 
+    pred_count = float(pred.sum().item())
+    gt_count = float(gt.sum().item())
+
     # Upsample prediction and GT density to image resolution
     pred_full = F.interpolate(
         pred.unsqueeze(0),
@@ -140,8 +143,7 @@ def _save_density_overlay(
         align_corners=False,
     ).squeeze(0)  # [1, H_img, W_img]
 
-    # Build overlays
-    def _overlay(image: torch.Tensor, density: torch.Tensor, alpha: float = 0.45) -> torch.Tensor:
+    def _overlay(image: torch.Tensor, density: torch.Tensor, alpha: float = 0.55) -> torch.Tensor:
         hm = _density_heatmap(density.squeeze(0))  # [3, H, W]
         return image * (1 - alpha) + hm * alpha
 
@@ -151,7 +153,14 @@ def _save_density_overlay(
     # Concatenate: [Original | Pred Overlay | GT Overlay]
     combined = torch.cat([img, overlay_pred, overlay_gt], dim=-1)  # [3, H, 3*W]
     combined_uint8 = (combined.clamp(0, 1) * 255).permute(1, 2, 0).byte().numpy()
-    Image.fromarray(combined_uint8).save(output_path)
+
+    # Annotate counts on the overlay panels
+    pil_img = Image.fromarray(combined_uint8)
+    draw = ImageDraw.Draw(pil_img)
+    w = img.shape[-1]
+    draw.text((w + 8, 8), f"Pred: {pred_count:.1f}", fill=(255, 255, 0))
+    draw.text((2 * w + 8, 8), f"GT:   {gt_count:.1f}", fill=(255, 255, 0))
+    pil_img.save(output_path)
 
     return combined
 
@@ -234,6 +243,10 @@ def train_moecount_one_epoch(
             "lambda_count": float(loss_dict["lambda_count"].detach().item()),
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
+        for loss_key in ("loss_point_cls", "loss_point_reg", "loss_ot"):
+            value = loss_dict.get(loss_key)
+            if isinstance(value, torch.Tensor):
+                metrics[loss_key] = float(value.detach().item())
         for output_key, metric_key in (
             ("moe_entropy", "moe_entropy"),
             ("moe_temperature", "moe_temperature"),
@@ -272,7 +285,7 @@ def train_moecount_one_epoch(
             and global_step % vis_interval == 0
             and isinstance(outputs.get("pred_density"), torch.Tensor)
         ):
-            density_overlay_path = Path(vis_dir) / f"density_overlay_step{global_step}.png"
+            density_overlay_path = Path(vis_dir) / "density_overlay.png"
             overlay_tensor = _save_density_overlay(
                 samples, outputs["pred_density"], gt_density,
                 density_overlay_path,

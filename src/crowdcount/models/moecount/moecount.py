@@ -10,12 +10,13 @@ from torch import nn
 
 from crowdcount.models.moecount.backbone import MoEConvNeXtBackbone
 from crowdcount.models.moecount.experts import HeterogeneousSparseMoE
-from crowdcount.models.moecount.head import DensityHead
+from crowdcount.models.moecount.gcn_refine import DensityGCNRefine
+from crowdcount.models.moecount.head import DensityHead, PointPredHead
 from crowdcount.models.moecount.neck import DeepBiFPNNeck, EnhancedFPNNeck
 
 
 class MoECountNet(nn.Module):
-    """Pure density-map crowd counter with heterogeneous sparse MoE routing."""
+    """Density-map crowd counter with pixel-wise soft-gated MoE and point aux head."""
 
     def __init__(
         self,
@@ -23,12 +24,16 @@ class MoECountNet(nn.Module):
         neck: EnhancedFPNNeck | DeepBiFPNNeck,
         moe: HeterogeneousSparseMoE,
         density_head: DensityHead,
+        point_head: PointPredHead | None = None,
+        gcn_refine: DensityGCNRefine | None = None,
     ) -> None:
         super().__init__()
         self.backbone = backbone
         self.neck = neck
         self.moe = moe
         self.density_head = density_head
+        self.point_head = point_head
+        self.gcn_refine = gcn_refine
 
     def supports_moe(self) -> bool:
         return True
@@ -53,9 +58,11 @@ class MoECountNet(nn.Module):
         else:
             fused_neck = self.neck(feature_maps["c2"], feature_maps["c3"])
         moe_features, moe_aux_losses, route = self.moe(fused_neck)
+        if self.gcn_refine is not None:
+            moe_features = self.gcn_refine(moe_features)
         density = self.density_head(moe_features)
         moe_aux_total = moe_aux_losses.get("total_aux") if moe_aux_losses else None
-        return {
+        result: dict[str, Any] = {
             "density_out": density,
             "pred_density": density,
             "moe_aux_total": moe_aux_total,
@@ -72,6 +79,9 @@ class MoECountNet(nn.Module):
             "moe_warmup_active": route["warmup_active"],
             "expert_similarity": route.get("expert_similarity", {}),
         }
+        if self.point_head is not None:
+            result.update(self.point_head(moe_features))
+        return result
 
 
 def build_moecount(cfg: DictConfig) -> MoECountNet:
@@ -124,9 +134,25 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
     )
     density_head = DensityHead(
         in_channels=int(getattr(neck_cfg, "out_channels", 256)),
-        hidden_channels=int(getattr(head_cfg, "hidden_channels", 64)),
+        hidden_channels=int(getattr(head_cfg, "hidden_channels", 128)),
         final_activation=str(getattr(head_cfg, "final_activation", "softplus")),
         initial_density=float(getattr(head_cfg, "initial_density", 0.05)),
         final_weight_std=float(getattr(head_cfg, "final_weight_std", 1e-4)),
     )
-    return MoECountNet(backbone, neck, moe, density_head)
+    use_point_head = bool(getattr(head_cfg, "use_point_head", True))
+    if use_point_head:
+        point_head = PointPredHead(
+            in_channels=int(getattr(neck_cfg, "out_channels", 256)),
+            hidden_channels=int(getattr(head_cfg, "point_hidden_channels", 128)),
+            stride=int(getattr(model_cfg, "output_stride", 8)),
+        )
+    else:
+        point_head = None
+    use_gcn = bool(getattr(model_cfg, "use_gcn", False))
+    gcn_refine = None
+    if use_gcn:
+        gcn_refine = DensityGCNRefine(
+            channels=int(getattr(neck_cfg, "out_channels", 256)),
+            k=int(getattr(model_cfg, "gcn_k", 4)),
+        )
+    return MoECountNet(backbone, neck, moe, density_head, point_head, gcn_refine)

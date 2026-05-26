@@ -147,6 +147,52 @@ class SparseTop2Gate(nn.Module):
         }
 
 
+class PixelSoftGate(nn.Module):
+    """HMoDE-style per-pixel soft gating for expert feature combination.
+
+    Replaces hard Top-K routing with per-pixel softmax weights.
+    All experts always contribute, weighted by learned spatial gating maps.
+
+    Reference: Du et al., "Redesigning Multi-Scale Neural Network for
+    Crowd Counting", IEEE TIP 2023 (Section 3.2, HMoDE).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        num_experts: int = 3,
+        hidden_channels: int = 128,
+    ) -> None:
+        super().__init__()
+        if num_experts < 2:
+            raise ValueError("num_experts must be >= 2")
+        self.num_experts = int(num_experts)
+        self.gate_net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, num_experts, kernel_size=1),
+        )
+
+    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | bool]:
+        raw_weights = self.gate_net(features)  # [B, K, H, W]
+        weights = F.softmax(raw_weights, dim=1)  # per-pixel softmax
+        importance = weights.detach().mean(dim=(0, 2, 3))  # [K]
+        return {
+            "weights": weights,
+            "soft_probs": weights,
+            "hard_mask": weights,
+            "top_indices": weights.argmax(dim=1, keepdim=True),
+            "top1": weights.argmax(dim=1).squeeze(1),
+            "importance": importance,
+            "load_fraction": importance / importance.sum().clamp_min(1e-8),
+            "entropy": weights.new_zeros(()),
+            "temperature": weights.new_tensor(1.0),
+            "warmup_active": False,
+            "logits": raw_weights,
+            "top_values": weights.max(dim=1).values,
+        }
+
+
 class MultiScaleSparseTop2Gate(SparseTop2Gate):
     """Multi-scale variant: router receives stride-8, 16, and 32 pooled features.
 

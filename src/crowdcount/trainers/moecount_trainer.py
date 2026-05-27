@@ -23,8 +23,10 @@ from crowdcount.models.moecount.engine import evaluate_moecount, train_moecount_
 from crowdcount.models.moecount.losses import (
     BayesianLoss,
     CountLoss,
+    GradientAwareLoss,
     LoadBalanceLoss,
     MoECountLoss,
+    PatchSSIMLoss,
     ProximalMappingLoss,
     SinkhornOTLoss,
 )
@@ -148,11 +150,15 @@ class MoECountTrainer:
         pml_loss = None
         bayesian_loss = None
         if use_pml:
+            sigma_schedule = getattr(pml_cfg, "sigma_schedule", None)
+            if sigma_schedule is not None and not isinstance(sigma_schedule, dict):
+                sigma_schedule = dict(sigma_schedule)
             pml_loss = ProximalMappingLoss(
                 sigma=float(getattr(pml_cfg, "sigma", 8.0)),
                 use_background=bool(getattr(pml_cfg, "use_background", False)),
                 bg_threshold=float(getattr(pml_cfg, "bg_threshold", 3.0)),
                 max_pixels_per_chunk=int(getattr(pml_cfg, "max_pixels_per_chunk", 16384)),
+                sigma_schedule=sigma_schedule,
             )
         else:
             bayesian_loss = BayesianLoss(
@@ -197,6 +203,24 @@ class MoECountTrainer:
             warmup_fraction = float(getattr(moe_cfg, "warmup_fraction", 0.2)) if moe_cfg is not None else 0.2
             warmup_end = int(math.ceil(float(self.cfg.epochs) * warmup_fraction))
 
+        diversity_weight = float(getattr(loss_cfg, "diversity_weight", 0.05))
+        expert_sup_weight = float(getattr(loss_cfg, "expert_supervision_weight", 0.2))
+        density_s4_weight = float(getattr(loss_cfg, "density_s4_weight", 0.3))
+
+        # SSIM local structure loss
+        ssim_weight = float(getattr(loss_cfg, "ssim_weight", 0.05))
+        if ssim_weight > 0:
+            ssim_loss = PatchSSIMLoss(kernel_size=5, sigma=2.0, weight=1.0)
+        else:
+            ssim_loss = None
+
+        # Gradient-aware loss
+        grad_weight = float(getattr(loss_cfg, "grad_weight", 0.01))
+        if grad_weight > 0:
+            grad_loss = GradientAwareLoss(weight=1.0)
+        else:
+            grad_loss = None
+
         return MoECountLoss(
             pml_loss=pml_loss,
             bayesian_loss=bayesian_loss,
@@ -216,6 +240,13 @@ class MoECountTrainer:
             point_eos_coef=point_eos_coef,
             ot_loss=ot_loss,
             ot_weight=ot_weight,
+            ssim_loss=ssim_loss,
+            ssim_weight=ssim_weight,
+            grad_loss=grad_loss,
+            grad_weight=grad_weight,
+            diversity_weight=diversity_weight,
+            expert_supervision_weight=expert_sup_weight,
+            density_s4_weight=density_s4_weight,
         )
 
     def _build_optimizer(self) -> torch.optim.Optimizer:

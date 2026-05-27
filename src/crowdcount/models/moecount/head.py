@@ -13,6 +13,66 @@ def _softplus_inverse(value: float) -> float:
     return math.log(math.expm1(value))
 
 
+class Stride4RefineHead(nn.Module):
+    """Coarse-to-fine refinement head: upsamples stride-8 density to stride-4,
+    concatenates with backbone stride-4 features, and refines for finer detail.
+
+    Reference: SANet (Cao et al., ECCV 2018), AMSNet (Hu et al., TAAI 2021).
+    """
+
+    def __init__(
+        self,
+        s4_channels: int = 128,
+        hidden_channels: int = 64,
+        final_activation: str = "softplus",
+        initial_density: float = 0.0125,
+        final_weight_std: float = 1e-4,
+    ) -> None:
+        super().__init__()
+        if final_activation not in {"relu", "softplus", "none"}:
+            raise ValueError("final_activation must be one of: relu, softplus, none")
+        self.final_activation = final_activation
+        gn1 = min(32, hidden_channels)
+        s2 = hidden_channels // 2
+        gn2 = min(32, s2)
+        self.s4_proj = nn.Conv2d(s4_channels, hidden_channels, kernel_size=1)
+        self.refine = nn.Sequential(
+            nn.Conv2d(hidden_channels + 1, hidden_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(gn1, hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, s2, kernel_size=3, padding=1),
+            nn.GroupNorm(gn2, s2),
+            nn.ReLU(inplace=True),
+        )
+        self.output_conv = nn.Conv2d(s2, 1, kernel_size=1)
+        nn.init.normal_(self.output_conv.weight, mean=0.0, std=final_weight_std)
+        if final_activation == "softplus":
+            bias_value = _softplus_inverse(initial_density)
+        else:
+            bias_value = initial_density
+        if self.output_conv.bias is not None:
+            nn.init.constant_(self.output_conv.bias, bias_value)
+
+    def forward(
+        self, feat_s4: torch.Tensor, density_s8: torch.Tensor,
+    ) -> torch.Tensor:
+        s4 = self.s4_proj(feat_s4)  # [B, H_hid, H/4, W/4]
+        d_up = F.interpolate(
+            density_s8,
+            size=s4.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )  # [B, 1, H/4, W/4]
+        fused = torch.cat([s4, d_up], dim=1)
+        refined = self.refine(fused)
+        density = self.output_conv(refined)
+        if self.final_activation == "relu":
+            return F.relu(density)
+        if self.final_activation == "softplus":
+            return F.softplus(density, beta=1, threshold=20)
+        return density
+
+
 class PointPredHead(nn.Module):
     """Per-pixel point prediction head for auxiliary supervision (P2PNet-style).
 
@@ -67,6 +127,82 @@ class PointPredHead(nn.Module):
             "pred_points": grid_flat + pred_offsets_flat,
             "pred_offsets": pred_offsets_flat,
         }
+
+
+class DenseASPPScaleHead(nn.Module):
+    """DenseASPP density head with dilations [1, 3, 6, 9] for multi-scale context.
+
+    Dense connectivity (Yang et al., CVPR 2018) lets each dilation branch see
+    all previous branches' outputs, creating an exponentially growing receptive
+    field without large kernels.  At stride-8 the effective kernel covers
+    ~152×152 pixels — enough for large heads in sparse crowds.
+
+    Reference: CCTrans (Tian et al., 2021) shows that multi-scale dilated
+    convolutions in the regression head are critical for crowd counting.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        branch_channels: int = 64,
+        dilations: tuple[int, ...] = (1, 3, 6, 9),
+        final_activation: str = "softplus",
+        initial_density: float = 0.05,
+        final_weight_std: float = 1e-4,
+    ) -> None:
+        super().__init__()
+        if final_activation not in {"relu", "softplus", "none"}:
+            raise ValueError("final_activation must be one of: relu, softplus, none")
+        self.final_activation = final_activation
+        self.dilations = tuple(dilations)
+        self.branch_channels = int(branch_channels)
+        num_branches = len(self.dilations)
+
+        # Dense ASPP branches — each receives input + all previous branch outputs
+        self.branches = nn.ModuleList()
+        for i, dilation in enumerate(self.dilations):
+            in_ch = in_channels + i * branch_channels
+            gn_groups = min(32, branch_channels)
+            self.branches.append(nn.Sequential(
+                nn.Conv2d(in_ch, branch_channels, kernel_size=3,
+                          padding=dilation, dilation=dilation),
+                nn.GroupNorm(gn_groups, branch_channels),
+                nn.ReLU(inplace=True),
+            ))
+
+        # Fusion: compress all branch outputs + input
+        total_branch_out = in_channels + num_branches * branch_channels
+        fuse_hidden = min(branch_channels * num_branches, 256)
+        gn_fuse = min(32, fuse_hidden)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(total_branch_out, fuse_hidden, kernel_size=1),
+            nn.GroupNorm(gn_fuse, fuse_hidden),
+            nn.ReLU(inplace=True),
+        )
+        self.output_conv = nn.Conv2d(fuse_hidden, 1, kernel_size=1)
+        self._init_final_layer(initial_density, final_weight_std)
+
+    def _init_final_layer(self, initial_density: float, final_weight_std: float) -> None:
+        nn.init.normal_(self.output_conv.weight, mean=0.0, std=final_weight_std)
+        if self.final_activation == "softplus":
+            bias_value = _softplus_inverse(initial_density)
+        else:
+            bias_value = initial_density
+        if self.output_conv.bias is not None:
+            nn.init.constant_(self.output_conv.bias, bias_value)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        outs = [features]
+        for branch in self.branches:
+            inp = torch.cat(outs, dim=1)
+            outs.append(branch(inp))
+        fused = self.fuse(torch.cat(outs, dim=1))
+        density = self.output_conv(fused)
+        if self.final_activation == "relu":
+            return F.relu(density)
+        if self.final_activation == "softplus":
+            return F.softplus(density, beta=1, threshold=20)
+        return density
 
 
 class DensityHead(nn.Module):

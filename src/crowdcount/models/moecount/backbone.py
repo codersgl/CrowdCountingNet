@@ -28,8 +28,11 @@ class BackboneOutputInfo:
     model_name: str
 
 
+_FEATURE_KEY_MAP = ("c1", "c2", "c3", "c4")
+
+
 class MoEConvNeXtBackbone(nn.Module):
-    """Timm ConvNeXt wrapper exposing stride-8 and stride-16 features."""
+    """Timm ConvNeXt wrapper exposing stride-4/8/16/32 features."""
 
     def __init__(
         self,
@@ -40,9 +43,10 @@ class MoEConvNeXtBackbone(nn.Module):
         out_indices: tuple[int, ...] = (1, 2),
     ) -> None:
         super().__init__()
+        self.out_indices = out_indices
         num_levels = len(out_indices)
-        if num_levels not in (2, 3):
-            raise ValueError(f"out_indices must contain 2 or 3 feature levels, got {num_levels}")
+        if num_levels not in (2, 3, 4):
+            raise ValueError(f"out_indices must contain 2–4 feature levels, got {num_levels}")
         resolved_name = model_name or _CONVNEXT_MODEL_NAMES.get(arch)
         if resolved_name is None:
             choices = ", ".join(sorted(_CONVNEXT_MODEL_NAMES))
@@ -96,8 +100,10 @@ class MoEConvNeXtBackbone(nn.Module):
         if len(features) != num_levels:
             raise RuntimeError(f"Expected {num_levels} ConvNeXt features, got {len(features)}")
         result: dict[str, torch.Tensor] = {}
-        for idx, key in enumerate(["c2", "c3", "c4"][:num_levels]):
-            result[key] = features[idx]
+        for idx, feat in enumerate(features):
+            key_idx = self.out_indices[idx]
+            key = _FEATURE_KEY_MAP[key_idx]
+            result[key] = feat
         return result
 
 

@@ -91,9 +91,8 @@ class ProximalMappingLoss(nn.Module):
                 raise ValueError(f"target['point'] must be [N, 2], got {tuple(points.shape)}")
 
             num_points = points.shape[0]
-            # Pre-allocate accumulated loss per point (proximal) and per pixel (background)
-            point_acc = torch.zeros(num_points, device=device, dtype=dtype)
-            point_counts = torch.zeros(num_points, device=device, dtype=dtype)
+            # Collect per-point density values across chunks for global simplex projection
+            point_densities: list[list[torch.Tensor]] = [[] for _ in range(num_points)]
             bg_acc = torch.zeros((), device=device, dtype=dtype)
 
             for start in range(0, coords.shape[0], self.max_pixels_per_chunk):
@@ -120,17 +119,18 @@ class ProximalMappingLoss(nn.Module):
                     point_mask = fg_assignment == p_idx
                     if not point_mask.any():
                         continue
-                    p_density = fg_density[point_mask]
-                    target = _project_onto_simplex(p_density)
-                    point_acc[p_idx] = point_acc[p_idx] + (p_density - target).pow(2).sum()
-                    point_counts[p_idx] = point_counts[p_idx] + point_mask.sum().to(dtype)
+                    point_densities[p_idx].append(fg_density[point_mask])
 
-            point_loss = point_acc.sum()
-            # Penalize points with no assigned pixels via log-count residual
-            orphan_mask = point_counts == 0
-            if orphan_mask.any():
-                orphan_count = torch.as_tensor(orphan_mask.sum().to(dtype), device=device)
-                point_loss = point_loss + orphan_count * 0.1
+            # Global simplex projection: process all pixels assigned to each point
+            # together so the "sum-to-1" constraint is exact, not per-chunk approximate.
+            point_loss = torch.zeros((), device=device, dtype=dtype)
+            for p_idx in range(num_points):
+                if not point_densities[p_idx]:
+                    point_loss = point_loss + 0.1  # orphan penalty
+                    continue
+                p_density = torch.cat(point_densities[p_idx])
+                target = _project_onto_simplex(p_density)
+                point_loss = point_loss + (p_density - target).pow(2).sum()
 
             if self.use_background:
                 total_loss = total_loss + point_loss + bg_acc
@@ -270,16 +270,20 @@ class SinkhornOTLoss(nn.Module):
         num_iters: int = 50,
         max_grid: int = 32,
         weight: float = 1.0,
+        output_stride: int = 8,
     ) -> None:
         super().__init__()
         if epsilon <= 0:
             raise ValueError("epsilon must be > 0")
         if num_iters < 1:
             raise ValueError("num_iters must be >= 1")
+        if output_stride < 1:
+            raise ValueError("output_stride must be >= 1")
         self.epsilon = float(epsilon)
         self.num_iters = int(num_iters)
         self.max_grid = int(max_grid)
         self.weight = float(weight)
+        self.output_stride = int(output_stride)
 
     def _build_cost_matrix(self, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         grid_y, grid_x = torch.meshgrid(
@@ -332,13 +336,12 @@ class SinkhornOTLoss(nn.Module):
                 total = total + p.pow(2).mean()
                 continue
 
-            # Build GT binary map at grid resolution
+            # Build GT binary map at grid resolution.
+            # Targets are in image pixel coords; first convert to stride-K coords
+            # (dividing by output_stride), then scale to grid coords.
             gt = torch.zeros(grid_h, grid_w, device=device, dtype=dtype)
-            scale_y = float(grid_h) / float(H)
-            scale_x = float(grid_w) / float(W)
-            # Assuming targets are in stride-8 coordinates; map to grid coords
-            pt_y = (pts[:, 1] * scale_y).long().clamp(0, grid_h - 1)
-            pt_x = (pts[:, 0] * scale_x).long().clamp(0, grid_w - 1)
+            pt_y = (pts[:, 1] / self.output_stride * float(grid_h) / float(H)).long().clamp(0, grid_h - 1)
+            pt_x = (pts[:, 0] / self.output_stride * float(grid_w) / float(W)).long().clamp(0, grid_w - 1)
             gt[pt_y, pt_x] = 1.0
             g = gt.reshape(-1)
             g = g / g.sum().clamp_min(1e-8)
@@ -535,7 +538,7 @@ class MoECountLoss(nn.Module):
         # OT auxiliary loss (distribution-level, before count loss)
         ot = pred_density.new_zeros(())
         if self.ot_loss is not None:
-            ot = self.ot_loss(pred_density, targets)
+            ot = self.ot_loss(pred_density, targets) * self.ot_weight
 
         # Count loss with fixed weight
         count_raw = self.count_loss(pred_density, targets)

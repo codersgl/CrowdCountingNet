@@ -177,11 +177,13 @@ class MoECountTrainer:
         # OT loss config
         ot_cfg = getattr(loss_cfg, "ot", None)
         if ot_cfg is not None and bool(getattr(ot_cfg, "enabled", False)):
+            output_stride = int(getattr(self.cfg.model, "output_stride", 8))
             ot_loss = SinkhornOTLoss(
                 epsilon=float(getattr(ot_cfg, "epsilon", 0.1)),
                 num_iters=int(getattr(ot_cfg, "num_iters", 50)),
                 max_grid=int(getattr(ot_cfg, "max_grid", 32)),
                 weight=1.0,  # weight applied in MoECountLoss
+                output_stride=output_stride,
             )
             ot_weight = float(getattr(ot_cfg, "weight", 0.05))
         else:

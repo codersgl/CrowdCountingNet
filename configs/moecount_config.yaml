@@ -31,7 +31,7 @@ optimizer:
   lr: 0.0001
   lr_backbone: 0.00001
   lr_gate: 0.0001
-  weight_decay: 0.01
+  weight_decay: 0.0001
   amsgrad: false
 
 scheduler:
@@ -42,7 +42,7 @@ scheduler:
   warmup_start_factor: 0.001
 
 moecount_loss:
-  use_pml: true  # true = ProximalMappingLoss, false = BayesianLoss
+  use_pml: false  # true = ProximalMappingLoss, false = BayesianLoss
   pml:
     sigma: 8.0
     use_background: false
@@ -50,8 +50,8 @@ moecount_loss:
     max_pixels_per_chunk: 16384
   bayesian:  # fallback when use_pml=false
     sigma: 8.0
-    use_background: false
-    bg_ratio: 0.05
+    use_background: true
+    bg_ratio: 0.15
     count_loss_type: l1
     max_pixels_per_chunk: 16384
   count:

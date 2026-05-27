@@ -20,5 +20,5 @@ def test_moecount_root_config_loads_with_interpolation() -> None:
     cfg = OmegaConf.load(Path("configs/moecount_config.yaml"))
     assert cfg.epochs == 1500
     assert int(cfg.scheduler.T_max) == 1500
-    assert cfg.optimizer.weight_decay == 0.01
+    assert cfg.optimizer.weight_decay == 0.0001
     assert cfg.mixed_precision.enabled is True

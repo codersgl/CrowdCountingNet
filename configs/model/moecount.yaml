@@ -19,7 +19,7 @@ neck:
 moe:
   top_k: 2
   gate_hidden_channels: 128
-  temperature_init: 0.5
+  temperature_init: 1.0
   temperature_min: 0.1
   temperature_decay: 0.9
   warmup_fraction: 0.1
@@ -44,7 +44,7 @@ head:
   hidden_channels: 128
   final_activation: softplus # relu | softplus | none
   initial_density: 0.01 # expected count per stride-8 density cell at init
-  final_weight_std: 1.0
+  final_weight_std: 0.0001
   use_point_head: true  # P2PNet-style point prediction auxiliary head
   point_hidden_channels: 128
 

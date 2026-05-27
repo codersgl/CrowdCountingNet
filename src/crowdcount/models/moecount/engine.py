@@ -211,6 +211,16 @@ def train_moecount_one_epoch(
             outputs = dict(outputs)
             outputs["density_out"] = aligned_pred
             outputs["pred_density"] = aligned_pred
+
+            # DeepSeek-V2 style expert bias update (post-warmup load balancing).
+            load_frac = outputs.get("moe_load_fraction")
+            warmup_flag = outputs.get("moe_warmup_active")
+            if (
+                isinstance(load_frac, torch.Tensor)
+                and not (isinstance(warmup_flag, bool) and warmup_flag)
+            ):
+                model.moe.gate.update_expert_bias(load_frac)
+
             image_sizes = (
                 int(gt_density.shape[-2] * output_stride),
                 int(gt_density.shape[-1] * output_stride),
@@ -224,15 +234,26 @@ def train_moecount_one_epoch(
         if amp_enabled:
             assert scaler is not None
             scaler.scale(loss_total).backward()
-            if max_norm > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            scaler.unscale_(optimizer)
+        else:
+            loss_total.backward()
+
+        # Pre-clip gradient norm for monitoring
+        total_norm: float = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        grad_norm = total_norm ** 0.5
+
+        if max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+        if amp_enabled:
+            assert scaler is not None
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss_total.backward()
-            if max_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             optimizer.step()
 
         density_loss_key = "loss_pml" if "loss_pml" in loss_dict else "loss_bayesian"
@@ -243,6 +264,7 @@ def train_moecount_one_epoch(
             "loss_balance": float(loss_dict["loss_balance"].detach().item()),
             "lambda_count": float(loss_dict["lambda_count"].detach().item()),
             "lr": float(optimizer.param_groups[0]["lr"]),
+            "grad_norm": grad_norm,
         }
         for loss_key in ("loss_point_cls", "loss_point_reg", "loss_ot"):
             value = loss_dict.get(loss_key)

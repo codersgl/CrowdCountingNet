@@ -49,7 +49,7 @@ class SparseTop2Gate(nn.Module):
         self.temperature = float(temperature_init)
 
         self.register_buffer("expert_bias", torch.zeros(num_experts))
-        self.logit_scale = nn.Parameter(torch.tensor(10.0))
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
         self.router = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -235,7 +235,7 @@ class MultiScaleSparseTop2Gate(SparseTop2Gate):
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, num_experts, kernel_size=1),
         )
-        self.logit_scale = nn.Parameter(torch.tensor(10.0))
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
 
     def _build_multi_scale(self, features: torch.Tensor) -> torch.Tensor:
         h, w = features.shape[-2:]

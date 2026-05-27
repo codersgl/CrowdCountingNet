@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from crowdcount.models.moecount.deformable_expert import DeformableCrossScaleExpert
-from crowdcount.models.moecount.gate import PixelSoftGate
+from crowdcount.models.moecount.gate import SparseTop2Gate
 from crowdcount.models.moecount.losses import ExpertImportanceLoss
 from crowdcount.models.neck import SPD
 
@@ -52,15 +52,17 @@ class LocalDetailExpert(nn.Module):
         self.dwconv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels)
         self.se = SE(channels, reduction=4)
         self.fuse = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
             nn.GroupNorm(32, channels),
             nn.ReLU(inplace=True),
         )
+        self.residual_gate = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         out = self.dwconv(features)
         out = self.se(out)
-        return self.fuse(out)
+        out = self.fuse(out)
+        return features + self.residual_gate.tanh() * out
 
 
 class SpatialRelationExpert(nn.Module):
@@ -178,6 +180,7 @@ class GlobalDensityExpert(nn.Module):
             nn.GroupNorm(32, channels),
             nn.ReLU(inplace=True),
         )
+        self.residual_gate = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         identity_size = features.shape[-2:]
@@ -186,7 +189,8 @@ class GlobalDensityExpert(nn.Module):
         x = self.large_kernel(x)
         x = self.se(x)
         x = self.fuse(x)
-        return F.interpolate(x, size=identity_size, mode="bilinear", align_corners=False)
+        out = F.interpolate(x, size=identity_size, mode="bilinear", align_corners=False)
+        return features + self.residual_gate.tanh() * out
 
 
 class HeterogeneousSparseMoE(nn.Module):
@@ -240,10 +244,16 @@ class HeterogeneousSparseMoE(nn.Module):
             spatial_expert,
             GlobalDensityExpert(channels),
         ])
-        self.gate = PixelSoftGate(
+        self.gate = SparseTop2Gate(
             in_channels=channels,
             num_experts=self.num_experts,
             hidden_channels=gate_hidden_channels,
+            top_k=top_k,
+            temperature_init=temperature_init,
+            temperature_min=temperature_min,
+            temperature_decay=temperature_decay,
+            warmup_fraction=warmup_fraction,
+            warmup_epochs=warmup_epochs,
         )
         self.eim_loss = ExpertImportanceLoss(
             lambda_importance=lambda_importance,
@@ -252,13 +262,13 @@ class HeterogeneousSparseMoE(nn.Module):
 
     @property
     def temperature(self) -> float:
-        return 1.0
+        return self.gate.temperature
 
     def set_epoch(self, epoch: int, total_epochs: int | None = None) -> None:
-        pass
+        self.gate.set_epoch(epoch, total_epochs)
 
     def update_temperature(self, decay_rate: float | None = None) -> None:
-        pass
+        self.gate.update_temperature(decay_rate)
 
     def forward(
         self, features: torch.Tensor

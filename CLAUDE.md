@@ -83,7 +83,7 @@ src/crowdcount/
     moecount.py           → MoECountNet: top-level model + build_moecount()
     backbone.py           → MoEConvNeXtBackbone (ConvNeXt, features_only)
     neck.py               → DeepBiFPNNeck (3-level SPD-BiFPN), EnhancedFPNNeck (2-level)
-    experts.py            → HeterogeneousSparseMoE: 3 scale×paradigm experts + PixelSoftGate
+    experts.py            → HeterogeneousSparseMoE: 3 scale×paradigm experts + shared expert
     deformable_expert.py  → DeformableCrossScaleExpert: DAT-style multi-scale deformable attention
     gate.py               → PixelSoftGate, SparseTop2Gate, MultiScaleSparseTop2Gate
     head.py               → DensityHead (softplus), PointPredHead (P2PNet-style)
@@ -92,9 +92,11 @@ src/crowdcount/
     engine.py             → train_moecount_one_epoch(), evaluate_moecount()
 ```
 
-**MoECountNet forward flow**: Backbone(C2/C3/C4) → BiFPN Neck → HeterogeneousSparseMoE (shared expert + 3 routed experts with pixel-wise softmax gate) → optional GCN refine → DensityHead + PointPredHead.
+**MoECountNet forward flow**: Backbone(C2/C3/C4) → BiFPN Neck → HeterogeneousSparseMoE (shared expert + 3 routed experts with SparseTop2Gate Gumbel-Softmax routing) → optional GCN refine → DensityHead + PointPredHead.
 
-The three experts are: `LocalDetailExpert` (stride-8, DWConv), `DeformableCrossScaleExpert` (stride-8, deformable attention; replaces `SpatialRelationExpert`'s W-MSA when `use_deformable: true`), `GlobalDensityExpert` (stride-32, large-kernel conv). All experts internally handle their own downsampling via SPD.
+The three experts are: `LocalDetailExpert` (stride-8, DWConv + SE), `DeformableCrossScaleExpert` (stride-8, DAT-style multi-scale deformable attention; replaces `SpatialRelationExpert`'s W-MSA when `use_deformable: true`), `GlobalDensityExpert` (stride-32, large-kernel DWConv + SE). All experts internally handle their own downsampling via SPD. `SparseTop2Gate` provides Gumbel-Softmax Top-2 sparse routing with temperature annealing (warmup → hard routing with straight-through gradients).
+
+**MoECountNet loss**: `MoECountLoss` composites: primary density loss (BayesianLoss or ProximalMappingLoss) + CountLoss (L1) + LoadBalanceLoss (CV² importance+batch load) + optional PointPredHead auxiliary loss (Hungarian matching + focal) + optional SinkhornOT loss. Balance loss decays linearly to 0 after warmup.
 
 ### Plugins (experimental modules for DSGCNet)
 
@@ -150,12 +152,21 @@ model:
 - **SPD (Space-to-Depth)**: Used throughout for lossless downsampling. Requires even spatial dimensions — pad before use.
 - **Zero-initialization pattern**: Learnable offsets and residual gates in deformable modules start at zero so training begins with identity behavior
 - **Tests**: Must not require GPU or real dataset files. Use synthetic tensors and fake configs.
-- **AMP**: MoECountNet uses `mixed_precision.enabled: true` by default; DSGCNet does not
 
 ## Training Considerations
 
 - MoECountNet has 3 parameter groups: head (lr=1e-4), backbone (lr=1e-5), gate (lr=1e-4)
-- Balance loss (CV² of expert load/importance) decays linearly to 0 over `decay_epochs`
+- MoECountNet uses SparseTop2Gate with Gumbel-Softmax temperature annealing. The gate starts in soft-routing warmup (all experts contribute with soft weights), then transitions to hard Top-2 routing with straight-through gradients. `model.moe.temperature_init`, `temperature_decay`, `warmup_epochs` control the schedule.
+- Balance loss (CV² of expert load/importance) decays linearly to 0 over `decay_epochs` after warmup
 - The deformable expert's residual gate is initialized to 0 (identity pass-through), so it needs many epochs to "warm up" — expect e2 gate load to start low and gradually increase
-- MoECountNet optimizer config differs from DSGCNet: `weight_decay=0.01` (vs 1e-4), `amsgrad=false`
 - DSGCNet default `clip_max_norm=0.1`; MoECountNet uses `clip_max_norm=5.0`
+- MoECountNet uses `mixed_precision.enabled: true` by default; DSGCNet does not
+- MoECountNet active development is on branch `exp1`
+
+## MoECountNet Config Defaults
+
+- `configs/moecount_config.yaml`: `epochs: 1500`, `weight_decay: 0.0001`, `use_pml: false` (BayesianLoss)
+- `configs/model/moecount.yaml`: `output_stride: 8`, `backbone.arch: convnext_tiny`, `moe.top_k: 2`, `head.final_activation: softplus`, `head.final_weight_std: 0.01`
+- The primary density loss is BayesianLoss (ICCV 2019) with `use_background: true`, `bg_ratio: 0.15`
+- Point prediction auxiliary head is enabled by default (`head.use_point_head: true`)
+- Sinkhorn OT loss is disabled by default (`moecount_loss.ot.enabled: false`)

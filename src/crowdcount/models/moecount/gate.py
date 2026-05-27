@@ -237,33 +237,17 @@ class MultiScaleSparseTop2Gate(SparseTop2Gate):
         )
         self.logit_scale = nn.Parameter(torch.tensor(10.0))
 
-    def _build_multi_scale(
-        self, features: torch.Tensor,
-        feat_s16: torch.Tensor | None = None,
-        feat_s32: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def _build_multi_scale(self, features: torch.Tensor) -> torch.Tensor:
         h, w = features.shape[-2:]
-
-        def _to_size(src: torch.Tensor | None, scale: int) -> torch.Tensor:
-            """Use real neck feature if available and at a different scale, else pool."""
-            if src is not None and src.shape[-2:] != features.shape[-2:]:
-                return F.interpolate(src, size=(h, w), mode="bilinear", align_corners=False)
-            pooled = F.adaptive_avg_pool2d(
-                features, (max(1, h // scale), max(1, w // scale)),
-            )
-            return F.interpolate(pooled, size=(h, w), mode="bilinear", align_corners=False)
-
-        s16_up = _to_size(feat_s16, 2)
-        s32_up = _to_size(feat_s32, 4)
+        s16 = F.adaptive_avg_pool2d(features, (max(1, h // 2), max(1, w // 2)))
+        s32 = F.adaptive_avg_pool2d(features, (max(1, h // 4), max(1, w // 4)))
+        s16_up = F.interpolate(s16, size=(h, w), mode="bilinear", align_corners=False)
+        s32_up = F.interpolate(s32, size=(h, w), mode="bilinear", align_corners=False)
         multi_scale = torch.cat([features, s16_up, s32_up], dim=1)
         return self.scale_compress(multi_scale)
 
-    def forward(
-        self, features: torch.Tensor,
-        feat_s16: torch.Tensor | None = None,
-        feat_s32: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor | bool]:
-        compressed = self._build_multi_scale(features, feat_s16, feat_s32)
+    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | bool]:
+        compressed = self._build_multi_scale(features)
         logits = self.router(compressed) * self.logit_scale + self.expert_bias.view(1, -1, 1, 1)
         warmup_active = self._in_warmup()
         temperature = max(float(self.temperature), self.temperature_min)

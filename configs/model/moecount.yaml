@@ -6,7 +6,7 @@ backbone:
   model_name: null # optional timm model name override
   pretrained: true
   pretrained_path: null # optional local .tar.gz/.safetensors/.pth file; disables online download
-  out_indices: [0, 1, 2, 3] # stride-4, stride-8, stride-16, stride-32 ConvNeXt feature levels
+  out_indices: [1, 2, 3] # stride-8, stride-16, and stride-32 ConvNeXt feature levels
 
 neck:
   out_channels: 256
@@ -17,32 +17,24 @@ neck:
   use_depthwise_refine: true
 
 moe:
-  gate_type: sparse_top2  # soft (PixelSoftGate) | sparse_top2 (MultiScaleSparseTop2Gate)
   top_k: 2
   gate_hidden_channels: 128
-  temperature_init: 1.0
+  temperature_init: 0.5
   temperature_min: 0.1
-  temperature_decay: 0.98
-  warmup_fraction: 0.2
-  warmup_epochs: 100
+  temperature_decay: 0.9
+  warmup_fraction: 0.1
+  warmup_epochs: 60
   lambda_importance: 0.001
   lambda_load: 0.001
   shared_scale: 0.3
 
 head:
-  head_type: denseaspp  # standard (DensityHead) | denseaspp (DenseASPPScaleHead)
-  hidden_channels: 128  # used by standard head
-  branch_channels: 64  # used by DenseASPP head
-  dilations: [1, 3, 6, 9]  # DenseASPP dilation rates
+  hidden_channels: 128
   final_activation: softplus # relu | softplus | none
   initial_density: 0.01 # expected count per stride-8 density cell at init
   final_weight_std: 1.0
   use_point_head: true  # P2PNet-style point prediction auxiliary head
   point_hidden_channels: 128
-  # Stride-4 refinement (P3-2)
-  s4_hidden_channels: 64
-  s4_initial_density: 0.0025  # ~1/4 of stride-8 density per cell
 
 use_gcn: false  # enable density-guided GCN feature refinement
 gcn_k: 4  # k for density k-NN graph building
-use_stride4_refine: true  # enable stride-4 coarse-to-fine refinement (P3-2)

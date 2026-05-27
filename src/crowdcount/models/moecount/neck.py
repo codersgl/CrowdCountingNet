@@ -66,7 +66,7 @@ class EnhancedFPNNeck(nn.Module):
         self.output_norm = nn.GroupNorm(32, out_channels)
         self.output_channels = out_channels
 
-    def forward(self, c2_feature: torch.Tensor, c3_feature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, c2_feature: torch.Tensor, c3_feature: torch.Tensor) -> torch.Tensor:
         c2_projected = self.c2_proj(c2_feature)
         c3_projected = self.c3_proj(c3_feature)
         c3_up = F.interpolate(
@@ -82,9 +82,7 @@ class EnhancedFPNNeck(nn.Module):
         )
         context_feature = self.context_norm(context_feature)
         context_feature = self.context_fuse(context_feature)
-        fused_s8 = self.output_norm(base_feature + context_feature)
-        # 2-level backbone: stride-32 falls back to stride-16
-        return fused_s8, c3_projected, c3_projected
+        return self.output_norm(base_feature + context_feature)
 
 
 class DeepBiFPNNeck(nn.Module):
@@ -160,7 +158,7 @@ class DeepBiFPNNeck(nn.Module):
         self.context_fuse = nn.Conv2d(out_channels, out_channels, kernel_size=1)
         self.output_norm = nn.GroupNorm(32, out_channels)
 
-    def forward(self, c2: torch.Tensor, c3: torch.Tensor, c4: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, c2: torch.Tensor, c3: torch.Tensor, c4: torch.Tensor) -> torch.Tensor:
         p3 = self.p3_proj(c2)
         p4 = self.p4_proj(c3)
         p5 = self.p5_proj(c4)
@@ -181,5 +179,4 @@ class DeepBiFPNNeck(nn.Module):
         )
         context_feature = self.context_norm(context_feature)
         context_feature = self.context_fuse(context_feature)
-        fused_s8 = self.output_norm(base_feature + context_feature)
-        return fused_s8, p4, p5  # stride-8 fused, stride-16, stride-32
+        return self.output_norm(base_feature + context_feature)

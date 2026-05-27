@@ -45,14 +45,9 @@ moecount_loss:
   use_pml: true  # true = ProximalMappingLoss, false = BayesianLoss
   pml:
     sigma: 8.0
-    use_background: true  # push empty-region density to zero (fixes "global wash")
-    bg_threshold: 2.5  # sigma * threshold = pixel distance for background classification
+    use_background: false
+    bg_threshold: 3.0
     max_pixels_per_chunk: 16384
-    sigma_schedule:  # linear anneal: large→small sigma (stabilise→sharpen)
-      start_epoch: 0
-      end_epoch: 300
-      sigma_start: 12.0
-      sigma_end: 6.0
   bayesian:  # fallback when use_pml=false
     sigma: 8.0
     use_background: false
@@ -64,7 +59,7 @@ moecount_loss:
   balance:
     lambda_importance: 0.001
     lambda_load: 0.001
-    decay_epochs: 100  # epochs over which CV^2 loss decays to 0 after warmup
+    decay_epochs: 50  # epochs over which CV^2 loss decays to 0 after warmup
   point:
     weight: 0.5  # point auxiliary loss weight (0 = disabled)
     cost_class: 1.0  # Hungarian matcher classification cost weight
@@ -73,16 +68,11 @@ moecount_loss:
     focal_gamma: 2.0  # focal loss gamma
     eos_coef: 0.1  # background class weight in empty_weight
   ot:
-    enabled: false  # Sinkhorn OT auxiliary loss (DM-Count, NeurIPS 2020) — disabled: NaN bug to fix
+    enabled: false  # set true to enable Sinkhorn OT auxiliary loss
     weight: 0.05  # OT loss weight in total loss
     epsilon: 0.1  # Sinkhorn entropic regularization
     num_iters: 50  # Sinkhorn iterations
     max_grid: 32  # downsample density to max_grid x max_grid for OT cost matrix
-  diversity_weight: 0.05  # expert activation cosine similarity penalty (P0-4)
-  expert_supervision_weight: 0.2  # per-expert density PML weight (P1-1)
-  ssim_weight: 0.05  # patch-wise SSIM local structure loss (P3-1)
-  density_s4_weight: 0.3  # stride-4 density PML weight (P3-2)
-  grad_weight: 0.01  # gradient-aware density loss (P3-3)
 
 monitor:
   log_interval: 100

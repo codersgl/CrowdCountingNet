@@ -219,9 +219,7 @@ def train_moecount_one_epoch(
             loss_total = loss_dict["loss_total"]
 
         if not torch.isfinite(loss_total):
-            nan_keys = [k for k, v in loss_dict.items() if isinstance(v, torch.Tensor) and not torch.isfinite(v).all()]
-            named_vals = ", ".join(f"{k}={loss_dict[k].item():.4g}" for k in nan_keys)
-            raise FloatingPointError(f"MoECount loss NaN/Inf in [{named_vals}]; total={float(loss_total.item())}")
+            raise FloatingPointError(f"MoECount loss is not finite: {float(loss_total.item())}")
 
         if amp_enabled:
             assert scaler is not None
@@ -237,17 +235,6 @@ def train_moecount_one_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             optimizer.step()
 
-        # DeepSeek-V2 style expert bias update: nudge underloaded experts up,
-        # overloaded experts down.  Runs after every step so the bias converges
-        # to a balanced state without gradient-based auxiliary losses.
-        moe_module = getattr(model, "moe", None)
-        if moe_module is not None:
-            gate = getattr(moe_module, "gate", None)
-            if gate is not None and hasattr(gate, "update_expert_bias"):
-                load_frac = outputs.get("moe_load_fraction")
-                if isinstance(load_frac, torch.Tensor):
-                    gate.update_expert_bias(load_frac)
-
         density_loss_key = "loss_pml" if "loss_pml" in loss_dict else "loss_bayesian"
         metrics: dict[str, float] = {
             "loss_total": float(loss_dict["loss_total"].detach().item()),
@@ -257,7 +244,7 @@ def train_moecount_one_epoch(
             "lambda_count": float(loss_dict["lambda_count"].detach().item()),
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
-        for loss_key in ("loss_point_cls", "loss_point_reg", "loss_ot", "loss_ssim", "loss_grad", "loss_diversity", "loss_expert_sup", "loss_density_s4"):
+        for loss_key in ("loss_point_cls", "loss_point_reg", "loss_ot"):
             value = loss_dict.get(loss_key)
             if isinstance(value, torch.Tensor):
                 metrics[loss_key] = float(value.detach().item())
@@ -336,13 +323,7 @@ def evaluate_moecount(
         pred_density = outputs["density_out"]
         if not isinstance(pred_density, torch.Tensor):
             raise TypeError("model output density_out must be a tensor")
-        # Use stride-4 density for evaluation if available (finer resolution)
-        density_s4 = outputs.get("density_s4")
-        if isinstance(density_s4, torch.Tensor):
-            s4_border = border // 4  # stride-4 border crop
-            pred_density = density_s4[:, :, s4_border:-s4_border or None, s4_border:-s4_border or None]
-        else:
-            pred_density = pred_density[:, :, crop:-crop or None, crop:-crop or None]
+        pred_density = pred_density[:, :, crop:-crop or None, crop:-crop or None]
         pred_density = _crop_density_for_eval(pred_density, targets[0], output_stride)
         pred_count = float(pred_density.sum().item())
         gt_count = float(targets[0]["point"].shape[0])

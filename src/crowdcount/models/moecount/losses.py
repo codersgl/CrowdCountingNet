@@ -480,7 +480,7 @@ class MoECountLoss(nn.Module):
         point_loss_weight: float = 0.0,
         point_cost_class: float = 1.0,
         point_cost_point: float = 0.05,
-        point_eos_coef: float = 0.1,
+        point_eos_coef: float = 0.5,
         ot_loss: SinkhornOTLoss | None = None,
         ot_weight: float = 0.1,
         tv_loss: TotalVariationLoss | None = None,

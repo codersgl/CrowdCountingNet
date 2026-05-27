@@ -171,7 +171,7 @@ class MoECountTrainer:
         point_loss_weight = float(getattr(point_cfg, "weight", 0.0)) if point_cfg is not None else 0.0
         point_cost_class = float(getattr(point_cfg, "cost_class", 1.0)) if point_cfg is not None else 1.0
         point_cost_point = float(getattr(point_cfg, "cost_point", 0.05)) if point_cfg is not None else 0.05
-        point_eos_coef = float(getattr(point_cfg, "eos_coef", 0.1)) if point_cfg is not None else 0.1
+        point_eos_coef = float(getattr(point_cfg, "eos_coef", 0.5)) if point_cfg is not None else 0.5
 
         # OT loss config
         ot_cfg = getattr(loss_cfg, "ot", None)

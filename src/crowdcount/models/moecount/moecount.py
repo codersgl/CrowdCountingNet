@@ -8,7 +8,7 @@ import torch
 from omegaconf import DictConfig
 from torch import nn
 
-from crowdcount.models.moecount.backbone import MoEConvNeXtBackbone
+from crowdcount.models.moecount.backbone import MoEConvNeXtBackbone, MoEVGGBackbone
 from crowdcount.models.moecount.experts import HeterogeneousSparseMoE
 from crowdcount.models.moecount.gcn_refine import DensityGCNRefine
 from crowdcount.models.moecount.head import DensityHead, PointPredHead
@@ -20,7 +20,7 @@ class MoECountNet(nn.Module):
 
     def __init__(
         self,
-        backbone: MoEConvNeXtBackbone,
+        backbone: nn.Module,
         neck: EnhancedFPNNeck | DeepBiFPNNeck,
         moe: HeterogeneousSparseMoE,
         density_head: DensityHead,
@@ -91,13 +91,22 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
     moe_cfg = getattr(model_cfg, "moe", None)
     head_cfg = getattr(model_cfg, "head", None)
 
-    backbone = MoEConvNeXtBackbone(
-        arch=str(getattr(backbone_cfg, "arch", "convnext_tiny")),
-        model_name=getattr(backbone_cfg, "model_name", None),
-        pretrained=bool(getattr(backbone_cfg, "pretrained", True)),
-        pretrained_path=getattr(backbone_cfg, "pretrained_path", None),
-        out_indices=tuple(getattr(backbone_cfg, "out_indices", (1, 2))),
-    )
+    backbone_type = str(getattr(backbone_cfg, "type", "convnext")).lower()
+
+    if backbone_type == "vgg":
+        backbone = MoEVGGBackbone(
+            vgg_name=str(getattr(backbone_cfg, "vgg_name", "vgg16_bn")),
+            pretrained=bool(getattr(backbone_cfg, "pretrained", True)),
+            out_levels=int(getattr(backbone_cfg, "num_output_levels", 3)),
+        )
+    else:
+        backbone = MoEConvNeXtBackbone(
+            arch=str(getattr(backbone_cfg, "arch", "convnext_tiny")),
+            model_name=getattr(backbone_cfg, "model_name", None),
+            pretrained=bool(getattr(backbone_cfg, "pretrained", True)),
+            pretrained_path=getattr(backbone_cfg, "pretrained_path", None),
+            out_indices=tuple(getattr(backbone_cfg, "out_indices", (1, 2))),
+        )
     num_backbone_levels = len(backbone.out_channels)
     if num_backbone_levels == 3:
         neck = DeepBiFPNNeck(

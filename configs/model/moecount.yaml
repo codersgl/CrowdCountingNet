@@ -2,11 +2,16 @@ name: moecount
 output_stride: 8
 
 backbone:
+  type: convnext # convnext | vgg
+  # --- ConvNeXt options (when type: convnext) ---
   arch: convnext_tiny # convnext_tiny | convnext_small | convnext_base | convnext_large
   model_name: null # optional timm model name override
   pretrained: true
   pretrained_path: null # optional local .tar.gz/.safetensors/.pth file; disables online download
   out_indices: [1, 2, 3] # stride-8, stride-16, and stride-32 ConvNeXt feature levels
+  # --- VGG options (when type: vgg) ---
+  vgg_name: vgg16_bn # vgg16_bn | vgg16
+  num_output_levels: 3 # 2 (c2,c3) or 3 (c2,c3,c4)
 
 neck:
   out_channels: 256

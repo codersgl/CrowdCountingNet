@@ -4,11 +4,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from crowdcount.models.moecount.backbone import convert_convnext_state_dict_for_features_only
+from crowdcount.models.moecount.backbone import (
+    MoEVGGBackbone,
+    convert_convnext_state_dict_for_features_only,
+)
 from crowdcount.models.moecount.experts import HeterogeneousSparseMoE
 from crowdcount.models.moecount.head import DensityHead
 from crowdcount.models.moecount.moecount import MoECountNet
-from crowdcount.models.moecount.neck import EnhancedFPNNeck
+from crowdcount.models.moecount.neck import DeepBiFPNNeck, EnhancedFPNNeck
 
 
 class TinyMoEBackbone(nn.Module):
@@ -92,3 +95,40 @@ def test_convnext_local_state_dict_key_conversion() -> None:
         "stages_1.blocks.0.gamma",
     }
     assert skipped == 1
+
+
+def test_vgg_backbone_forward() -> None:
+    backbone = MoEVGGBackbone(vgg_name="vgg16_bn", pretrained=False, out_levels=3)
+    backbone.eval()
+    with torch.no_grad():
+        out = backbone(torch.randn(2, 3, 256, 256))
+    assert set(out) == {"c2", "c3", "c4"}
+    assert out["c2"].shape == (2, 256, 64, 64)  # stride 4
+    assert out["c3"].shape == (2, 512, 32, 32)  # stride 8
+    assert out["c4"].shape == (2, 512, 16, 16)  # stride 16
+    assert backbone.out_channels == (256, 512, 512)
+
+
+def test_vgg_backbone_out_levels_2() -> None:
+    backbone = MoEVGGBackbone(vgg_name="vgg16_bn", pretrained=False, out_levels=2)
+    backbone.eval()
+    with torch.no_grad():
+        out = backbone(torch.randn(1, 3, 128, 128))
+    assert set(out) == {"c2", "c3"}
+    assert out["c2"].shape == (1, 256, 32, 32)  # stride 4
+    assert out["c3"].shape == (1, 512, 16, 16)  # stride 8
+    assert backbone.out_channels == (256, 512)
+
+
+def test_moecount_with_vgg_backbone() -> None:
+    backbone = MoEVGGBackbone(vgg_name="vgg16_bn", pretrained=False, out_levels=3)
+    c2_ch, c3_ch, c4_ch = backbone.out_channels
+    neck = DeepBiFPNNeck(c2_ch, c3_ch, c4_ch, out_channels=64, branch_channels=(32, 16, 16))
+    moe = HeterogeneousSparseMoE(channels=64, gate_hidden_channels=16, warmup_epochs=0)
+    head = DensityHead(in_channels=64, hidden_channels=16, final_activation="softplus")
+    model = MoECountNet(backbone, neck, moe, head)
+    model.eval()
+    with torch.no_grad():
+        output = model(torch.randn(1, 3, 256, 256))
+    assert output["density_out"].shape == (1, 1, 64, 64)  # c2 stride = 4
+    assert "moe_weights" in output

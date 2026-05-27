@@ -1,4 +1,4 @@
-"""ConvNeXt backbone wrapper for MoECountNet."""
+"""ConvNeXt and VGG backbone wrappers for MoECountNet."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any, cast
 import torch
 from torch import nn
 from loguru import logger
+
 
 
 _CONVNEXT_MODEL_NAMES = {
@@ -171,6 +172,48 @@ def convert_convnext_state_dict_for_features_only(
         else:
             skipped += 1
     return converted, skipped
+
+
+class MoEVGGBackbone(nn.Module):
+    """VGG16-BN backbone wrapper for MoECountNet, exposing stride-8/16/32 features.
+
+    Maps VGG's body2/body3/body4 to ``c2``/``c3``/``c4`` dict keys so the
+    MoECountNet neck can consume them identically to ConvNeXt features.
+    """
+
+    def __init__(
+        self,
+        vgg_name: str = "vgg16_bn",
+        pretrained: bool = True,
+        out_levels: int = 3,
+    ) -> None:
+        super().__init__()
+        if out_levels not in (2, 3):
+            raise ValueError(f"out_levels must be 2 or 3, got {out_levels}")
+
+        from crowdcount.models import vgg_ as vgg_models
+        from crowdcount.models.backbone import BackboneBase_VGG
+
+        backbone = vgg_models.vgg16_bn(pretrained=pretrained)
+        self.body = BackboneBase_VGG(backbone, 256, vgg_name, return_interm_layers=True)
+
+        if vgg_name in ("vgg16_bn", "vgg16"):
+            self._out_channels = (256, 512, 512)[:out_levels]
+        else:
+            self._out_channels = (128, 256, 512)[:out_levels]
+        self._out_levels = out_levels
+
+    @property
+    def out_channels(self) -> tuple[int, ...]:
+        return self._out_channels
+
+    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+        features = self.body(images)  # [body1, body2, body3, body4]
+        result: dict[str, torch.Tensor] = {}
+        keys = ["c2", "c3", "c4"][: self._out_levels]
+        for idx, key in enumerate(keys):
+            result[key] = features[idx + 1]  # skip body1 (stride-4)
+        return result
 
 
 def load_local_convnext_weights(model: nn.Module, pretrained_path: str | Path) -> tuple[int, int]:

@@ -119,6 +119,8 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
             branch_channels=tuple(getattr(neck_cfg, "branch_channels", (128, 64, 64))),
             dilations=tuple(getattr(neck_cfg, "dilations", (1, 2, 5))),
         )
+    deformable_cfg = getattr(moe_cfg, "deformable_expert", None)
+    use_deformable = bool(getattr(deformable_cfg, "use_deformable", False))
     moe = HeterogeneousSparseMoE(
         channels=int(getattr(neck_cfg, "out_channels", 256)),
         gate_hidden_channels=int(getattr(moe_cfg, "gate_hidden_channels", 128)),
@@ -131,6 +133,13 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         lambda_importance=float(getattr(moe_cfg, "lambda_importance", 0.01)),
         lambda_load=float(getattr(moe_cfg, "lambda_load", 0.01)),
         shared_scale=float(getattr(moe_cfg, "shared_scale", 0.3)),
+        use_deformable_expert=use_deformable,
+        deformable_num_heads=int(getattr(deformable_cfg, "num_heads", 4)),
+        deformable_num_sampling_points=int(getattr(deformable_cfg, "num_sampling_points", 8)),
+        deformable_num_scale_levels=int(getattr(deformable_cfg, "num_scale_levels", 3)),
+        deformable_max_offset=float(getattr(deformable_cfg, "max_offset", 8.0)),
+        deformable_dropout=float(getattr(deformable_cfg, "dropout", 0.1)),
+        deformable_use_se=bool(getattr(deformable_cfg, "use_se", True)),
     )
     density_head = DensityHead(
         in_channels=int(getattr(neck_cfg, "out_channels", 256)),

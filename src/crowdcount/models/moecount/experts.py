@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from crowdcount.models.moecount.deformable_expert import DeformableCrossScaleExpert
 from crowdcount.models.moecount.gate import PixelSoftGate
 from crowdcount.models.moecount.losses import ExpertImportanceLoss
 from crowdcount.models.neck import SPD
@@ -209,14 +210,34 @@ class HeterogeneousSparseMoE(nn.Module):
         lambda_importance: float = 0.01,
         lambda_load: float = 0.01,
         shared_scale: float = 0.3,
+        use_deformable_expert: bool = False,
+        deformable_num_heads: int = 4,
+        deformable_num_sampling_points: int = 8,
+        deformable_num_scale_levels: int = 3,
+        deformable_max_offset: float = 8.0,
+        deformable_dropout: float = 0.1,
+        deformable_use_se: bool = True,
     ) -> None:
         super().__init__()
         self.num_experts = 3
         self.shared_scale = float(shared_scale)
         self.shared_expert = SharedExpert(channels)
+        spatial_expert: nn.Module
+        if use_deformable_expert:
+            spatial_expert = DeformableCrossScaleExpert(
+                channels=channels,
+                num_heads=deformable_num_heads,
+                num_sampling_points=deformable_num_sampling_points,
+                num_scale_levels=deformable_num_scale_levels,
+                max_offset=deformable_max_offset,
+                dropout=deformable_dropout,
+                use_se=deformable_use_se,
+            )
+        else:
+            spatial_expert = SpatialRelationExpert(channels)
         self.experts = nn.ModuleList([
             LocalDetailExpert(channels),
-            SpatialRelationExpert(channels),
+            spatial_expert,
             GlobalDensityExpert(channels),
         ])
         self.gate = PixelSoftGate(

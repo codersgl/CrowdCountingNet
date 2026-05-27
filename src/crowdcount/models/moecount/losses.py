@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from crowdcount.models.matcher import HungarianMatcher_Crowd
-from crowdcount.models.criterion import softmax_focal_loss
 
 
 def _project_onto_simplex(v: torch.Tensor) -> torch.Tensor:
@@ -480,9 +479,7 @@ class MoECountLoss(nn.Module):
         balance_decay_epochs: int = 50,
         point_loss_weight: float = 0.0,
         point_cost_class: float = 1.0,
-        point_cost_l1: float = 1.0,
-        point_focal_alpha: float = 0.75,
-        point_focal_gamma: float = 2.0,
+        point_cost_point: float = 0.05,
         point_eos_coef: float = 0.1,
         ot_loss: SinkhornOTLoss | None = None,
         ot_weight: float = 0.1,
@@ -503,10 +500,8 @@ class MoECountLoss(nn.Module):
         if self.point_loss_weight > 0:
             self.matcher = HungarianMatcher_Crowd(
                 cost_class=float(point_cost_class),
-                cost_point=float(point_cost_l1),
+                cost_point=float(point_cost_point),
             )
-            self.point_focal_alpha = float(point_focal_alpha)
-            self.point_focal_gamma = float(point_focal_gamma)
             empty_weight = torch.ones(2)
             empty_weight[0] = float(point_eos_coef)
             self.register_buffer("point_empty_weight", empty_weight)
@@ -516,15 +511,6 @@ class MoECountLoss(nn.Module):
             return 1.0
         progress = (epoch - self.warmup_end) / max(self.balance_decay_epochs, 1)
         return max(0.0, 1.0 - progress)
-
-    def _point_weight_scale(
-        self, epoch: int, warmup_end: int = 60, warmup_len: int = 30
-    ) -> float:
-        """Scale point loss weight: 0 during MoE warmup, then linear ramp."""
-        if epoch < warmup_end:
-            return 0.0
-        progress = min((epoch - warmup_end) / max(warmup_len, 1), 1.0)
-        return float(progress)
 
     def forward(
         self,
@@ -595,19 +581,15 @@ class MoECountLoss(nn.Module):
             "lambda_count": pred_density.new_tensor(self.count_weight),
         }
 
-        # Point auxiliary loss (Hungarian matching + focal cls + SmoothL1 reg)
+        # Point auxiliary loss (Hungarian matching + CE cls + SmoothL1 reg)
         if (
             self.point_loss_weight > 0
             and "pred_logits" in outputs
             and "pred_points" in outputs
         ):
             point_losses = self._compute_point_loss(outputs, targets)
-            point_scale = self._point_weight_scale(epoch)
-            scaled_point_total = point_losses["loss_point_total"] * point_scale
-            point_losses["loss_point_total"] = scaled_point_total
-            point_losses["point_weight_scale"] = pred_density.new_tensor(point_scale)
             result.update(point_losses)
-            result["loss_total"] = result["loss_total"] + scaled_point_total
+            result["loss_total"] = result["loss_total"] + point_losses["loss_point_total"]
 
         return result
 
@@ -628,7 +610,7 @@ class MoECountLoss(nn.Module):
         tgt_points = torch.cat([v["point"] for v in targets])
 
         cost_class = -out_prob[:, tgt_ids]
-        cost_point = torch.cdist(out_points, tgt_points, p=2)
+        cost_point = torch.cdist(out_points, tgt_points, p=1)
         C = self.matcher.cost_point * cost_point + self.matcher.cost_class * cost_class
         bs, num_queries = pred_logits.shape[:2]
         C = C.view(bs, num_queries, -1).cpu().detach()
@@ -659,12 +641,10 @@ class MoECountLoss(nn.Module):
         )
         target_classes[batch_idx, src_idx] = target_classes_o
 
-        loss_cls = softmax_focal_loss(
-            pred_logits.flatten(0, 1),
-            target_classes.flatten(0, 1),
-            alpha=self.point_focal_alpha,
-            gamma=self.point_focal_gamma,
-            class_weight=self.point_empty_weight,  # type: ignore[arg-type]
+        loss_cls = F.cross_entropy(
+            pred_logits.transpose(1, 2),  # [B, 2, Q]
+            target_classes,               # [B, Q]
+            self.point_empty_weight,
         )
 
         # Regression loss (SmoothL1)

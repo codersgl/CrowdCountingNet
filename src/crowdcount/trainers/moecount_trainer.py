@@ -170,9 +170,7 @@ class MoECountTrainer:
         point_cfg = getattr(loss_cfg, "point", None)
         point_loss_weight = float(getattr(point_cfg, "weight", 0.0)) if point_cfg is not None else 0.0
         point_cost_class = float(getattr(point_cfg, "cost_class", 1.0)) if point_cfg is not None else 1.0
-        point_cost_l1 = float(getattr(point_cfg, "cost_l1", 1.0)) if point_cfg is not None else 1.0
-        point_focal_alpha = float(getattr(point_cfg, "focal_alpha", 0.75)) if point_cfg is not None else 0.75
-        point_focal_gamma = float(getattr(point_cfg, "focal_gamma", 2.0)) if point_cfg is not None else 2.0
+        point_cost_point = float(getattr(point_cfg, "cost_point", 0.05)) if point_cfg is not None else 0.05
         point_eos_coef = float(getattr(point_cfg, "eos_coef", 0.1)) if point_cfg is not None else 0.1
 
         # OT loss config
@@ -220,9 +218,7 @@ class MoECountTrainer:
             balance_decay_epochs=int(getattr(balance_cfg, "decay_epochs", 50)),
             point_loss_weight=point_loss_weight,
             point_cost_class=point_cost_class,
-            point_cost_l1=point_cost_l1,
-            point_focal_alpha=point_focal_alpha,
-            point_focal_gamma=point_focal_gamma,
+            point_cost_point=point_cost_point,
             point_eos_coef=point_eos_coef,
             ot_loss=ot_loss,
             ot_weight=ot_weight,

@@ -23,7 +23,7 @@ class HungarianMatcher_Crowd(nn.Module):
         tgt_points = torch.cat([v["point"] for v in targets])
 
         cost_class = -out_prob[:, tgt_ids]
-        cost_point = torch.cdist(out_points, tgt_points, p=2)
+        cost_point = torch.cdist(out_points, tgt_points, p=1)
 
         C = self.cost_point * cost_point + self.cost_class * cost_class
         C = C.view(bs, num_queries, -1).cpu()

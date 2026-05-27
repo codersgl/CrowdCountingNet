@@ -80,7 +80,7 @@ class MoECountNet(nn.Module):
             "expert_similarity": route.get("expert_similarity", {}),
         }
         if self.point_head is not None:
-            result.update(self.point_head(moe_features))
+            result.update(self.point_head(fused_neck))
         return result
 
 

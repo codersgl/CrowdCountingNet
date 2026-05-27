@@ -63,10 +63,8 @@ moecount_loss:
   point:
     weight: 0.5  # point auxiliary loss weight (0 = disabled)
     cost_class: 1.0  # Hungarian matcher classification cost weight
-    cost_l1: 1.0  # Hungarian matcher L1 distance cost weight
-    focal_alpha: 0.75  # focal loss alpha for foreground class
-    focal_gamma: 2.0  # focal loss gamma
-    eos_coef: 0.1  # background class weight in empty_weight
+    cost_point: 0.05  # Hungarian matcher point distance cost weight (P2PNet default)
+    eos_coef: 0.1  # background class weight for cross-entropy loss (P2PNet default)
   ot:
     enabled: false  # set true to enable Sinkhorn OT auxiliary loss
     weight: 0.05  # OT loss weight in total loss

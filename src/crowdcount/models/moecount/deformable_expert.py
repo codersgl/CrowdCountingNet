@@ -255,7 +255,7 @@ class DeformableCrossScaleExpert(nn.Module):
         distance_lambda = self.distance_lambda.clamp_min(0.0)
         attn = attn - distance_lambda * distance.unsqueeze(1)
 
-        attn = F.softmax(attn, dim=-1)
+        attn = F.softmax(attn.clamp(-1e4, 1e4), dim=-1)
         attn = self.attn_drop(attn)
 
         out = torch.einsum("bhnk,bhnkd->bhnd", attn, v)  # [B, heads, N, head_dim]

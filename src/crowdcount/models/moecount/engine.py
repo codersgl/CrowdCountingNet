@@ -331,6 +331,7 @@ def evaluate_moecount(
     output_stride: int = 8,
     eval_point_head: bool = True,
     point_match_threshold: float = 8.0,
+    point_cls_threshold: float = 0.3,
 ) -> tuple[float, float, dict[str, float]]:
     model.eval()
     maes: list[float] = []
@@ -365,6 +366,7 @@ def evaluate_moecount(
                 outputs["pred_points"],
                 targets[0]["point"],
                 match_threshold=point_match_threshold,
+                cls_threshold=point_cls_threshold,
             )
             if pt_metrics is not None:
                 point_maes.append(pt_metrics["mae"])
@@ -396,6 +398,7 @@ def _eval_point_head(
     pred_points: torch.Tensor,
     gt_points: torch.Tensor,
     match_threshold: float = 8.0,
+    cls_threshold: float = 0.3,
 ) -> dict[str, float] | None:
     """Compute point head metrics via Hungarian matching."""
     gt_count = gt_points.shape[0]
@@ -403,7 +406,7 @@ def _eval_point_head(
         return None
     gt_points = gt_points.to(device=pred_points.device, dtype=pred_points.dtype)
     probs = pred_logits[0].softmax(dim=-1)
-    fg_mask = probs[:, 1] > 0.5
+    fg_mask = probs[:, 1] > cls_threshold
     if not fg_mask.any():
         return {"mae": float(gt_count), "precision": 0.0, "recall": 0.0}
     fg_pts = pred_points[0][fg_mask]

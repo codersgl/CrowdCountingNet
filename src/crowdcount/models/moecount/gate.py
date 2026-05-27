@@ -97,6 +97,8 @@ class SparseTop2Gate(nn.Module):
         """DeepSeek-V2 style bias adjustment: boost underloaded, penalize overloaded experts."""
         target_load = self.top_k / self.num_experts
         error = target_load - load_fraction.detach()
+        if not torch.isfinite(error).all():
+            return
         self.expert_bias = self.expert_bias + bias_lr * error.to(device=self.expert_bias.device)
 
     def _sample_gumbel(self, logits: torch.Tensor) -> torch.Tensor:
@@ -104,7 +106,9 @@ class SparseTop2Gate(nn.Module):
         return -torch.log(-torch.log(uniform))
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | bool]:
-        logits = self.router(features) * self.logit_scale + self.expert_bias.view(1, -1, 1, 1)
+        if not torch.isfinite(self.expert_bias).all():
+            self.expert_bias.zero_()
+        logits = self.router(features) * self.logit_scale.clamp(0.1, 10.0) + self.expert_bias.view(1, -1, 1, 1)
         warmup_active = self._in_warmup()
         temperature = max(float(self.temperature), self.temperature_min)
 
@@ -248,7 +252,9 @@ class MultiScaleSparseTop2Gate(SparseTop2Gate):
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | bool]:
         compressed = self._build_multi_scale(features)
-        logits = self.router(compressed) * self.logit_scale + self.expert_bias.view(1, -1, 1, 1)
+        if not torch.isfinite(self.expert_bias).all():
+            self.expert_bias.zero_()
+        logits = self.router(compressed) * self.logit_scale.clamp(0.1, 10.0) + self.expert_bias.view(1, -1, 1, 1)
         warmup_active = self._in_warmup()
         temperature = max(float(self.temperature), self.temperature_min)
 

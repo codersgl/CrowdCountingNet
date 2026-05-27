@@ -517,6 +517,15 @@ class MoECountLoss(nn.Module):
         progress = (epoch - self.warmup_end) / max(self.balance_decay_epochs, 1)
         return max(0.0, 1.0 - progress)
 
+    def _point_weight_scale(
+        self, epoch: int, warmup_end: int = 60, warmup_len: int = 30
+    ) -> float:
+        """Scale point loss weight: 0 during MoE warmup, then linear ramp."""
+        if epoch < warmup_end:
+            return 0.0
+        progress = min((epoch - warmup_end) / max(warmup_len, 1), 1.0)
+        return float(progress)
+
     def forward(
         self,
         outputs: dict[str, torch.Tensor | dict[str, torch.Tensor]],
@@ -593,8 +602,12 @@ class MoECountLoss(nn.Module):
             and "pred_points" in outputs
         ):
             point_losses = self._compute_point_loss(outputs, targets)
+            point_scale = self._point_weight_scale(epoch)
+            scaled_point_total = point_losses["loss_point_total"] * point_scale
+            point_losses["loss_point_total"] = scaled_point_total
+            point_losses["point_weight_scale"] = pred_density.new_tensor(point_scale)
             result.update(point_losses)
-            result["loss_total"] = result["loss_total"] + point_losses["loss_point_total"]
+            result["loss_total"] = result["loss_total"] + scaled_point_total
 
         return result
 

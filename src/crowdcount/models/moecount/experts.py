@@ -176,10 +176,6 @@ class LocalDetailExpert(nn.Module):
                 groups=channels,
             )
             fuse_in = channels * 3
-            # Per-branch gate scalars (initialized to soft-contribute)
-            self.branch_gate_3x3 = nn.Parameter(torch.ones(1) * 0.5)
-            self.branch_gate_1xK = nn.Parameter(torch.ones(1) * 0.25)
-            self.branch_gate_Kx1 = nn.Parameter(torch.ones(1) * 0.25)
         else:
             fuse_in = channels
         self.fuse_strips = nn.Sequential(
@@ -208,12 +204,9 @@ class LocalDetailExpert(nn.Module):
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         out_3x3 = self.dwconv_3x3(features)
         if self.use_strip_convs:
-            g3 = self.branch_gate_3x3.tanh()
-            gh = self.branch_gate_1xK.tanh()
-            gv = self.branch_gate_Kx1.tanh()
             out_1xK = self.dwconv_1xK(features)
             out_Kx1 = self.dwconv_Kx1(features)
-            out = torch.cat([g3 * out_3x3, gh * out_1xK, gv * out_Kx1], dim=1)
+            out = torch.cat([out_3x3, out_1xK, out_Kx1], dim=1)
         else:
             out = out_3x3
         out = self.fuse_strips(out)
@@ -295,7 +288,7 @@ class SpatialRelationExpert(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
+        attn = F.softmax(attn.clamp(-1e4, 1e4), dim=-1)
         attn_out = (attn @ v).transpose(1, 2).reshape(Bnw, N, C)
         attn_out = self.proj(attn_out)
 

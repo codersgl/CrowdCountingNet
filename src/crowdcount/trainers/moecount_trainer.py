@@ -394,6 +394,7 @@ class MoECountTrainer:
         output_stride = int(getattr(cfg.model, "output_stride", 8))
         eval_point_head = bool(getattr(monitor_cfg, "eval_point_head", True))
         point_match_threshold = float(getattr(monitor_cfg, "point_match_threshold", 8.0))
+        point_cls_threshold = float(getattr(monitor_cfg, "point_cls_threshold", 0.3))
 
         for epoch in range(int(cfg.start_epoch), int(cfg.epochs)):
             epoch_start = time.time()
@@ -434,6 +435,7 @@ class MoECountTrainer:
                     output_stride=output_stride,
                     eval_point_head=eval_point_head,
                     point_match_threshold=point_match_threshold,
+                    point_cls_threshold=point_cls_threshold,
                 )
                 mae_history.append(mae)
                 mse_history.append(mse)

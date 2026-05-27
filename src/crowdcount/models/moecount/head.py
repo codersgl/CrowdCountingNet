@@ -39,8 +39,17 @@ class PointPredHead(nn.Module):
             nn.GroupNorm(32, hidden_channels),
             nn.ReLU(inplace=True),
         )
-        self.cls_conv = nn.Conv2d(hidden_channels, 2, kernel_size=1)
+        self.cls_conv = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels // 2, kernel_size=3, padding=1),
+            nn.GroupNorm(min(32, hidden_channels // 2), hidden_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels // 2, 2, kernel_size=1),
+        )
         self.reg_conv = nn.Conv2d(hidden_channels, 2, kernel_size=1)
+
+        # Initialise classifier with strong background prior: ~95% bg prob
+        nn.init.constant_(self.cls_conv[-1].bias[0], 3.0)  # bg logit
+        nn.init.zeros_(self.cls_conv[-1].bias[1:])          # fg logit
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
         b, _, h, w = features.shape

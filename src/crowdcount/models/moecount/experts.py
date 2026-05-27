@@ -29,6 +29,96 @@ class SE(nn.Module):
         return x * self.fc(x)
 
 
+class MultiSpectralChannelAttention(nn.Module):
+    """FcaNet-style multi-spectral channel attention via 2D DCT bases.
+
+    Replaces the single GAP scalar (DC component only) with K different
+    2D DCT frequency components, enriching channel descriptors with
+    multi-frequency texture information at near-zero parameter cost.
+
+    Ref: Qin et al., "FcaNet: Frequency Channel Attention Networks", ICCV 2021.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        reduction: int = 4,
+        num_freqs: int = 4,
+    ) -> None:
+        super().__init__()
+        self.num_freqs = num_freqs
+        dct_basis = self._build_dct_basis(num_freqs, channels)
+        self.register_buffer("dct_basis", dct_basis)  # [C, K, 1, 1]
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels * num_freqs, channels // reduction, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    @staticmethod
+    def _build_dct_basis(
+        num_freqs: int, channels: int, base_h: int = 8, base_w: int = 8
+    ) -> torch.Tensor:
+        """Pre-compute K different 2D DCT basis vectors as constant buffers.
+
+        Uses the standard DCT-II formulation where the (u,v) basis image is:
+
+            B_{u,v}(i,j) = cos(pi*u*(i+0.5)/H) * cos(pi*v*(j+0.5)/W)
+
+        The first basis (u=0, v=0) recovers GAP — all coefficients equal.
+        Subsequent bases capture progressively higher spatial frequencies.
+        """
+        basis_list = []
+        # Select K DCT frequency pairs distributed across the spectrum.
+        # Strategy: grid-scan low-frequency region first, then extend.
+        freq_pairs: list[tuple[int, int]] = [(0, 0)]  # DC = GAP
+        for d in range(1, num_freqs):
+            # Zigzag-like: alternate between adding horizontal and vertical freqs
+            if d % 2 == 1:
+                freq_pairs.append((d // 2 + 1, 0))
+            else:
+                freq_pairs.append((0, d // 2))
+        freq_pairs = freq_pairs[:num_freqs]
+
+        i = torch.arange(base_h, dtype=torch.float32).unsqueeze(1)  # [H, 1]
+        j = torch.arange(base_w, dtype=torch.float32).unsqueeze(0)  # [1, W]
+
+        for u, v in freq_pairs:
+            basis_u = torch.cos(torch.pi * u * (i + 0.5) / base_h)  # [H, 1]
+            basis_v = torch.cos(torch.pi * v * (j + 0.5) / base_w)  # [1, W]
+            basis_2d = basis_u @ basis_v  # [H, W]
+            basis_2d = basis_2d / basis_2d.abs().sum().clamp_min(1e-8)  # L1-normalize
+            basis_list.append(basis_2d)
+
+        # Stack → [K, H, W], then expand channel dimension: treat equally per channel
+        basis_stack = torch.stack(basis_list)  # [K, H, W]
+        basis_stack = basis_stack.unsqueeze(0).expand(channels, -1, -1, -1)  # [C, K, H, W]
+        return basis_stack
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        # Resize pre-computed bases to match input spatial size
+        dct_basis = self.dct_basis  # [C, K, base_h, base_w]
+        if H != dct_basis.shape[-2] or W != dct_basis.shape[-1]:
+            dct_basis = (
+                F.interpolate(
+                    dct_basis.flatten(0, 1).unsqueeze(0),  # [1, C*K, base_h, base_w]
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                .squeeze(0)
+                .view(C, self.num_freqs, H, W)
+            )
+        # Compress each channel with K different DCT bases: [B, C, K]
+        freq_components = (x.unsqueeze(2) * dct_basis.unsqueeze(0)).sum(dim=[-2, -1])  # [B, C, K]
+        # Flatten to [B, C*K, 1, 1] for FC processing
+        freq_flat = freq_components.view(B, C * self.num_freqs, 1, 1)
+        attn = self.fc(freq_flat)  # [B, C, 1, 1]
+        return x * attn
+
+
 class SharedExpert(nn.Module):
     """Minimal shared expert — single conv, forcing routed experts to specialize."""
 
@@ -45,24 +135,93 @@ class SharedExpert(nn.Module):
 
 
 class LocalDetailExpert(nn.Module):
-    """Stride-8 expert: depthwise conv + channel attention for fine local patterns."""
+    """Stride-8 expert: multi-branch strip convs + multi-spectral channel attention.
 
-    def __init__(self, channels: int = 256) -> None:
+    Three parallel depthwise branches capture local patterns at different
+    aspect ratios (3x3 square, 1xK horizontal strip, Kx1 vertical strip),
+    followed by FcaNet-style multi-spectral channel attention that enriches
+    the channel descriptor with K DCT frequency components beyond GAP's DC.
+
+    Ref:
+      - SPCANet (Yuan, PeerJ CS 2024): Strip Pooling for crowd counting
+      - FcaNet (Qin et al., ICCV 2021): Multi-spectral channel attention
+    """
+
+    def __init__(
+        self,
+        channels: int = 256,
+        use_residual: bool = True,
+        use_strip_convs: bool = True,
+        strip_kernel: int = 7,
+        use_multi_spectral_se: bool = True,
+        ms_num_freqs: int = 4,
+    ) -> None:
         super().__init__()
-        self.dwconv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels)
-        self.se = SE(channels, reduction=4)
+        self.use_residual = use_residual
+        self.use_strip_convs = use_strip_convs
+
+        # --- Depthwise spatial branches ---
+        self.dwconv_3x3 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels)
+        if use_strip_convs:
+            self.dwconv_1xK = nn.Conv2d(
+                channels, channels,
+                kernel_size=(1, strip_kernel),
+                padding=(0, strip_kernel // 2),
+                groups=channels,
+            )
+            self.dwconv_Kx1 = nn.Conv2d(
+                channels, channels,
+                kernel_size=(strip_kernel, 1),
+                padding=(strip_kernel // 2, 0),
+                groups=channels,
+            )
+            fuse_in = channels * 3
+            # Per-branch gate scalars (initialized to soft-contribute)
+            self.branch_gate_3x3 = nn.Parameter(torch.ones(1) * 0.5)
+            self.branch_gate_1xK = nn.Parameter(torch.ones(1) * 0.25)
+            self.branch_gate_Kx1 = nn.Parameter(torch.ones(1) * 0.25)
+        else:
+            fuse_in = channels
+        self.fuse_strips = nn.Sequential(
+            nn.Conv2d(fuse_in, channels, kernel_size=1, bias=False),
+            nn.GroupNorm(32, channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # --- Channel attention ---
+        if use_multi_spectral_se:
+            self.channel_attn = MultiSpectralChannelAttention(
+                channels, reduction=4, num_freqs=ms_num_freqs,
+            )
+        else:
+            self.channel_attn = SE(channels, reduction=4)
+
+        # --- Output projection ---
         self.fuse = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=1, bias=False),
             nn.GroupNorm(32, channels),
             nn.ReLU(inplace=True),
         )
-        self.residual_gate = nn.Parameter(torch.tensor(0.0))
+        if use_residual:
+            self.residual_gate = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        out = self.dwconv(features)
-        out = self.se(out)
+        out_3x3 = self.dwconv_3x3(features)
+        if self.use_strip_convs:
+            g3 = self.branch_gate_3x3.tanh()
+            gh = self.branch_gate_1xK.tanh()
+            gv = self.branch_gate_Kx1.tanh()
+            out_1xK = self.dwconv_1xK(features)
+            out_Kx1 = self.dwconv_Kx1(features)
+            out = torch.cat([g3 * out_3x3, gh * out_1xK, gv * out_Kx1], dim=1)
+        else:
+            out = out_3x3
+        out = self.fuse_strips(out)
+        out = self.channel_attn(out)
         out = self.fuse(out)
-        return features + self.residual_gate.tanh() * out
+        if self.use_residual:
+            return features + self.residual_gate.tanh() * out
+        return out
 
 
 class SpatialRelationExpert(nn.Module):
@@ -159,8 +318,9 @@ class GlobalDensityExpert(nn.Module):
     SPD×2 downsampling to stride-32 → Conv7×7 DW + SE + Conv1×1 → bilinear up.
     """
 
-    def __init__(self, channels: int = 256) -> None:
+    def __init__(self, channels: int = 256, use_residual: bool = True) -> None:
         super().__init__()
+        self.use_residual = use_residual
         self.spd_down = nn.Sequential(
             SPD(),
             nn.Conv2d(4 * channels, channels, kernel_size=1, bias=False),
@@ -180,7 +340,8 @@ class GlobalDensityExpert(nn.Module):
             nn.GroupNorm(32, channels),
             nn.ReLU(inplace=True),
         )
-        self.residual_gate = nn.Parameter(torch.tensor(0.0))
+        if use_residual:
+            self.residual_gate = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         identity_size = features.shape[-2:]
@@ -190,7 +351,9 @@ class GlobalDensityExpert(nn.Module):
         x = self.se(x)
         x = self.fuse(x)
         out = F.interpolate(x, size=identity_size, mode="bilinear", align_corners=False)
-        return features + self.residual_gate.tanh() * out
+        if self.use_residual:
+            return features + self.residual_gate.tanh() * out
+        return out
 
 
 class HeterogeneousSparseMoE(nn.Module):
@@ -221,10 +384,18 @@ class HeterogeneousSparseMoE(nn.Module):
         deformable_max_offset: float = 8.0,
         deformable_dropout: float = 0.1,
         deformable_use_se: bool = True,
+        use_input_residual: bool = True,
+        expert_local_detail_use_residual: bool = True,
+        expert_global_density_use_residual: bool = True,
+        expert_local_detail_use_strip_convs: bool = True,
+        expert_local_detail_strip_kernel: int = 7,
+        expert_local_detail_use_multi_spectral_se: bool = True,
+        expert_local_detail_ms_num_freqs: int = 4,
     ) -> None:
         super().__init__()
         self.num_experts = 3
         self.shared_scale = float(shared_scale)
+        self.use_input_residual = use_input_residual
         self.shared_expert = SharedExpert(channels)
         spatial_expert: nn.Module
         if use_deformable_expert:
@@ -240,9 +411,16 @@ class HeterogeneousSparseMoE(nn.Module):
         else:
             spatial_expert = SpatialRelationExpert(channels)
         self.experts = nn.ModuleList([
-            LocalDetailExpert(channels),
+            LocalDetailExpert(
+                channels,
+                use_residual=expert_local_detail_use_residual,
+                use_strip_convs=expert_local_detail_use_strip_convs,
+                strip_kernel=expert_local_detail_strip_kernel,
+                use_multi_spectral_se=expert_local_detail_use_multi_spectral_se,
+                ms_num_freqs=expert_local_detail_ms_num_freqs,
+            ),
             spatial_expert,
-            GlobalDensityExpert(channels),
+            GlobalDensityExpert(channels, use_residual=expert_global_density_use_residual),
         ])
         self.gate = SparseTop2Gate(
             in_channels=channels,
@@ -296,7 +474,10 @@ class HeterogeneousSparseMoE(nn.Module):
         if not isinstance(route_weights, torch.Tensor):
             raise TypeError("gate route weights must be a tensor")
         routed = (expert_outputs * route_weights.unsqueeze(2)).sum(dim=1)
-        fused = self.output_norm(shared_out + routed)
+        if self.use_input_residual:
+            fused = self.output_norm(features + shared_out + routed)
+        else:
+            fused = self.output_norm(shared_out + routed)
 
         soft_probs = route["soft_probs"]
         if not isinstance(soft_probs, torch.Tensor):

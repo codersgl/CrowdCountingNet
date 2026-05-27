@@ -32,6 +32,18 @@ moe:
   lambda_importance: 0.001
   lambda_load: 0.001
   shared_scale: 0.3
+  use_input_residual: true  # adds features identity to MoE output
+
+  # Expert configuration: control per-expert behavior
+  expert_config:
+    local_detail:
+      use_residual: false   # true = old gated residual (identity pass-through)
+      use_strip_convs: true          # parallel 1xK + Kx1 depthwise strip branches
+      strip_kernel: 7                # strip kernel size (recommend 5-9)
+      use_multi_spectral_se: true    # FcaNet-style DCT multi-spectral attention
+      ms_num_freqs: 4                # number of DCT frequency components
+    global_density:
+      use_residual: false   # true = old gated residual (identity pass-through)
 
   # Deformable Cross-Scale Expert — replaces SpatialRelationExpert's W-MSA
   # with DAT-style multi-scale deformable attention.
@@ -50,6 +62,8 @@ head:
   final_activation: softplus # relu | softplus | none
   initial_density: 0.01 # expected count per stride-8 density cell at init
   final_weight_std: 0.0001
+  output_kernel_size: 3  # 1 = 1x1 (per-pixel), 3 = 3x3 (spatial context)
+  use_residual: true      # skip connection in DensityHead
   use_point_head: true  # P2PNet-style point prediction auxiliary head
   point_hidden_channels: 128
 

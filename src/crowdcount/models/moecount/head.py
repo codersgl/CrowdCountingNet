@@ -79,6 +79,8 @@ class DensityHead(nn.Module):
         final_activation: str = "softplus",
         initial_density: float = 0.05,
         final_weight_std: float = 1e-4,
+        output_kernel_size: int = 1,
+        use_residual: bool = False,
     ) -> None:
         super().__init__()
         if final_activation not in {"relu", "softplus", "none"}:
@@ -87,7 +89,10 @@ class DensityHead(nn.Module):
             raise ValueError("initial_density must be > 0")
         if final_weight_std < 0:
             raise ValueError("final_weight_std must be >= 0")
+        if output_kernel_size not in {1, 3, 5}:
+            raise ValueError("output_kernel_size must be 1, 3, or 5")
         self.final_activation = final_activation
+        self.use_residual = use_residual
         gn1 = min(32, hidden_channels)
         s2_channels = hidden_channels // 2
         gn2 = min(32, s2_channels)
@@ -101,8 +106,15 @@ class DensityHead(nn.Module):
             nn.GroupNorm(gn2, s2_channels),
             nn.ReLU(inplace=True),
         )
-        self.output_conv = nn.Conv2d(hidden_channels // 2, 1, kernel_size=1)
+        self.output_conv = nn.Conv2d(
+            hidden_channels // 2, 1,
+            kernel_size=output_kernel_size,
+            padding=output_kernel_size // 2,
+        )
         self._init_final_layer(initial_density, final_weight_std)
+        if use_residual:
+            self.residual_proj = nn.Conv2d(in_channels, 1, kernel_size=1)
+            self._init_residual_proj(initial_density, final_weight_std)
 
     def _init_final_layer(self, initial_density: float, final_weight_std: float) -> None:
         nn.init.normal_(self.output_conv.weight, mean=0.0, std=final_weight_std)
@@ -113,10 +125,21 @@ class DensityHead(nn.Module):
         if self.output_conv.bias is not None:
             nn.init.constant_(self.output_conv.bias, bias_value)
 
+    def _init_residual_proj(self, initial_density: float, final_weight_std: float) -> None:
+        nn.init.normal_(self.residual_proj.weight, mean=0.0, std=final_weight_std)
+        if self.final_activation == "softplus":
+            bias_value = _softplus_inverse(initial_density)
+        else:
+            bias_value = initial_density
+        if self.residual_proj.bias is not None:
+            nn.init.constant_(self.residual_proj.bias, bias_value)
+
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         x = self.stage1(features)
         x = self.stage2(x)
         density = self.output_conv(x)
+        if self.use_residual:
+            density = density + self.residual_proj(features)
         if self.final_activation == "relu":
             return F.relu(density)
         if self.final_activation == "softplus":

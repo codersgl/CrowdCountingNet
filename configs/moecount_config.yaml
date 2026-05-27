@@ -73,11 +73,15 @@ moecount_loss:
     epsilon: 0.1  # Sinkhorn entropic regularization
     num_iters: 50  # Sinkhorn iterations
     max_grid: 32  # downsample density to max_grid x max_grid for OT cost matrix
+  tv:
+    weight: 0.0005  # total variation smoothness regularizer; 0 = disabled
 
 monitor:
   log_interval: 100
   vis_interval: 500
   vis_dir: visuals/moecount
+  eval_point_head: true
+  point_match_threshold: 8.0  # max pixel distance for point matching
 
 hydra:
   run:

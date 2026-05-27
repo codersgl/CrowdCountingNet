@@ -27,6 +27,7 @@ from crowdcount.models.moecount.losses import (
     MoECountLoss,
     ProximalMappingLoss,
     SinkhornOTLoss,
+    TotalVariationLoss,
 )
 from crowdcount.utils.logging import logger, setup_logger
 from crowdcount.utils.misc import get_rank, nested_tensor_from_tensor_list
@@ -190,6 +191,13 @@ class MoECountTrainer:
             ot_loss = None
             ot_weight = 0.0
 
+        # TV smoothness loss config
+        tv_cfg = getattr(loss_cfg, "tv", None)
+        if tv_cfg is not None and float(getattr(tv_cfg, "weight", 0.0)) > 0:
+            tv_loss = TotalVariationLoss(weight=float(getattr(tv_cfg, "weight", 0.001)))
+        else:
+            tv_loss = None
+
         # Compute warmup end for balance loss decay
         moe_cfg = getattr(self.cfg.model, "moe", None)
         warmup_epochs = getattr(moe_cfg, "warmup_epochs", None) if moe_cfg is not None else None
@@ -218,6 +226,7 @@ class MoECountTrainer:
             point_eos_coef=point_eos_coef,
             ot_loss=ot_loss,
             ot_weight=ot_weight,
+            tv_loss=tv_loss,
         )
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
@@ -304,16 +313,38 @@ class MoECountTrainer:
         logger.info(f"Scheduler: {name} (no warmup)")
         return main_sched
 
+    def _load_state_dict_safe(self, checkpoint_state_dict: dict) -> None:
+        """Load state dict with graceful handling of missing/unexpected keys."""
+        model_state = self.model.state_dict()
+        ckpt_keys = set(checkpoint_state_dict.keys())
+        model_keys = set(model_state.keys())
+        missing = model_keys - ckpt_keys
+        unexpected = ckpt_keys - model_keys
+        if missing:
+            logger.warning(f"Missing keys (will use init values): {sorted(missing)}")
+        if unexpected:
+            logger.warning(f"Unexpected keys (will be ignored): {sorted(unexpected)}")
+        for key in model_keys & ckpt_keys:
+            if model_state[key].shape == checkpoint_state_dict[key].shape:
+                model_state[key] = checkpoint_state_dict[key]
+            else:
+                logger.warning(
+                    f"Shape mismatch for {key}: "
+                    f"model={model_state[key].shape}, "
+                    f"ckpt={checkpoint_state_dict[key].shape} — skipping"
+                )
+        self.model.load_state_dict(model_state)
+
     def _load_initial_state(self) -> None:
         cfg = self.cfg
         if cfg.frozen_weights is not None:
             checkpoint = torch.load(cfg.frozen_weights, map_location="cpu")
-            self.model.load_state_dict(checkpoint["model"])
+            self._load_state_dict_safe(checkpoint["model"])
             logger.info(f"Loaded MoECount weights from {cfg.frozen_weights}")
         if not cfg.resume:
             return
         checkpoint = torch.load(cfg.resume, map_location="cpu")
-        self.model.load_state_dict(checkpoint["model"])
+        self._load_state_dict_safe(checkpoint["model"])
         reset_optimizer = bool(getattr(cfg, "reset_optimizer", False))
         if not reset_optimizer and "optimizer" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
@@ -361,6 +392,8 @@ class MoECountTrainer:
         log_interval = int(getattr(monitor_cfg, "log_interval", 100))
         vis_interval = int(getattr(monitor_cfg, "vis_interval", 500))
         output_stride = int(getattr(cfg.model, "output_stride", 8))
+        eval_point_head = bool(getattr(monitor_cfg, "eval_point_head", True))
+        point_match_threshold = float(getattr(monitor_cfg, "point_match_threshold", 8.0))
 
         for epoch in range(int(cfg.start_epoch), int(cfg.epochs)):
             epoch_start = time.time()
@@ -394,16 +427,20 @@ class MoECountTrainer:
 
             do_eval = (epoch + 1) % int(cfg.eval_freq) == 0
             if do_eval:
-                mae, mse = evaluate_moecount(
+                mae, mse, pt_metrics = evaluate_moecount(
                     self.model,
                     self.data_loader_val,
                     self.device,
                     output_stride=output_stride,
+                    eval_point_head=eval_point_head,
+                    point_match_threshold=point_match_threshold,
                 )
                 mae_history.append(mae)
                 mse_history.append(mse)
                 self.writer.add_scalar("metric/mae", mae, epoch)
                 self.writer.add_scalar("metric/mse", mse, epoch)
+                for pt_key, pt_value in pt_metrics.items():
+                    self.writer.add_scalar(f"metric/{pt_key}", pt_value, epoch)
                 if mae <= self.best_mae:
                     self.best_mae = mae
                     torch.save(

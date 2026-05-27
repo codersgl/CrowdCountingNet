@@ -329,10 +329,15 @@ def evaluate_moecount(
     data_loader: Iterable,
     device: torch.device,
     output_stride: int = 8,
-) -> tuple[float, float]:
+    eval_point_head: bool = True,
+    point_match_threshold: float = 8.0,
+) -> tuple[float, float, dict[str, float]]:
     model.eval()
     maes: list[float] = []
     mses: list[float] = []
+    point_maes: list[float] = []
+    point_precisions: list[float] = []
+    point_recalls: list[float] = []
     border = _EVAL_REFLECT_BORDER
     crop = border // output_stride  # px at stride-8 density resolution
 
@@ -353,7 +358,66 @@ def evaluate_moecount(
         maes.append(abs(error))
         mses.append(error * error)
 
+        # Point head eval
+        if eval_point_head and "pred_logits" in outputs and "pred_points" in outputs:
+            pt_metrics = _eval_point_head(
+                outputs["pred_logits"],
+                outputs["pred_points"],
+                targets[0]["point"],
+                match_threshold=point_match_threshold,
+            )
+            if pt_metrics is not None:
+                point_maes.append(pt_metrics["mae"])
+                point_precisions.append(pt_metrics["precision"])
+                point_recalls.append(pt_metrics["recall"])
+
     mae = float(np.mean(maes)) if maes else 0.0
     mse = float(np.sqrt(np.mean(mses))) if mses else 0.0
-    logger.info(f"[MoECount Eval] mae={mae:.2f} mse={mse:.2f}")
-    return mae, mse
+    pt_metrics: dict[str, float] = {}
+    if point_maes:
+        pt_metrics = {
+            "point_mae": float(np.mean(point_maes)),
+            "point_precision": float(np.mean(point_precisions)),
+            "point_recall": float(np.mean(point_recalls)),
+        }
+        logger.info(
+            f"[MoECount Eval] mae={mae:.2f} mse={mse:.2f} | "
+            f"point_mae={pt_metrics['point_mae']:.2f} "
+            f"point_prec={pt_metrics['point_precision']:.3f} "
+            f"point_recall={pt_metrics['point_recall']:.3f}"
+        )
+    else:
+        logger.info(f"[MoECount Eval] mae={mae:.2f} mse={mse:.2f}")
+    return mae, mse, pt_metrics
+
+
+def _eval_point_head(
+    pred_logits: torch.Tensor,
+    pred_points: torch.Tensor,
+    gt_points: torch.Tensor,
+    match_threshold: float = 8.0,
+) -> dict[str, float] | None:
+    """Compute point head metrics via Hungarian matching."""
+    gt_count = gt_points.shape[0]
+    if gt_count == 0:
+        return None
+    gt_points = gt_points.to(device=pred_points.device, dtype=pred_points.dtype)
+    probs = pred_logits[0].softmax(dim=-1)
+    fg_mask = probs[:, 1] > 0.5
+    if not fg_mask.any():
+        return {"mae": float(gt_count), "precision": 0.0, "recall": 0.0}
+    fg_pts = pred_points[0][fg_mask]
+    pred_count = fg_pts.shape[0]
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ImportError:
+        return None
+    cost = torch.cdist(fg_pts.unsqueeze(0), gt_points.unsqueeze(0), p=2).squeeze(0)
+    cost_np = cost.cpu().numpy()
+    row_ind, col_ind = linear_sum_assignment(cost_np)
+    matched = sum(1 for r, c in zip(row_ind, col_ind) if cost_np[r, c] <= match_threshold)
+    return {
+        "mae": float(abs(pred_count - gt_count)),
+        "precision": matched / max(pred_count, 1),
+        "recall": matched / max(gt_count, 1),
+    }

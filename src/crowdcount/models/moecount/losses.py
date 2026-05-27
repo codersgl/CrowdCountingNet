@@ -449,6 +449,19 @@ class LoadBalanceLoss(nn.Module):
         }
 
 
+class TotalVariationLoss(nn.Module):
+    """Total variation regularizer to encourage spatially smooth density maps."""
+
+    def __init__(self, weight: float = 0.001) -> None:
+        super().__init__()
+        self.weight = float(weight)
+
+    def forward(self, pred_density: torch.Tensor) -> torch.Tensor:
+        diff_x = (pred_density[:, :, :, 1:] - pred_density[:, :, :, :-1]).abs().mean()
+        diff_y = (pred_density[:, :, 1:, :] - pred_density[:, :, :-1, :]).abs().mean()
+        return self.weight * (diff_x + diff_y)
+
+
 class MoECountLoss(nn.Module):
     """Aggregate density, count, and MoE balance losses.
 
@@ -473,6 +486,7 @@ class MoECountLoss(nn.Module):
         point_eos_coef: float = 0.1,
         ot_loss: SinkhornOTLoss | None = None,
         ot_weight: float = 0.1,
+        tv_loss: TotalVariationLoss | None = None,
     ) -> None:
         super().__init__()
         self.pml_loss = pml_loss
@@ -484,6 +498,7 @@ class MoECountLoss(nn.Module):
         self.balance_decay_epochs = int(balance_decay_epochs)
         self.ot_loss = ot_loss
         self.ot_weight = float(ot_weight)
+        self.tv_loss = tv_loss
         self.point_loss_weight = float(point_loss_weight)
         if self.point_loss_weight > 0:
             self.matcher = HungarianMatcher_Crowd(
@@ -557,11 +572,13 @@ class MoECountLoss(nn.Module):
         balance_scale = self._balance_scale(epoch)
         scaled_balance = balance * balance_scale
 
-        total = density_loss + ot + count + scaled_balance
+        tv = self.tv_loss(pred_density) if self.tv_loss is not None else pred_density.new_zeros(())
+        total = density_loss + ot + tv + count + scaled_balance
         result = {
             "loss_total": total,
             loss_label: density_loss,
             "loss_ot": ot,
+            "loss_tv": tv,
             "loss_count": count,
             "loss_balance": scaled_balance,
             "loss_balance_raw": balance,

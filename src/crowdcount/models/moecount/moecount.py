@@ -130,6 +130,9 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         )
     deformable_cfg = getattr(moe_cfg, "deformable_expert", None)
     use_deformable = bool(getattr(deformable_cfg, "use_deformable", False))
+    expert_config = getattr(moe_cfg, "expert_config", None)
+    local_detail_cfg = getattr(expert_config, "local_detail", None) if expert_config is not None else None
+    global_density_cfg = getattr(expert_config, "global_density", None) if expert_config is not None else None
     moe = HeterogeneousSparseMoE(
         channels=int(getattr(neck_cfg, "out_channels", 256)),
         gate_hidden_channels=int(getattr(moe_cfg, "gate_hidden_channels", 128)),
@@ -149,6 +152,13 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         deformable_max_offset=float(getattr(deformable_cfg, "max_offset", 8.0)),
         deformable_dropout=float(getattr(deformable_cfg, "dropout", 0.1)),
         deformable_use_se=bool(getattr(deformable_cfg, "use_se", True)),
+        use_input_residual=bool(getattr(moe_cfg, "use_input_residual", True)),
+        expert_local_detail_use_residual=bool(getattr(local_detail_cfg, "use_residual", True) if local_detail_cfg is not None else True),
+        expert_global_density_use_residual=bool(getattr(global_density_cfg, "use_residual", True) if global_density_cfg is not None else True),
+        expert_local_detail_use_strip_convs=bool(getattr(local_detail_cfg, "use_strip_convs", True) if local_detail_cfg is not None else True),
+        expert_local_detail_strip_kernel=int(getattr(local_detail_cfg, "strip_kernel", 7) if local_detail_cfg is not None else 7),
+        expert_local_detail_use_multi_spectral_se=bool(getattr(local_detail_cfg, "use_multi_spectral_se", True) if local_detail_cfg is not None else True),
+        expert_local_detail_ms_num_freqs=int(getattr(local_detail_cfg, "ms_num_freqs", 4) if local_detail_cfg is not None else 4),
     )
     density_head = DensityHead(
         in_channels=int(getattr(neck_cfg, "out_channels", 256)),
@@ -156,6 +166,8 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         final_activation=str(getattr(head_cfg, "final_activation", "softplus")),
         initial_density=float(getattr(head_cfg, "initial_density", 0.05)),
         final_weight_std=float(getattr(head_cfg, "final_weight_std", 1e-4)),
+        output_kernel_size=int(getattr(head_cfg, "output_kernel_size", 1)),
+        use_residual=bool(getattr(head_cfg, "use_residual", False)),
     )
     use_point_head = bool(getattr(head_cfg, "use_point_head", True))
     if use_point_head:

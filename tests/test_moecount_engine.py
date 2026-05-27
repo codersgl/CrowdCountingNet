@@ -69,7 +69,7 @@ def test_evaluate_moecount_returns_density_metrics() -> None:
     model = build_tiny_moecount(final_activation="softplus").eval()
     samples = torch.randn(1, 3, 128, 128)
     targets = ({"point": torch.zeros(0, 2), "orig_size": torch.tensor([128, 128])},)
-    mae, mse = evaluate_moecount(
+    mae, mse, pt_metrics = evaluate_moecount(
         model,
         [(samples, targets)],
         torch.device("cpu"),
@@ -77,5 +77,6 @@ def test_evaluate_moecount_returns_density_metrics() -> None:
     )
     assert isinstance(mae, float)
     assert isinstance(mse, float)
+    assert isinstance(pt_metrics, dict)
     assert mae >= 0
     assert mse >= 0

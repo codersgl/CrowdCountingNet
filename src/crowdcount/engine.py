@@ -9,16 +9,151 @@ from __future__ import annotations
 import inspect
 import math
 import sys
+from pathlib import Path
 from typing import Iterable, Optional, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from PIL import Image, ImageDraw
 
+from crowdcount.data.transforms import DeNormalize
 from crowdcount.eval.tta import count_from_outputs, tta_predict
 from crowdcount.utils.misc import MetricLogger, SmoothedValue, reduce_dict
 from loguru import logger
+
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def _density_heatmap(density: torch.Tensor) -> torch.Tensor:
+    """Convert a 2D density map to a JET RGB heatmap [3, H, W] in [0, 1]."""
+    import matplotlib
+
+    d = density.detach().cpu().float()
+    vmax = torch.quantile(d, 0.995).clamp_min(1e-8)
+    d = (d / vmax).clamp(0, 1)
+    jet = matplotlib.colormaps["jet"]
+    rgb = jet(d.numpy())[..., :3].copy()
+    return torch.from_numpy(rgb).permute(2, 0, 1).float()
+
+
+def _save_expert_route_image(top1: torch.Tensor, output_path: Path) -> torch.Tensor:
+    """Save per-pixel expert routing map as RGB image. Returns [3, H, W] tensor."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    palette = top1.new_tensor(
+        [[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+        dtype=torch.uint8,
+    )
+    top1_cpu = top1[0].detach().to(torch.long).cpu().clamp(0, 2)
+    rgb = palette.cpu()[top1_cpu]
+    Image.fromarray(rgb.numpy()).save(output_path)
+    return rgb.permute(2, 0, 1).float() / 255.0
+
+
+def _save_density_overlay(
+    sample: torch.Tensor,
+    pred_density: torch.Tensor,
+    gt_density: torch.Tensor,
+    output_path: Path,
+    pred_points: torch.Tensor | None = None,
+    gt_points: torch.Tensor | None = None,
+    point_radius: int = 2,
+) -> torch.Tensor:
+    """Save original | pred-overlay | gt-overlay side-by-side.
+
+    Optionally draws predicted points (red) and GT points (green) as circles.
+    Returns [3, H, 3*W] tensor for TensorBoard.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    denorm = DeNormalize(_IMAGENET_MEAN, _IMAGENET_STD)
+    img = denorm(sample[0].detach().cpu().clone()).clamp(0, 1)
+    pred = pred_density[0].detach().cpu()
+    gt = gt_density[0].detach().cpu()
+    pred_count = float(pred.sum().item())
+    gt_count = float(gt.sum().item())
+    img_h, img_w = img.shape[-2:]
+
+    pred_full = F.interpolate(
+        pred.unsqueeze(0), size=(img_h, img_w), mode="bilinear", align_corners=False,
+    ).squeeze(0)
+    gt_full = F.interpolate(
+        gt.unsqueeze(0).float(), size=(img_h, img_w), mode="bilinear", align_corners=False,
+    ).squeeze(0)
+
+    def _overlay(image: torch.Tensor, density: torch.Tensor, alpha: float = 0.55) -> torch.Tensor:
+        hm = _density_heatmap(density.squeeze(0))
+        return image * (1 - alpha) + hm * alpha
+
+    overlay_pred = _overlay(img, pred_full)
+    overlay_gt = _overlay(img, gt_full)
+    combined = torch.cat([img, overlay_pred, overlay_gt], dim=-1)
+    combined_uint8 = (combined.clamp(0, 1) * 255).permute(1, 2, 0).byte().numpy()
+
+    pil_img = Image.fromarray(combined_uint8)
+    draw = ImageDraw.Draw(pil_img)
+    w = img_w
+    draw.text((w + 8, 8), f"Pred: {pred_count:.1f}", fill=(255, 255, 0))
+    draw.text((2 * w + 8, 8), f"GT:   {gt_count:.1f}", fill=(255, 255, 0))
+
+    # Draw predicted points on the pred-overlay panel (cyan fill, white outline, offset by w)
+    if pred_points is not None and pred_points.numel() > 0:
+        pts = pred_points.detach().cpu()
+        for x, y in pts:
+            _x = float(x) + w
+            _y = float(y)
+            draw.ellipse(
+                (_x - point_radius, _y - point_radius, _x + point_radius, _y + point_radius),
+                fill=(0, 255, 255), outline=(255, 255, 255),
+            )
+
+    # Draw GT points on the GT-overlay panel (magenta fill, white outline, offset by 2*w)
+    if gt_points is not None and gt_points.numel() > 0:
+        pts = gt_points.detach().cpu()
+        for x, y in pts:
+            _x = float(x) + 2 * w
+            _y = float(y)
+            draw.ellipse(
+                (_x - point_radius, _y - point_radius, _x + point_radius, _y + point_radius),
+                fill=(255, 0, 255), outline=(255, 255, 255),
+            )
+
+    pil_img.save(output_path)
+    return combined
+
+
+def _eval_point_head(
+    pred_logits: torch.Tensor,
+    pred_points: torch.Tensor,
+    gt_points: torch.Tensor,
+    match_threshold: float = 8.0,
+    cls_threshold: float = 0.5,
+) -> dict[str, float] | None:
+    """Compute point head metrics (MAE, precision, recall) via Hungarian matching."""
+    gt_count = gt_points.shape[0]
+    if gt_count == 0:
+        return None
+    gt_points = gt_points.to(device=pred_points.device, dtype=pred_points.dtype)
+    probs = pred_logits[0].softmax(dim=-1)
+    fg_mask = probs[:, 1] > cls_threshold
+    if not fg_mask.any():
+        return {"mae": float(gt_count), "precision": 0.0, "recall": 0.0}
+    fg_pts = pred_points[0][fg_mask]
+    pred_count = fg_pts.shape[0]
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ImportError:
+        return None
+    cost = torch.cdist(fg_pts.unsqueeze(0), gt_points.unsqueeze(0), p=2).squeeze(0)
+    cost_np = cost.cpu().numpy()
+    row_ind, col_ind = linear_sum_assignment(cost_np)
+    matched = sum(1 for r, c in zip(row_ind, col_ind) if cost_np[r, c] <= match_threshold)
+    return {
+        "mae": float(abs(pred_count - gt_count)),
+        "precision": matched / max(pred_count, 1),
+        "recall": matched / max(gt_count, 1),
+    }
 
 
 def _forward_model(
@@ -165,6 +300,11 @@ def train_one_epoch(
     cfg=None,
     ssim_criterion: nn.Module | None = None,
     uncertainty_weighter: nn.Module | None = None,
+    writer=None,
+    vis_dir: str | None = None,
+    vis_interval: int = 500,
+    pml_mse_aux: nn.Module | None = None,
+    pml_mse_aux_weight: float = 0.0,
 ) -> dict:
     """Train for one epoch.
 
@@ -353,6 +493,8 @@ def train_one_epoch(
         )
     else:
         point_feedback_warmup_factor = 1.0
+
+    batch_idx = 0
 
     for batch in data_loader:
         if needs_depth_batch:
@@ -579,6 +721,13 @@ def train_one_epoch(
             density_ssim_loss = density_ssim_weight * ssim_criterion(et_dmap, gt_dmap)
             density_loss = density_loss + density_ssim_loss
 
+        pml_mse_aux_loss = torch.tensor(0.0, device=samples.device)
+        if pml_mse_aux is not None and pml_mse_aux_weight > 0:
+            pml_mse_aux_loss = (
+                pml_mse_aux(et_dmap, gt_dmap) / gt_dmap.shape[0] * pml_mse_aux_weight
+            )
+            density_loss = density_loss + pml_mse_aux_loss
+
         depth_aux_loss = torch.tensor(0.0, device=samples.device)
         depth_aux_pixel_loss = torch.tensor(0.0, device=samples.device)
         depth_aux_grad_loss = torch.tensor(0.0, device=samples.device)
@@ -794,6 +943,8 @@ def train_one_epoch(
             metric_logger.update(**_dm_components)
         if use_density_ssim:
             metric_logger.update(den_ssim=density_ssim_loss.item())
+        if pml_mse_aux is not None and pml_mse_aux_weight > 0:
+            metric_logger.update(pml_mse_aux=pml_mse_aux_loss.item())
 
         if moe_aux_total is not None:
             metric_logger.update(
@@ -844,6 +995,67 @@ def train_one_epoch(
                         ema_usage_max=float(ema_u.max().item()),
                     )
 
+            # --- MoECountNet MoE metrics ---
+            moe_load_fraction = outputs.get("moe_load_fraction")
+            if moe_load_fraction is not None and isinstance(moe_load_fraction, torch.Tensor):
+                lf = moe_load_fraction.detach().cpu()
+                for i, val in enumerate(lf.tolist(), start=1):
+                    metric_logger.update(**{f"moe_e{i}_load": float(val)})
+
+            moe_entropy = outputs.get("moe_entropy")
+            if moe_entropy is not None:
+                if isinstance(moe_entropy, torch.Tensor):
+                    metric_logger.update(moe_entropy=float(moe_entropy.item()))
+                elif isinstance(moe_entropy, bool):
+                    pass
+
+            expert_similarity = outputs.get("expert_similarity") or {}
+            if isinstance(expert_similarity, dict):
+                for sim_key, sim_val in expert_similarity.items():
+                    if isinstance(sim_val, torch.Tensor):
+                        metric_logger.update(**{f"expert_{sim_key}": float(sim_val.item())})
+
+            moe_warmup = outputs.get("moe_warmup_active")
+            if isinstance(moe_warmup, bool):
+                metric_logger.update(moe_warmup=1.0 if moe_warmup else 0.0)
+
+            # --- Visualization (expert route + density overlay) ---
+            if vis_dir is not None and vis_interval > 0:
+                if batch_idx % vis_interval == 0:
+                    moe_top1 = outputs.get("moe_top1")
+                    if moe_top1 is not None and isinstance(moe_top1, torch.Tensor):
+                        route_path = Path(vis_dir) / "expert_route_latest.png"
+                        route_img = _save_expert_route_image(moe_top1, route_path)
+                        if writer is not None:
+                            writer.add_image("moe/top1_expert", route_img, epoch)
+
+                        pd_density = outputs.get("pred_density")
+                        if pd_density is None:
+                            pd_density = outputs.get("density_out")
+                        if pd_density is not None and isinstance(pd_density, torch.Tensor):
+                            # Extract predicted points (confidence > 0.5)
+                            _pred_pts = None
+                            _pred_logits = outputs.get("pred_logits")
+                            _pred_points = outputs.get("pred_points")
+                            if _pred_logits is not None and _pred_points is not None:
+                                _probs = _pred_logits[0].softmax(dim=-1)
+                                _fg = _probs[:, 1] > 0.5
+                                if _fg.any():
+                                    _pred_pts = _pred_points[0][_fg]
+
+                            _gt_pts = targets[0].get("point") if targets else None
+
+                            overlay_path = Path(vis_dir) / "density_overlay_latest.png"
+                            overlay_img = _save_density_overlay(
+                                samples, pd_density, gt_dmap, overlay_path,
+                                pred_points=_pred_pts,
+                                gt_points=_gt_pts,
+                            )
+                            if writer is not None:
+                                writer.add_image("moe/density_overlay", overlay_img, epoch)
+
+            batch_idx += 1
+
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
     metric_logger.synchronize_between_processes()
@@ -859,11 +1071,15 @@ def evaluate_crowd_no_overlap(
     vis_dir: Optional[str] = None,
     use_depth: bool = False,
     cfg=None,
-) -> tuple[float, float, float, float]:
+    eval_point_head: bool = False,
+    point_match_threshold: float = 8.0,
+    point_cls_threshold: float = 0.5,
+) -> tuple[float, float, float, float, dict[str, float]]:
     """Evaluate on validation set (no overlap).
 
     Returns:
-        (mae, mse, density_mae, density_mse)
+        (mae, mse, density_mae, density_mse, pt_metrics)
+        pt_metrics is a dict with optional keys: point_mae, point_precision, point_recall
     """
     model.eval()
 
@@ -872,6 +1088,9 @@ def evaluate_crowd_no_overlap(
         "class_error", SmoothedValue(window_size=1, fmt="{value:.2f}")
     )
     maes, mses, density_maes, density_mses = [], [], [], []
+    point_maes: list[float] = []
+    point_precisions: list[float] = []
+    point_recalls: list[float] = []
 
     eval_cfg = getattr(cfg, "eval_counting", None) if cfg is not None else None
     tta_cfg = getattr(cfg, "eval_tta", None) if cfg is not None else None
@@ -917,11 +1136,32 @@ def evaluate_crowd_no_overlap(
         density_maes.append(float(density_mae))
         density_mses.append(float(density_mse))
 
+        # Point head precision/recall via Hungarian matching
+        if eval_point_head and not tta_enabled and "pred_logits" in outputs and "pred_points" in outputs:
+            pt = _eval_point_head(
+                outputs["pred_logits"],
+                outputs["pred_points"],
+                targets[0]["point"],
+                match_threshold=point_match_threshold,
+                cls_threshold=point_cls_threshold,
+            )
+            if pt is not None:
+                point_maes.append(pt["mae"])
+                point_precisions.append(pt["precision"])
+                point_recalls.append(pt["recall"])
+
     mae = float(np.mean(maes))
     mse = float(np.sqrt(np.mean(mses)))
     density_mae = float(np.mean(density_maes))
     density_mse = float(np.sqrt(np.mean(density_mses)))
-    return mae, mse, density_mae, density_mse
+
+    pt_metrics: dict[str, float] = {}
+    if point_maes:
+        pt_metrics["point_mae"] = float(np.mean(point_maes))
+        pt_metrics["point_precision"] = float(np.mean(point_precisions))
+        pt_metrics["point_recall"] = float(np.mean(point_recalls))
+
+    return mae, mse, density_mae, density_mse, pt_metrics
 
 
 # ---------------------------------------------------------------------------

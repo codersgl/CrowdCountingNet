@@ -309,11 +309,24 @@ class GlobalDensityExpert(nn.Module):
     """Stride-32 expert: large-kernel conv + channel attention for global density context.
 
     SPD×2 downsampling to stride-32 → Conv7×7 DW + SE + Conv1×1 → bilinear up.
+
+    When use_density=True, the predicted density map is concatenated as an
+    additional input channel and fused via a 1×1 projection before the SPD
+    downsamples, making the expert truly density-aware.
     """
 
-    def __init__(self, channels: int = 256, use_residual: bool = True) -> None:
+    def __init__(
+        self, channels: int = 256, use_residual: bool = True, use_density: bool = True
+    ) -> None:
         super().__init__()
         self.use_residual = use_residual
+        self.use_density = use_density
+        if use_density:
+            self.density_fuse = nn.Sequential(
+                nn.Conv2d(channels + 1, channels, kernel_size=1, bias=False),
+                nn.GroupNorm(32, channels),
+                nn.ReLU(inplace=True),
+            )
         self.spd_down = nn.Sequential(
             SPD(),
             nn.Conv2d(4 * channels, channels, kernel_size=1, bias=False),
@@ -336,10 +349,17 @@ class GlobalDensityExpert(nn.Module):
         if use_residual:
             self.residual_gate = nn.Parameter(torch.tensor(0.0))
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, features: torch.Tensor, density: torch.Tensor | None = None
+    ) -> torch.Tensor:
         identity_size = features.shape[-2:]
-        x = self.spd_down(features)   # s8 → s16
-        x = self.spd_down2(x)         # s16 → s32
+        if self.use_density and density is not None:
+            x = torch.cat([features, density], dim=1)
+            x = self.density_fuse(x)
+        else:
+            x = features
+        x = self.spd_down(x)   # s8 → s16
+        x = self.spd_down2(x)  # s16 → s32
         x = self.large_kernel(x)
         x = self.se(x)
         x = self.fuse(x)
@@ -385,6 +405,7 @@ class HeterogeneousSparseMoE(nn.Module):
         expert_local_detail_use_multi_spectral_se: bool = True,
         expert_local_detail_ms_num_freqs: int = 4,
         gate_type: str = "sparse_top2",
+        expert_global_density_use_density: bool = True,
     ) -> None:
         super().__init__()
         self.num_experts = 3
@@ -415,7 +436,11 @@ class HeterogeneousSparseMoE(nn.Module):
                 ms_num_freqs=expert_local_detail_ms_num_freqs,
             ),
             spatial_expert,
-            GlobalDensityExpert(channels, use_residual=expert_global_density_use_residual),
+            GlobalDensityExpert(
+                channels,
+                use_residual=expert_global_density_use_residual,
+                use_density=expert_global_density_use_density,
+            ),
         ])
         if gate_type == "soft":
             self.gate = PixelSoftGate(
@@ -451,11 +476,16 @@ class HeterogeneousSparseMoE(nn.Module):
         self.gate.update_temperature(decay_rate)
 
     def forward(
-        self, features: torch.Tensor
+        self, features: torch.Tensor, density: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor | bool]]:
         shared_out = self.shared_expert(features) * self.shared_scale
         expert_outputs = torch.stack(
-            [expert(features) for expert in self.experts],
+            [
+                expert(features, density=density)
+                if isinstance(expert, GlobalDensityExpert)
+                else expert(features)
+                for expert in self.experts
+            ],
             dim=1,
         )  # [B, 3, C, H/8, W/8]
 

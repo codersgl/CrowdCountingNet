@@ -73,6 +73,17 @@ density_mds:
   ssim_sigma: 1.5
   warmup_epochs: 10 # Linear ramp-up of lambda_gsf / lambda_ot
 
+# Proximal Mapping Loss (Lin et al. ICLR 2025): point-supervised density loss
+# that eliminates the intersection hypothesis via Voronoi decomposition + simplex
+# projection. Takes priority over all other density losses when enabled.
+# Set mse_aux_weight > 0 to add Gaussian density map MSE as spatial regularisation.
+density_pml:
+  enabled: false
+  sigma: 8.0
+  use_background: true
+  bg_threshold: 3.0 # background distance in sigma units (bg_dist = threshold × sigma)
+  mse_aux_weight: 0.1 # auxiliary MSE on Gaussian density map (0 = off, 0.1 is MoECountNet default)
+
 # Bayesian Loss (Ma et al. ICCV 2019): point-supervised density loss that
 # replaces MSE on Gaussian-blurred GT density maps. When enabled, takes
 # priority over ASACL / DM-Count / MSE. Incompatible with multi-scale

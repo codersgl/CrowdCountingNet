@@ -281,7 +281,7 @@ def test_evaluate_with_tta_enabled_runs():
             },
         }
     )
-    mae, mse, d_mae, d_mse = evaluate_crowd_no_overlap(model, loader, device, cfg=cfg)
+    mae, mse, d_mae, d_mse, _pt = evaluate_crowd_no_overlap(model, loader, device, cfg=cfg)
     for v in (mae, mse, d_mae, d_mse):
         assert isinstance(v, float)
         assert v >= 0

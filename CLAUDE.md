@@ -16,6 +16,8 @@ DSGCNet (Dual-Stream Graph Convolutional Network) is a crowd counting codebase p
 
 ## Commands
 
+**Always use `uv run`** to invoke Python scripts so the virtual environment is active. Do not assume `pip` or bare `python`.
+
 ```bash
 # Install
 uv sync
@@ -24,21 +26,29 @@ uv sync --extra dev  # includes pytest
 # Tests (no GPU or real data required)
 uv run pytest tests/ -v
 uv run pytest tests/test_deformable_expert.py -v  # single test file
+uv run pytest tests/ --cov=src/crowdcount --cov-report=term-missing  # with coverage
 
 # === DSGCNet (paper model) ===
-python scripts/train.py data.data_root=DATA_ROOT
-python scripts/train.py data.data_root=DATA_ROOT epochs=3500 optimizer.lr=0.0001 gpu_id=0
-python scripts/train.py data.data_root=DATA_ROOT resume=checkpoints/latest.pth
+uv run python scripts/train.py data.data_root=DATA_ROOT
+uv run python scripts/train.py data.data_root=DATA_ROOT epochs=3500 optimizer.lr=0.0001 gpu_id=0
+uv run python scripts/train.py data.data_root=DATA_ROOT resume=checkpoints/latest.pth
+
+# Reproduce the best known SHA result (MAE=48.51 / MSE=79.87)
+uv run python scripts/train.py data.data_root=DATA_ROOT \
+  model.use_gm=true model.use_dap_neck=true model.use_density_attention=true \
+  model.density_head_version=v3 model.gcn_conv_type=gatv2 \
+  scheduler=step_lr scheduler.lr_drop=800 \
+  data.density_generation.hybrid=true
 
 # === MoECountNet (newer architecture) ===
-python scripts/train_moecount.py data.data_root=DATA_ROOT
+uv run python scripts/train_moecount.py data.data_root=DATA_ROOT
 # Smoke test (no pretrained weights, 1 epoch)
-python scripts/train_moecount.py data.data_root=DATA_ROOT \
+uv run python scripts/train_moecount.py data.data_root=DATA_ROOT \
   model.backbone.pretrained=false epochs=1 data.batch_size=1 \
   data.num_patches=1 num_workers=0
 
 # Prediction / inference
-python scripts/predict.py \
+uv run python scripts/predict.py \
     +predict.weight_path=checkpoints/SHTechA.pth \
     +predict.root_dir=./sha_a/test \
     +predict.output_dir=./pred_result \
@@ -48,7 +58,17 @@ python scripts/predict.py \
 tensorboard --logdir runs/
 ```
 
+Alternative entry points are registered in pyproject.toml:
+```bash
+crowdcount-train data.data_root=DATA_ROOT     # ≡ scripts/train.py
+crowdcount-predict +predict.weight_path=...    # ≡ scripts/predict.py
+```
+
 Outputs are written to `outputs/<YYYY-MM-DD>/<HH-MM-SS>/`.
+
+**`hydra.job.chdir: false`** is set in configs, so the working directory stays at the repo root during runs. All relative paths (e.g., `resume=checkpoints/latest.pth`) resolve from the project root, not from the output directory.
+
+**uv index mirror**: `pyproject.toml` defaults to `pypi.tuna.tsinghua.edu.cn`. Users outside China may need to remove or override the `[[tool.uv.index]]` entry.
 
 ## Architecture
 
@@ -116,9 +136,11 @@ Key plugins in `src/crowdcount/plugins/`:
 ## Configuration
 
 ### DSGCNet config
-- `configs/config.yaml` — Root (epochs=2500, seed=42, clip_max_norm=0.1)
+- `configs/config.yaml` — Root (epochs=3500, seed=42, clip_max_norm=0.1, optimizer=adamw, scheduler=cosine_annealing)
 - `configs/model/dsgcnet.yaml` — Model architecture + fusion_mode (gcn, esca_moe, deformable_dual, etc.)
 - `configs/data/shha.yaml` — Data settings
+- `configs/optimizer/adamw.yaml` — Default: lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4
+- Note: `step_lr` is available but not the root default; it was used as an override in the best known run (`scheduler=step_lr scheduler.lr_drop=800`)
 
 ### MoECountNet config
 - `configs/moecount_config.yaml` — Root (epochs=1500, clip_max_norm=5.0, AMP enabled)
@@ -152,6 +174,22 @@ model:
 - **SPD (Space-to-Depth)**: Used throughout for lossless downsampling. Requires even spatial dimensions — pad before use.
 - **Zero-initialization pattern**: Learnable offsets and residual gates in deformable modules start at zero so training begins with identity behavior
 - **Tests**: Must not require GPU or real dataset files. Use synthetic tensors and fake configs.
+
+## Pitfalls
+
+- **Density map cache staleness**: Changing sigma, perspective, or hybrid settings silently reuses stale cached maps. Delete `gt_density_maps/` directories when changing density generation parameters.
+- **MSAA + multi_scale channel mismatch**: `use_msaa=true` combined with `density_multi_scale.enabled=true` can break unless channel contracts are updated together.
+- **Trust Hydra output configs over defaults**: When diagnosing experiments, always read `outputs/.../.hydra/config.yaml` and `overrides.yaml`. This repo has had typo-like config values in logs.
+- **Density loss magnitude**: `density_loss_weight` is a global scale applied in the training engine. Retune carefully when swapping loss types (MSE, Bayesian, ASACL, DM-Count, MDS) since each has different magnitude.
+- **Evaluation dataloaders require batch_size=1**, enforced automatically. Do not override.
+
+## Reference Documents
+
+- Experiment reports (consult instead of duplicating findings):
+  - `docs/ablation_full_report_2026-04-26.md`
+  - `docs/density_generation_quality_report_2026-05-08.md`
+- Best known run: `outputs/2026-04-25/22-51-51/` (MAE=48.51, MSE=79.87 on SHA). Checkpoint at `checkpoints/best_mae.pth`. Use this as the performance baseline before claiming improvement.
+- Diagnostic scripts in `scripts/` are useful for debugging: `analyze_density_generation_quality.py`, `analyze_hard_score_band.py`, `calibrate_counts.py`, `search_threshold.py`, plus `diag_*.py` and `probe_*.py` tools.
 
 ## Training Considerations
 

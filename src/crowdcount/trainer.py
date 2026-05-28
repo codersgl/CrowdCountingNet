@@ -89,12 +89,47 @@ class Trainer:
         if self.uncertainty_weighter is not None:
             self.uncertainty_weighter.to(self.device)
 
-        # Density criterion: Bayesian > MDS > ASACL > DM-Count > MSE (priority order)
+        # Density criterion: PML > Bayesian > MDS > ASACL > DM-Count > MSE (priority order)
+        pml_cfg = getattr(cfg, "density_pml", None)
         bayesian_cfg = getattr(cfg, "density_bayesian", None)
         mds_cfg = getattr(cfg, "density_mds", None)
         asacl_cfg = getattr(cfg, "density_asacl", None)
         dmcount_cfg = getattr(cfg, "density_dmcount", None)
-        if bool(getattr(bayesian_cfg, "enabled", False)):
+        self.pml_mse_aux: nn.Module | None = None
+        self.pml_mse_aux_weight: float = 0.0
+        if bool(getattr(pml_cfg, "enabled", False)):
+            # PML is point-supervised; incompatible with multi-scale density
+            density_ms_cfg = getattr(cfg, "density_multi_scale", None)
+            if bool(getattr(density_ms_cfg, "enabled", False)):
+                raise ValueError(
+                    "density_pml.enabled=true is incompatible with "
+                    "density_multi_scale.enabled=true (PML is point-supervised "
+                    "and has no per-scale GT density to compare against). "
+                    "Disable one of the two."
+                )
+
+            from crowdcount.models.moecount.losses import ProximalMappingLoss
+
+            self.density_criterion: nn.Module = ProximalMappingLoss(
+                sigma=float(getattr(pml_cfg, "sigma", 8.0)),
+                use_background=bool(getattr(pml_cfg, "use_background", True)),
+                bg_threshold=float(getattr(pml_cfg, "bg_threshold", 3.0)),
+            ).to(self.device)
+            logger.info(
+                "Using PML density criterion "
+                f"(sigma={float(getattr(pml_cfg, 'sigma', 8.0))}, "
+                f"use_background={bool(getattr(pml_cfg, 'use_background', True))}, "
+                f"bg_threshold={float(getattr(pml_cfg, 'bg_threshold', 3.0))})"
+            )
+
+            _mse_aux_w = float(getattr(pml_cfg, "mse_aux_weight", 0.0))
+            if _mse_aux_w > 0:
+                from crowdcount.models.moecount.losses import DensityMapLoss
+
+                self.pml_mse_aux = DensityMapLoss(reduction="sum").to(self.device)
+                self.pml_mse_aux_weight = _mse_aux_w
+                logger.info(f"PML MSE auxiliary enabled (weight={_mse_aux_w})")
+        elif bool(getattr(bayesian_cfg, "enabled", False)):
             # Bayesian Loss is point-supervised; the multi-scale density
             # supervision pipeline compares per-block density maps against
             # the Gaussian-blurred GT density and has no equivalent point
@@ -404,6 +439,17 @@ class Trainer:
         mse_history, density_mse_history = [], []
         step = 0
 
+        # Create visualization directory when using MoECountNet MoE
+        fusion_mode = str(getattr(getattr(cfg, "model", None), "fusion_mode", "gcn"))
+        vis_dir: str | None = None
+        if fusion_mode == "moe":
+            try:
+                hydra_output = Path(HydraConfig.get().runtime.output_dir)
+            except Exception:
+                hydra_output = Path(".")
+            vis_dir = str(hydra_output / "vis")
+            Path(vis_dir).mkdir(parents=True, exist_ok=True)
+
         for epoch in range(cfg.start_epoch, cfg.epochs):
             moe_module = getattr(self.model, "moe", None)
             if self.use_moe and moe_module is not None:
@@ -413,6 +459,11 @@ class Trainer:
             _set_epoch = getattr(self.density_criterion, "set_epoch", None)
             if callable(_set_epoch):
                 _set_epoch(epoch)
+
+            # Set epoch for MoE warmup scheduling (HeterogeneousSparseMoE)
+            _model_set_epoch = getattr(self.model, "set_epoch", None)
+            if callable(_model_set_epoch):
+                _model_set_epoch(epoch, cfg.epochs)
 
             t1 = time.time()
             stat = train_one_epoch(
@@ -427,6 +478,10 @@ class Trainer:
                 cfg=cfg,  # Pass config for multi-scale density prediction
                 ssim_criterion=self.ssim_criterion,
                 uncertainty_weighter=self.uncertainty_weighter,
+                writer=self.writer,
+                vis_dir=vis_dir,
+                pml_mse_aux=self.pml_mse_aux,
+                pml_mse_aux_weight=self.pml_mse_aux_weight,
             )
             t2 = time.time()
 
@@ -487,6 +542,7 @@ class Trainer:
                     self.device,
                     use_depth=self._needs_depth_eval,
                     cfg=self.cfg,
+                    eval_point_head=(fusion_mode == "moe"),
                 )
                 t2 = time.time()
 
@@ -494,6 +550,7 @@ class Trainer:
                 mse_history.append(result[1])
                 density_mae_history.append(result[2])
                 density_mse_history.append(result[3])
+                pt_metrics = result[4] if len(result) > 4 else {}
 
                 logger.info(
                     f"[Eval] mae={result[0]:.2f}  mse={result[1]:.2f}  "
@@ -503,11 +560,20 @@ class Trainer:
                     f"[Eval] density_mae={result[2]:.2f}  density_mse={result[3]:.2f}  "
                     f"best_density_mae={np.min(density_mae_history):.2f}"
                 )
+                if pt_metrics:
+                    logger.info(
+                        f"[Eval] point_mae={pt_metrics.get('point_mae', 0):.2f}  "
+                        f"point_prec={pt_metrics.get('point_precision', 0):.3f}  "
+                        f"point_recall={pt_metrics.get('point_recall', 0):.3f}"
+                    )
 
                 self.writer.add_scalar("metric/mae", result[0], step)
                 self.writer.add_scalar("metric/mse", result[1], step)
                 self.writer.add_scalar("metric/density_mae", result[2], step)
                 self.writer.add_scalar("metric/density_mse", result[3], step)
+                if pt_metrics:
+                    for pt_key, pt_val in pt_metrics.items():
+                        self.writer.add_scalar(f"metric/{pt_key}", pt_val, step)
                 step += 1
 
                 # Threshold search config

@@ -267,7 +267,7 @@ def test_evaluate_returns_four_metrics():
     model = DummyDSGC()
     loader = [_make_val_batch()]
     device = torch.device("cpu")
-    mae, mse, d_mae, d_mse = evaluate_crowd_no_overlap(model, loader, device)
+    mae, mse, d_mae, d_mse, _pt = evaluate_crowd_no_overlap(model, loader, device)
     assert isinstance(mae, float)
     assert isinstance(mse, float)
     assert isinstance(d_mae, float)
@@ -278,5 +278,5 @@ def test_evaluate_metrics_non_negative():
     model = DummyDSGC()
     loader = [_make_val_batch() for _ in range(3)]
     device = torch.device("cpu")
-    mae, mse, d_mae, d_mse = evaluate_crowd_no_overlap(model, loader, device)
+    mae, mse, d_mae, d_mse, _pt = evaluate_crowd_no_overlap(model, loader, device)
     assert mae >= 0 and mse >= 0 and d_mae >= 0 and d_mse >= 0

@@ -98,7 +98,7 @@ clip_prompt_density:
 use_rccformer_neck: false
 rccformer_deab_blocks: 2 # Number of DEAB blocks in density prediction branch
 
-# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe | graph_moe | mamba_moe | mamba_vss_dual | sdd_moe | sa_dgat | deformable_dual
+# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe | graph_moe | mamba_moe | mamba_vss_dual | sdd_moe | sa_dgat | deformable_dual | moe
 # gcn_moe: GCN dual-stream + LightMoE post-refinement (recommended)
 # graph_attn_moe: 2-expert MoE (local conv + graph-biased attention)
 # graph_moe: 5-expert unified GraphMoE replacement for dual-stream GCN
@@ -598,3 +598,26 @@ use_density_adaptive_fusion: false
 density_adaptive_fusion:
   density_embed_dim: 64 # internal channels for density pattern encoder
   spatial: true # true: per-pixel [B,3,H,W] | false: per-image [B,3]
+
+# MoECountNet HeterogeneousSparseMoE (only used when fusion_mode: moe)
+# Three heterogeneous experts (LocalDetail stride-8, SpatialRelation/Deformable stride-8,
+# GlobalDensity stride-32) with per-pixel SparseTop2Gate routing replace the
+# dual-stream GCN entirely. Output shape [B, 256, H, W] is identical.
+moecount_moe:
+  gate_type: sparse_top2           # sparse_top2 | soft
+  top_k: 2
+  temperature_init: 1.0
+  temperature_min: 0.1
+  temperature_decay: 0.99998
+  warmup_epochs: null              # null -> use warmup_fraction * total_epochs
+  warmup_fraction: 0.2
+  lambda_importance: 0.01
+  lambda_load: 0.01
+  shared_scale: 0.3
+  use_input_residual: true
+  use_deformable_expert: false     # true -> DeformableCrossScaleExpert instead of window-MSA
+  aux_loss_weight: 0.01            # global multiplier applied in training loop
+  # Expert config (mirrors moecount.yaml defaults)
+  expert_local_detail_use_residual: false  # false = direct output; true = gated residual (starts identity)
+  expert_global_density_use_residual: false
+  expert_global_density_use_density: true   # concat density map as extra input channel to GlobalDensityExpert

@@ -269,7 +269,7 @@ def train_moecount_one_epoch(
             "lr": float(optimizer.param_groups[0]["lr"]),
             "grad_norm": grad_norm,
         }
-        for loss_key in ("loss_point_cls", "loss_point_reg", "loss_ot"):
+        for loss_key in ("loss_point_cls", "loss_point_reg", "loss_density_map", "loss_ot"):
             value = loss_dict.get(loss_key)
             if isinstance(value, torch.Tensor):
                 metrics[loss_key] = float(value.detach().item())

@@ -74,6 +74,10 @@ moecount_loss:
     max_grid: 32  # downsample density to max_grid x max_grid for OT cost matrix
   tv:
     weight: 0.0005  # total variation smoothness regularizer; 0 = disabled
+  density_map:
+    enabled: true  # enable density map MSE supervision (uses pre-computed gt density maps)
+    weight: 0.1     # loss weight in total loss
+    type: mse       # loss type: "mse" (extensible to "dmcount", "mds" later)
 
 monitor:
   log_interval: 100

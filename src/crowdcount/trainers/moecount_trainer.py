@@ -23,6 +23,7 @@ from crowdcount.models.moecount.engine import evaluate_moecount, train_moecount_
 from crowdcount.models.moecount.losses import (
     BayesianLoss,
     CountLoss,
+    DensityMapLoss,
     LoadBalanceLoss,
     MoECountLoss,
     ProximalMappingLoss,
@@ -196,6 +197,15 @@ class MoECountTrainer:
         else:
             tv_loss = None
 
+        # Density map supervision config
+        density_map_cfg = getattr(loss_cfg, "density_map", None)
+        if density_map_cfg is not None and bool(getattr(density_map_cfg, "enabled", False)):
+            density_map_loss = DensityMapLoss(reduction="sum")
+            density_map_weight = float(getattr(density_map_cfg, "weight", 0.01))
+        else:
+            density_map_loss = None
+            density_map_weight = 0.0
+
         # Compute warmup end for balance loss decay
         moe_cfg = getattr(self.cfg.model, "moe", None)
         warmup_epochs = getattr(moe_cfg, "warmup_epochs", None) if moe_cfg is not None else None
@@ -224,6 +234,8 @@ class MoECountTrainer:
             ot_loss=ot_loss,
             ot_weight=ot_weight,
             tv_loss=tv_loss,
+            density_map_loss=density_map_loss,
+            density_map_weight=density_map_weight,
         )
 
     def _build_optimizer(self) -> torch.optim.Optimizer:

@@ -461,6 +461,17 @@ class TotalVariationLoss(nn.Module):
         return self.weight * (diff_x + diff_y)
 
 
+class DensityMapLoss(nn.Module):
+    """MSE loss between predicted and ground-truth density maps."""
+
+    def __init__(self, reduction: str = "sum") -> None:
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        return F.mse_loss(pred, gt, reduction=self.reduction)
+
+
 class MoECountLoss(nn.Module):
     """Aggregate density, count, and MoE balance losses.
 
@@ -485,6 +496,8 @@ class MoECountLoss(nn.Module):
         ot_loss: SinkhornOTLoss | None = None,
         ot_weight: float = 0.1,
         tv_loss: TotalVariationLoss | None = None,
+        density_map_loss: DensityMapLoss | None = None,
+        density_map_weight: float = 0.01,
     ) -> None:
         super().__init__()
         self.pml_loss = pml_loss
@@ -498,6 +511,8 @@ class MoECountLoss(nn.Module):
         self.ot_loss = ot_loss
         self.ot_weight = float(ot_weight)
         self.tv_loss = tv_loss
+        self.density_map_loss = density_map_loss
+        self.density_map_weight = float(density_map_weight)
         self.point_loss_weight = float(point_loss_weight)
         if self.point_loss_weight > 0:
             self.matcher = HungarianMatcher_Crowd(
@@ -570,7 +585,17 @@ class MoECountLoss(nn.Module):
         scaled_balance = balance * balance_scale
 
         tv = self.tv_loss(pred_density) if self.tv_loss is not None else pred_density.new_zeros(())
-        total = density_loss + ot + tv + count + scaled_balance
+
+        # Density map MSE supervision (auxiliary)
+        density_map = pred_density.new_zeros(())
+        if self.density_map_loss is not None and gt_density is not None:
+            density_map = (
+                self.density_map_loss(pred_density, gt_density)
+                / batch_size
+                * self.density_map_weight
+            )
+
+        total = density_loss + ot + tv + count + scaled_balance + density_map
         result = {
             "loss_total": total,
             loss_label: density_loss,
@@ -581,6 +606,7 @@ class MoECountLoss(nn.Module):
             "loss_balance_raw": balance,
             "balance_scale": pred_density.new_tensor(balance_scale),
             "lambda_count": pred_density.new_tensor(self.count_weight),
+            "loss_density_map": density_map,
         }
 
         # Point auxiliary loss (Hungarian matching + CE cls + SmoothL1 reg)

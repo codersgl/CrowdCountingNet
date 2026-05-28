@@ -30,7 +30,7 @@ moe:
   temperature_decay: 0.9
   warmup_fraction: 0.1
   warmup_epochs: 60
-  lambda_importance: 1.0
+  lambda_importance: 0.1
   lambda_load: 0.001
   shared_scale: 0.3
   use_input_residual: true  # adds features identity to MoE output

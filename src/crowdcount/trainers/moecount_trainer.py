@@ -170,6 +170,8 @@ class MoECountTrainer:
         # Point loss config
         point_cfg = getattr(loss_cfg, "point", None)
         point_loss_weight = float(getattr(point_cfg, "weight", 0.0)) if point_cfg is not None else 0.0
+        point_cls_weight = float(getattr(point_cfg, "cls_weight", 1.0)) if point_cfg is not None else 1.0
+        point_reg_weight = float(getattr(point_cfg, "reg_weight", 0.0002)) if point_cfg is not None else 0.0002
         point_cost_class = float(getattr(point_cfg, "cost_class", 1.0)) if point_cfg is not None else 1.0
         point_cost_point = float(getattr(point_cfg, "cost_point", 0.05)) if point_cfg is not None else 0.05
         point_eos_coef = float(getattr(point_cfg, "eos_coef", 0.5)) if point_cfg is not None else 0.5
@@ -228,6 +230,8 @@ class MoECountTrainer:
             balance_decay_epochs=int(getattr(balance_cfg, "decay_epochs", 50)),
             balance_final_scale=float(getattr(balance_cfg, "final_scale", 0.0)),
             point_loss_weight=point_loss_weight,
+            point_cls_weight=point_cls_weight,
+            point_reg_weight=point_reg_weight,
             point_cost_class=point_cost_class,
             point_cost_point=point_cost_point,
             point_eos_coef=point_eos_coef,
@@ -403,7 +407,7 @@ class MoECountTrainer:
         output_stride = int(getattr(cfg.model, "output_stride", 8))
         eval_point_head = bool(getattr(monitor_cfg, "eval_point_head", True))
         point_match_threshold = float(getattr(monitor_cfg, "point_match_threshold", 8.0))
-        point_cls_threshold = float(getattr(monitor_cfg, "point_cls_threshold", 0.3))
+        point_cls_threshold = float(getattr(monitor_cfg, "point_cls_threshold", 0.5))
 
         for epoch in range(int(cfg.start_epoch), int(cfg.epochs)):
             epoch_start = time.time()

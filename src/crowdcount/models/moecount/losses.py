@@ -490,6 +490,8 @@ class MoECountLoss(nn.Module):
         balance_decay_epochs: int = 50,
         balance_final_scale: float = 0.0,
         point_loss_weight: float = 0.0,
+        point_cls_weight: float = 1.0,
+        point_reg_weight: float = 0.0002,
         point_cost_class: float = 1.0,
         point_cost_point: float = 0.05,
         point_eos_coef: float = 0.5,
@@ -514,6 +516,8 @@ class MoECountLoss(nn.Module):
         self.density_map_loss = density_map_loss
         self.density_map_weight = float(density_map_weight)
         self.point_loss_weight = float(point_loss_weight)
+        self.point_cls_weight = float(point_cls_weight)
+        self.point_reg_weight = float(point_reg_weight)
         if self.point_loss_weight > 0:
             self.matcher = HungarianMatcher_Crowd(
                 cost_class=float(point_cost_class),
@@ -683,10 +687,10 @@ class MoECountLoss(nn.Module):
         num_points = max(sum(sizes), 1)
         loss_reg = F.smooth_l1_loss(src_points, target_pts, beta=1.0, reduction="sum") / num_points
 
-        total = loss_cls + loss_reg
+        total = self.point_cls_weight * loss_cls + self.point_reg_weight * loss_reg
         return {
             "loss_point_cls": loss_cls,
             "loss_point_reg": loss_reg,
-            "loss_point_total": self.point_loss_weight * total,
+            "loss_point_total": total,
             "point_loss_weight": pred_logits.new_tensor(self.point_loss_weight),
         }

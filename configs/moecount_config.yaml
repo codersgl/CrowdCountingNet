@@ -62,7 +62,9 @@ moecount_loss:
     decay_epochs: 50  # epochs over which CV^2 loss decays to 0 after warmup
     final_scale: 0.1  # floor for balance scale (never decays to 0)
   point:
-    weight: 2.0  # point auxiliary loss weight (0 = disabled)
+    weight: 2.0  # gate only: >0 enables point auxiliary loss
+    cls_weight: 1.0  # CE classification loss weight (match DSGCNet loss_ce)
+    reg_weight: 0.0002  # SmoothL1 regression loss weight (match DSGCNet point_loss_coef)
     cost_class: 1.0  # Hungarian matcher classification cost weight
     cost_point: 0.05  # Hungarian matcher point distance cost weight (P2PNet default)
     eos_coef: 0.5  # background class weight for cross-entropy loss (match DSGCNet)
@@ -85,7 +87,7 @@ monitor:
   vis_dir: visuals/moecount
   eval_point_head: true
   point_match_threshold: 8.0  # max pixel distance for point matching
-  point_cls_threshold: 0.3  # fg classification threshold for point eval
+  point_cls_threshold: 0.5  # fg classification threshold for point eval (match DSGCNet)
 
 hydra:
   run:

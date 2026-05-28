@@ -11,7 +11,7 @@ from torch import nn
 from crowdcount.models.moecount.backbone import MoEConvNeXtBackbone, MoEVGGBackbone
 from crowdcount.models.moecount.experts import HeterogeneousSparseMoE
 from crowdcount.models.moecount.gcn_refine import DensityGCNRefine
-from crowdcount.models.moecount.head import DensityHead, PointPredHead
+from crowdcount.models.moecount.head import DensityHead, DSGCAnchorPointHead
 from crowdcount.models.moecount.neck import DeepBiFPNNeck, EnhancedFPNNeck
 
 
@@ -24,7 +24,7 @@ class MoECountNet(nn.Module):
         neck: EnhancedFPNNeck | DeepBiFPNNeck,
         moe: HeterogeneousSparseMoE,
         density_head: DensityHead,
-        point_head: PointPredHead | None = None,
+        point_head: DSGCAnchorPointHead | None = None,
         gcn_refine: DensityGCNRefine | None = None,
     ) -> None:
         super().__init__()
@@ -80,7 +80,7 @@ class MoECountNet(nn.Module):
             "expert_similarity": route.get("expert_similarity", {}),
         }
         if self.point_head is not None:
-            result.update(self.point_head(moe_features))
+            result.update(self.point_head(moe_features, samples))
         return result
 
 
@@ -172,11 +172,11 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
     )
     use_point_head = bool(getattr(head_cfg, "use_point_head", True))
     if use_point_head:
-        point_head = PointPredHead(
+        point_head = DSGCAnchorPointHead(
             in_channels=int(getattr(neck_cfg, "out_channels", 256)),
-            hidden_channels=int(getattr(head_cfg, "point_hidden_channels", 128)),
-            stride=int(getattr(model_cfg, "output_stride", 8)),
-            coord_scale=float(getattr(head_cfg, "point_coord_scale", 12.5)),
+            feature_size=int(getattr(head_cfg, "point_feature_size", 256)),
+            row=int(getattr(head_cfg, "point_anchor_row", 2)),
+            line=int(getattr(head_cfg, "point_anchor_line", 2)),
         )
     else:
         point_head = None

@@ -65,9 +65,10 @@ head:
   final_weight_std: 0.0001
   output_kernel_size: 3  # 1 = 1x1 (per-pixel), 3 = 3x3 (spatial context)
   use_residual: true      # skip connection in DensityHead
-  use_point_head: true  # P2PNet-style point prediction auxiliary head
-  point_hidden_channels: 128
-  point_coord_scale: 12.5  # regression coord amplification (× stride × scale ≈ 100, matching DSGCNet)
+  use_point_head: true  # DSGCNet anchor-based point prediction auxiliary head
+  point_anchor_row: 2     # anchor sub-grid rows per stride cell
+  point_anchor_line: 2    # anchor sub-grid columns per stride cell
+  point_feature_size: 256 # SharedPredictionTrunk feature channels
 
 use_gcn: false  # enable density-guided GCN feature refinement
 gcn_k: 4  # k for density k-NN graph building

@@ -1,4 +1,4 @@
-"""Density regression head and point prediction head for MoECountNet."""
+"""Density regression head and anchor-based point prediction head for MoECountNet."""
 
 from __future__ import annotations
 
@@ -8,79 +8,65 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from crowdcount.models.anchor import AnchorPoints
+from crowdcount.models.head import (
+    ClassificationModel,
+    RegressionModel,
+    SharedPredictionTrunk,
+)
+
 
 def _softplus_inverse(value: float) -> float:
     return math.log(math.expm1(value))
 
 
-class PointPredHead(nn.Module):
-    """Per-pixel point prediction head matching the P2PNet architecture exactly.
+class DSGCAnchorPointHead(nn.Module):
+    """Anchor-based point prediction head matching the DSGCNet architecture.
 
-    Two independent 3-layer conv branches (classification and regression)
-    with no shared trunk, matching Song et al. ICCV 2021.
+    Shared prediction trunk (2 Conv3x3) followed by independent
+    ClassificationModel and RegressionModel projection layers, with
+    4 anchor points per stride-8 cell (row=2, line=2).
 
-    Reference: Song et al., "Rethinking Counting and Localization in Crowds:
-    A Purely Point-Based Framework", ICCV 2021.
+    Replaces the P2PNet-style anchor-free PointPredHead which had:
+      - 10,000x too-large regression loss weight
+      - No shared trunk between cls/reg branches
+      - Only 1 query per pixel (vs 4 anchors per cell)
     """
 
     def __init__(
         self,
         in_channels: int = 256,
-        hidden_channels: int = 128,
-        stride: int = 8,
-        coord_scale: float = 12.5,
+        feature_size: int = 256,
+        row: int = 2,
+        line: int = 2,
     ) -> None:
         super().__init__()
-        self.stride = float(stride)
-        self.coord_scale = float(coord_scale)
-        num_groups = min(32, hidden_channels)
-
-        self.cls_head = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups, hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups, hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, 2, kernel_size=1),
+        num_anchor_points = row * line
+        self.pred_trunk = SharedPredictionTrunk(
+            in_channels=in_channels,
+            feature_size=feature_size,
         )
-        self.reg_head = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups, hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups, hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, 2, kernel_size=1),
+        self.regression = RegressionModel(
+            num_features_in=feature_size,
+            num_anchor_points=num_anchor_points,
         )
-
-        # Strong background prior: bias[0]=3.0 => P(bg) ≈ 95% at init
-        nn.init.constant_(self.cls_head[-1].bias[0], 3.0)
-        nn.init.zeros_(self.cls_head[-1].bias[1:])
-
-    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
-        b, _, h, w = features.shape
-        pred_logits = self.cls_head(features)  # [B, 2, H, W]
-        pred_offsets = self.reg_head(features).tanh() * self.stride * self.coord_scale  # [B, 2, H, W]
-
-        grid_y, grid_x = torch.meshgrid(
-            torch.arange(h, device=features.device, dtype=features.dtype),
-            torch.arange(w, device=features.device, dtype=features.dtype),
-            indexing="ij",
+        self.classification = ClassificationModel(
+            num_features_in=feature_size,
+            num_anchor_points=num_anchor_points,
+            num_classes=2,
+            prior=0.01,
         )
-        grid_centers = torch.stack([
-            (grid_x + 0.5) * self.stride,
-            (grid_y + 0.5) * self.stride,
-        ], dim=0)  # [2, H, W]
+        self.anchor_points = AnchorPoints(pyramid_levels=[3], row=row, line=line)
 
-        pred_logits_flat = pred_logits.reshape(b, 2, h * w).transpose(1, 2)  # [B, N, 2]
-        pred_offsets_flat = pred_offsets.reshape(b, 2, h * w).transpose(1, 2)  # [B, N, 2]
-        grid_flat = grid_centers.reshape(2, h * w).t().unsqueeze(0)  # [1, N, 2]
-
+    def forward(self, features: torch.Tensor, image: torch.Tensor) -> dict[str, torch.Tensor]:
+        shared_feat = self.pred_trunk(features)
+        regression = self.regression(shared_feat) * 100.0
+        classification = self.classification(shared_feat)
+        batch_size = features.shape[0]
+        anchors = self.anchor_points(image).repeat(batch_size, 1, 1)
         return {
-            "pred_logits": pred_logits_flat,
-            "pred_points": grid_flat + pred_offsets_flat,
-            "pred_offsets": pred_offsets_flat,
+            "pred_logits": classification,
+            "pred_points": regression + anchors,
         }
 
 

@@ -42,10 +42,10 @@ scheduler:
   warmup_start_factor: 0.001
 
 moecount_loss:
-  use_pml: false  # true = ProximalMappingLoss, false = BayesianLoss
+  use_pml: true  # true = ProximalMappingLoss, false = BayesianLoss
   pml:
     sigma: 8.0
-    use_background: false
+    use_background: true
     bg_threshold: 3.0
     max_pixels_per_chunk: 16384
   bayesian:  # fallback when use_pml=false

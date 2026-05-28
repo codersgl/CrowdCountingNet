@@ -60,8 +60,9 @@ moecount_loss:
     lambda_importance: 0.001
     lambda_load: 0.001
     decay_epochs: 50  # epochs over which CV^2 loss decays to 0 after warmup
+    final_scale: 0.1  # floor for balance scale (never decays to 0)
   point:
-    weight: 0.5  # point auxiliary loss weight (0 = disabled)
+    weight: 2.0  # point auxiliary loss weight (0 = disabled)
     cost_class: 1.0  # Hungarian matcher classification cost weight
     cost_point: 0.05  # Hungarian matcher point distance cost weight (P2PNet default)
     eos_coef: 0.5  # background class weight for cross-entropy loss (match DSGCNet)

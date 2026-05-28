@@ -28,9 +28,11 @@ class PointPredHead(nn.Module):
         in_channels: int = 256,
         hidden_channels: int = 128,
         stride: int = 8,
+        coord_scale: float = 12.5,
     ) -> None:
         super().__init__()
         self.stride = float(stride)
+        self.coord_scale = float(coord_scale)
         num_groups = min(32, hidden_channels)
 
         self.cls_head = nn.Sequential(
@@ -59,7 +61,7 @@ class PointPredHead(nn.Module):
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
         b, _, h, w = features.shape
         pred_logits = self.cls_head(features)  # [B, 2, H, W]
-        pred_offsets = self.reg_head(features).tanh() * self.stride  # [B, 2, H, W]
+        pred_offsets = self.reg_head(features).tanh() * self.stride * self.coord_scale  # [B, 2, H, W]
 
         grid_y, grid_x = torch.meshgrid(
             torch.arange(h, device=features.device, dtype=features.dtype),

@@ -436,7 +436,7 @@ class LoadBalanceLoss(nn.Module):
         if hard_mask is None:
             load_signal = soft_probs
         else:
-            load_signal = hard_mask + soft_probs - soft_probs.detach()
+            load_signal = soft_probs + (hard_mask - soft_probs).detach()
         load = load_signal.sum(dim=(0, 2, 3))
         load_cv = self._cv_squared(load)
         total = self.lambda_importance * importance_cv + self.lambda_load * load_cv
@@ -477,6 +477,7 @@ class MoECountLoss(nn.Module):
         balance_loss: LoadBalanceLoss | None = None,
         warmup_end: int = 0,
         balance_decay_epochs: int = 50,
+        balance_final_scale: float = 0.0,
         point_loss_weight: float = 0.0,
         point_cost_class: float = 1.0,
         point_cost_point: float = 0.05,
@@ -493,6 +494,7 @@ class MoECountLoss(nn.Module):
         self.balance_loss = balance_loss or LoadBalanceLoss()
         self.warmup_end = int(warmup_end)
         self.balance_decay_epochs = int(balance_decay_epochs)
+        self.balance_final_scale = float(balance_final_scale)
         self.ot_loss = ot_loss
         self.ot_weight = float(ot_weight)
         self.tv_loss = tv_loss
@@ -510,7 +512,7 @@ class MoECountLoss(nn.Module):
         if epoch <= self.warmup_end:
             return 1.0
         progress = (epoch - self.warmup_end) / max(self.balance_decay_epochs, 1)
-        return max(0.0, 1.0 - progress)
+        return max(self.balance_final_scale, 1.0 - progress)
 
     def forward(
         self,
@@ -610,7 +612,7 @@ class MoECountLoss(nn.Module):
         tgt_points = torch.cat([v["point"] for v in targets])
 
         cost_class = -out_prob[:, tgt_ids]
-        cost_point = torch.cdist(out_points, tgt_points, p=1)
+        cost_point = torch.cdist(out_points, tgt_points, p=2)
         C = self.matcher.cost_point * cost_point + self.matcher.cost_class * cost_class
         bs, num_queries = pred_logits.shape[:2]
         C = C.view(bs, num_queries, -1).cpu().detach()

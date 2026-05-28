@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from crowdcount.models.moecount.deformable_expert import DeformableCrossScaleExpert
-from crowdcount.models.moecount.gate import SparseTop2Gate
+from crowdcount.models.moecount.gate import PixelSoftGate, SparseTop2Gate
 from crowdcount.models.moecount.losses import ExpertImportanceLoss
 from crowdcount.models.neck import SPD
 
@@ -288,7 +288,7 @@ class SpatialRelationExpert(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn.clamp(-1e4, 1e4), dim=-1)
+        attn = F.softmax(attn.clamp(-50, 50), dim=-1)
         attn_out = (attn @ v).transpose(1, 2).reshape(Bnw, N, C)
         attn_out = self.proj(attn_out)
 
@@ -384,11 +384,13 @@ class HeterogeneousSparseMoE(nn.Module):
         expert_local_detail_strip_kernel: int = 7,
         expert_local_detail_use_multi_spectral_se: bool = True,
         expert_local_detail_ms_num_freqs: int = 4,
+        gate_type: str = "sparse_top2",
     ) -> None:
         super().__init__()
         self.num_experts = 3
         self.shared_scale = float(shared_scale)
         self.use_input_residual = use_input_residual
+        self.gate_type = gate_type
         self.shared_expert = SharedExpert(channels)
         spatial_expert: nn.Module
         if use_deformable_expert:
@@ -415,17 +417,24 @@ class HeterogeneousSparseMoE(nn.Module):
             spatial_expert,
             GlobalDensityExpert(channels, use_residual=expert_global_density_use_residual),
         ])
-        self.gate = SparseTop2Gate(
-            in_channels=channels,
-            num_experts=self.num_experts,
-            hidden_channels=gate_hidden_channels,
-            top_k=top_k,
-            temperature_init=temperature_init,
-            temperature_min=temperature_min,
-            temperature_decay=temperature_decay,
-            warmup_fraction=warmup_fraction,
-            warmup_epochs=warmup_epochs,
-        )
+        if gate_type == "soft":
+            self.gate = PixelSoftGate(
+                in_channels=channels,
+                num_experts=self.num_experts,
+                hidden_channels=gate_hidden_channels,
+            )
+        else:
+            self.gate = SparseTop2Gate(
+                in_channels=channels,
+                num_experts=self.num_experts,
+                hidden_channels=gate_hidden_channels,
+                top_k=top_k,
+                temperature_init=temperature_init,
+                temperature_min=temperature_min,
+                temperature_decay=temperature_decay,
+                warmup_fraction=warmup_fraction,
+                warmup_epochs=warmup_epochs,
+            )
         self.eim_loss = ExpertImportanceLoss(
             lambda_importance=lambda_importance,
         )
@@ -433,7 +442,7 @@ class HeterogeneousSparseMoE(nn.Module):
 
     @property
     def temperature(self) -> float:
-        return self.gate.temperature
+        return getattr(self.gate, "temperature", 1.0)
 
     def set_epoch(self, epoch: int, total_epochs: int | None = None) -> None:
         self.gate.set_epoch(epoch, total_epochs)

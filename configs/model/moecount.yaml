@@ -22,6 +22,7 @@ neck:
   use_depthwise_refine: true
 
 moe:
+  gate_type: soft  # "soft" (PixelSoftGate) or "sparse_top2" (SparseTop2Gate with Gumbel-ST)
   top_k: 2
   gate_hidden_channels: 128
   temperature_init: 1.0
@@ -29,7 +30,7 @@ moe:
   temperature_decay: 0.9
   warmup_fraction: 0.1
   warmup_epochs: 60
-  lambda_importance: 0.001
+  lambda_importance: 1.0
   lambda_load: 0.001
   shared_scale: 0.3
   use_input_residual: true  # adds features identity to MoE output
@@ -66,6 +67,7 @@ head:
   use_residual: true      # skip connection in DensityHead
   use_point_head: true  # P2PNet-style point prediction auxiliary head
   point_hidden_channels: 128
+  point_coord_scale: 12.5  # regression coord amplification (× stride × scale ≈ 100, matching DSGCNet)
 
 use_gcn: false  # enable density-guided GCN feature refinement
 gcn_k: 4  # k for density k-NN graph building

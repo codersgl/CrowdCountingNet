@@ -213,13 +213,16 @@ def train_moecount_one_epoch(
             outputs["pred_density"] = aligned_pred
 
             # DeepSeek-V2 style expert bias update (post-warmup load balancing).
-            load_frac = outputs.get("moe_load_fraction")
-            warmup_flag = outputs.get("moe_warmup_active")
-            if (
-                isinstance(load_frac, torch.Tensor)
-                and not (isinstance(warmup_flag, bool) and warmup_flag)
-            ):
-                model.moe.gate.update_expert_bias(load_frac)
+            # Only applies to SparseTop2Gate; PixelSoftGate has no concept of
+            # hard load balancing or expert bias.
+            if hasattr(model.moe.gate, "update_expert_bias"):
+                load_frac = outputs.get("moe_load_fraction")
+                warmup_flag = outputs.get("moe_warmup_active")
+                if (
+                    isinstance(load_frac, torch.Tensor)
+                    and not (isinstance(warmup_flag, bool) and warmup_flag)
+                ):
+                    model.moe.gate.update_expert_bias(load_frac)
 
             image_sizes = (
                 int(gt_density.shape[-2] * output_stride),

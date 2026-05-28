@@ -103,7 +103,7 @@ class SparseTop2Gate(nn.Module):
 
     def _sample_gumbel(self, logits: torch.Tensor) -> torch.Tensor:
         uniform = torch.rand_like(logits).clamp_(self.eps, 1.0 - self.eps)
-        return -torch.log(-torch.log(uniform))
+        return (-torch.log(-torch.log(uniform))).clamp(-10, 10)
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | bool]:
         if not torch.isfinite(self.expert_bias).all():
@@ -127,7 +127,7 @@ class SparseTop2Gate(nn.Module):
         else:
             masked_probs = soft_probs * hard_mask
             hard_weights = masked_probs / masked_probs.sum(dim=1, keepdim=True).clamp_min(self.eps)
-            route_weights = hard_weights + soft_probs - soft_probs.detach()
+            route_weights = soft_probs + (hard_weights - soft_probs).detach()
 
         load_counts = hard_mask.detach().sum(dim=(0, 2, 3))
         load_distribution = load_counts / load_counts.sum().clamp_min(self.eps)
@@ -176,6 +176,12 @@ class PixelSoftGate(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, num_experts, kernel_size=1),
         )
+
+    def set_epoch(self, epoch: int, total_epochs: int | None = None) -> None:
+        del epoch, total_epochs
+
+    def update_temperature(self, decay_rate: float | None = None) -> None:
+        del decay_rate
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | bool]:
         raw_weights = self.gate_net(features)  # [B, K, H, W]
@@ -273,7 +279,7 @@ class MultiScaleSparseTop2Gate(SparseTop2Gate):
         else:
             masked_probs = soft_probs * hard_mask
             hard_weights = masked_probs / masked_probs.sum(dim=1, keepdim=True).clamp_min(self.eps)
-            route_weights = hard_weights + soft_probs - soft_probs.detach()
+            route_weights = soft_probs + (hard_weights - soft_probs).detach()
 
         load_counts = hard_mask.detach().sum(dim=(0, 2, 3))
         load_distribution = load_counts / load_counts.sum().clamp_min(self.eps)

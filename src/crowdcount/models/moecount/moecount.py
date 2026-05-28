@@ -159,6 +159,7 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         expert_local_detail_strip_kernel=int(getattr(local_detail_cfg, "strip_kernel", 7) if local_detail_cfg is not None else 7),
         expert_local_detail_use_multi_spectral_se=bool(getattr(local_detail_cfg, "use_multi_spectral_se", True) if local_detail_cfg is not None else True),
         expert_local_detail_ms_num_freqs=int(getattr(local_detail_cfg, "ms_num_freqs", 4) if local_detail_cfg is not None else 4),
+        gate_type=str(getattr(moe_cfg, "gate_type", "sparse_top2")),
     )
     density_head = DensityHead(
         in_channels=int(getattr(neck_cfg, "out_channels", 256)),
@@ -175,6 +176,7 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
             in_channels=int(getattr(neck_cfg, "out_channels", 256)),
             hidden_channels=int(getattr(head_cfg, "point_hidden_channels", 128)),
             stride=int(getattr(model_cfg, "output_stride", 8)),
+            coord_scale=float(getattr(head_cfg, "point_coord_scale", 12.5)),
         )
     else:
         point_head = None

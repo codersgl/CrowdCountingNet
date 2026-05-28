@@ -123,7 +123,7 @@ class MoECountTrainer:
         )
 
         self.amp_enabled = bool(getattr(getattr(cfg, "mixed_precision", None), "enabled", True)) and self.device.type == "cuda"
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
+        self.scaler = torch.cuda.amp.GradScaler(init_scale=128.0, enabled=self.amp_enabled)
 
         self._resume_mae_history: list[float] = []
         self._resume_mse_history: list[float] = []
@@ -216,6 +216,7 @@ class MoECountTrainer:
             ),
             warmup_end=warmup_end,
             balance_decay_epochs=int(getattr(balance_cfg, "decay_epochs", 50)),
+            balance_final_scale=float(getattr(balance_cfg, "final_scale", 0.0)),
             point_loss_weight=point_loss_weight,
             point_cost_class=point_cost_class,
             point_cost_point=point_cost_point,

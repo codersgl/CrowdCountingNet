@@ -449,7 +449,7 @@ semc:
 # NOTE: alpha is only used when eos_coef-based class_weight is NOT provided.
 # Since class_weight (empty_weight) is always set, alpha is effectively unused
 # and foreground/background balance is controlled by eos_coef instead.
-use_focal_loss: false
+use_focal_loss: true
 focal_loss:
   alpha: 0.75 # Foreground weight (only effective without class_weight)
   gamma: 2.0 # Focusing parameter; higher = more focus on hard examples
@@ -621,3 +621,5 @@ moecount_moe:
   expert_local_detail_use_residual: false  # false = direct output; true = gated residual (starts identity)
   expert_global_density_use_residual: false
   expert_global_density_use_density: true   # concat density map as extra input channel to GlobalDensityExpert
+  gate_use_density_hint: false       # true -> density map conditions the router
+  gate_density_hidden: 8             # projection channels for density hint (only when gate_use_density_hint=true)

@@ -1341,6 +1341,8 @@ class DSGCnet(nn.Module):
                 shared_scale=float(_def("shared_scale", 0.3)),
                 use_deformable_expert=bool(_def("use_deformable_expert", False)),
                 use_input_residual=bool(_def("use_input_residual", True)),
+                gate_use_density_hint=bool(_def("gate_use_density_hint", False)),
+                gate_density_hidden=int(_def("gate_density_hidden", 8)),
                 expert_local_detail_use_residual=bool(
                     _def("expert_local_detail_use_residual", False)
                 ),

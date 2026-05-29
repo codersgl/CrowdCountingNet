@@ -10,7 +10,12 @@ from torch import nn
 
 
 class SparseTop2Gate(nn.Module):
-    """Full-resolution dilated router with warmup soft routing and ST Top-2."""
+    """Full-resolution dilated router with warmup soft routing and ST Top-2.
+
+    Optionally accepts a density hint (e.g. a density map) that is projected and
+    concatenated with features before the router, giving the gate a direct
+    signal about where people are located.
+    """
 
     def __init__(
         self,
@@ -24,6 +29,8 @@ class SparseTop2Gate(nn.Module):
         warmup_fraction: float = 0.2,
         warmup_epochs: int | None = None,
         eps: float = 1e-8,
+        use_density_hint: bool = False,
+        density_hidden: int = 8,
     ) -> None:
         super().__init__()
         if num_experts < 2:
@@ -47,11 +54,19 @@ class SparseTop2Gate(nn.Module):
         self.current_epoch = 0
         self.total_epochs: int | None = None
         self.temperature = float(temperature_init)
+        self.use_density_hint = bool(use_density_hint)
+        self.density_hidden = int(density_hidden)
 
         self.register_buffer("expert_bias", torch.zeros(num_experts))
         self.logit_scale = nn.Parameter(torch.tensor(1.0))
+        router_in = in_channels + (density_hidden if self.use_density_hint else 0)
+        if self.use_density_hint:
+            self.density_proj = nn.Sequential(
+                nn.Conv2d(1, density_hidden, kernel_size=1),
+                nn.ReLU(inplace=True),
+            )
         self.router = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.Conv2d(router_in, hidden_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=3, dilation=3),
             nn.ReLU(inplace=True),
@@ -105,7 +120,31 @@ class SparseTop2Gate(nn.Module):
         uniform = torch.rand_like(logits).clamp_(self.eps, 1.0 - self.eps)
         return (-torch.log(-torch.log(uniform))).clamp(-10, 10)
 
-    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | bool]:
+    def forward(
+        self, features: torch.Tensor, density: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor | bool]:
+        if self.use_density_hint and density is not None:
+            if density.shape[-2:] != features.shape[-2:]:
+                density = F.interpolate(
+                    density, size=features.shape[-2:], mode="bilinear", align_corners=False
+                )
+            density_feat = self.density_proj(density)
+            features = torch.cat([features, density_feat], dim=1)
+        elif self.use_density_hint:
+            features = torch.cat(
+                [
+                    features,
+                    torch.zeros(
+                        features.shape[0],
+                        self.density_hidden,
+                        features.shape[2],
+                        features.shape[3],
+                        device=features.device,
+                        dtype=features.dtype,
+                    ),
+                ],
+                dim=1,
+            )
         if not torch.isfinite(self.expert_bias).all():
             self.expert_bias.zero_()
         logits = self.router(features) * self.logit_scale.clamp(0.1, 10.0) + self.expert_bias.view(1, -1, 1, 1)
@@ -183,7 +222,9 @@ class PixelSoftGate(nn.Module):
     def update_temperature(self, decay_rate: float | None = None) -> None:
         del decay_rate
 
-    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | bool]:
+    def forward(
+        self, features: torch.Tensor, density: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor | bool]:
         raw_weights = self.gate_net(features)  # [B, K, H, W]
         weights = F.softmax(raw_weights, dim=1)  # per-pixel softmax
         importance = weights.detach().mean(dim=(0, 2, 3))  # [K]
@@ -222,6 +263,8 @@ class MultiScaleSparseTop2Gate(SparseTop2Gate):
         warmup_fraction: float = 0.2,
         warmup_epochs: int | None = None,
         eps: float = 1e-8,
+        use_density_hint: bool = False,
+        density_hidden: int = 8,
     ) -> None:
         super().__init__(
             in_channels=in_channels,
@@ -234,10 +277,13 @@ class MultiScaleSparseTop2Gate(SparseTop2Gate):
             warmup_fraction=warmup_fraction,
             warmup_epochs=warmup_epochs,
             eps=eps,
+            use_density_hint=use_density_hint,
+            density_hidden=density_hidden,
         )
-        self.scale_compress = nn.Conv2d(3 * in_channels, in_channels, kernel_size=1)
+        router_in = in_channels + (density_hidden if use_density_hint else 0)
+        self.scale_compress = nn.Conv2d(3 * router_in, router_in, kernel_size=1)
         self.router = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.Conv2d(router_in, hidden_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=3, dilation=3),
             nn.ReLU(inplace=True),
@@ -256,7 +302,31 @@ class MultiScaleSparseTop2Gate(SparseTop2Gate):
         multi_scale = torch.cat([features, s16_up, s32_up], dim=1)
         return self.scale_compress(multi_scale)
 
-    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | bool]:
+    def forward(
+        self, features: torch.Tensor, density: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor | bool]:
+        if self.use_density_hint and density is not None:
+            if density.shape[-2:] != features.shape[-2:]:
+                density = F.interpolate(
+                    density, size=features.shape[-2:], mode="bilinear", align_corners=False
+                )
+            density_feat = self.density_proj(density)
+            features = torch.cat([features, density_feat], dim=1)
+        elif self.use_density_hint:
+            features = torch.cat(
+                [
+                    features,
+                    torch.zeros(
+                        features.shape[0],
+                        self.density_hidden,
+                        features.shape[2],
+                        features.shape[3],
+                        device=features.device,
+                        dtype=features.dtype,
+                    ),
+                ],
+                dim=1,
+            )
         compressed = self._build_multi_scale(features)
         if not torch.isfinite(self.expert_bias).all():
             self.expert_bias.zero_()

@@ -95,8 +95,8 @@ class Trainer:
         mds_cfg = getattr(cfg, "density_mds", None)
         asacl_cfg = getattr(cfg, "density_asacl", None)
         dmcount_cfg = getattr(cfg, "density_dmcount", None)
-        self.pml_mse_aux: nn.Module | None = None
-        self.pml_mse_aux_weight: float = 0.0
+        self.density_mse_aux: nn.Module | None = None
+        self.density_mse_aux_weight: float = 0.0
         if bool(getattr(pml_cfg, "enabled", False)):
             # PML is point-supervised; incompatible with multi-scale density
             density_ms_cfg = getattr(cfg, "density_multi_scale", None)
@@ -126,8 +126,8 @@ class Trainer:
             if _mse_aux_w > 0:
                 from crowdcount.models.moecount.losses import DensityMapLoss
 
-                self.pml_mse_aux = DensityMapLoss(reduction="sum").to(self.device)
-                self.pml_mse_aux_weight = _mse_aux_w
+                self.density_mse_aux = DensityMapLoss(reduction="sum").to(self.device)
+                self.density_mse_aux_weight = _mse_aux_w
                 logger.info(f"PML MSE auxiliary enabled (weight={_mse_aux_w})")
         elif bool(getattr(bayesian_cfg, "enabled", False)):
             # Bayesian Loss is point-supervised; the multi-scale density
@@ -143,19 +143,28 @@ class Trainer:
                     "Disable one of the two."
                 )
 
-            from crowdcount.plugins.bayesian_loss import BayesianLoss
+            from crowdcount.models.moecount.losses import BayesianLoss
 
             self.density_criterion: nn.Module = BayesianLoss(
                 sigma=float(getattr(bayesian_cfg, "sigma", 8.0)),
                 use_background=bool(getattr(bayesian_cfg, "use_background", True)),
                 bg_ratio=float(getattr(bayesian_cfg, "bg_ratio", 0.15)),
                 count_loss_type=str(getattr(bayesian_cfg, "count_loss_type", "l1")),
+                max_pixels_per_chunk=int(getattr(bayesian_cfg, "max_pixels_per_chunk", 16384)),
             ).to(self.device)
             logger.info(
                 "Using Bayesian Loss density criterion "
                 f"(sigma={float(getattr(bayesian_cfg, 'sigma', 8.0))}, "
                 f"use_background={bool(getattr(bayesian_cfg, 'use_background', True))})"
             )
+
+            _mse_aux_w = float(getattr(bayesian_cfg, "mse_aux_weight", 0.0))
+            if _mse_aux_w > 0:
+                from crowdcount.models.moecount.losses import DensityMapLoss
+
+                self.density_mse_aux = DensityMapLoss(reduction="sum").to(self.device)
+                self.density_mse_aux_weight = _mse_aux_w
+                logger.info(f"Bayesian MSE auxiliary enabled (weight={_mse_aux_w})")
         elif bool(getattr(mds_cfg, "enabled", False)):
             # MDS-Loss already includes an SSIM term; refuse to stack it on
             # top of the generic density_ssim regulariser.
@@ -480,8 +489,8 @@ class Trainer:
                 uncertainty_weighter=self.uncertainty_weighter,
                 writer=self.writer,
                 vis_dir=vis_dir,
-                pml_mse_aux=self.pml_mse_aux,
-                pml_mse_aux_weight=self.pml_mse_aux_weight,
+                density_mse_aux=self.density_mse_aux,
+                density_mse_aux_weight=self.density_mse_aux_weight,
             )
             t2 = time.time()
 

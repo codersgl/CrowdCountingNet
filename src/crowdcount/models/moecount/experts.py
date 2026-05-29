@@ -405,6 +405,8 @@ class HeterogeneousSparseMoE(nn.Module):
         expert_local_detail_use_multi_spectral_se: bool = True,
         expert_local_detail_ms_num_freqs: int = 4,
         gate_type: str = "sparse_top2",
+        gate_use_density_hint: bool = False,
+        gate_density_hidden: int = 8,
         expert_global_density_use_density: bool = True,
     ) -> None:
         super().__init__()
@@ -459,6 +461,8 @@ class HeterogeneousSparseMoE(nn.Module):
                 temperature_decay=temperature_decay,
                 warmup_fraction=warmup_fraction,
                 warmup_epochs=warmup_epochs,
+                use_density_hint=gate_use_density_hint,
+                density_hidden=gate_density_hidden,
             )
         self.eim_loss = ExpertImportanceLoss(
             lambda_importance=lambda_importance,
@@ -501,7 +505,7 @@ class HeterogeneousSparseMoE(nn.Module):
                 "cos_12": avg_cos[1, 2].clone(),
             }
 
-        route = self.gate(features)
+        route = self.gate(features, density=density.detach() if density is not None else None)
         route_weights = route["weights"]
         if not isinstance(route_weights, torch.Tensor):
             raise TypeError("gate route weights must be a tensor")

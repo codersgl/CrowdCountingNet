@@ -303,8 +303,8 @@ def train_one_epoch(
     writer=None,
     vis_dir: str | None = None,
     vis_interval: int = 500,
-    pml_mse_aux: nn.Module | None = None,
-    pml_mse_aux_weight: float = 0.0,
+    density_mse_aux: nn.Module | None = None,
+    density_mse_aux_weight: float = 0.0,
 ) -> dict:
     """Train for one epoch.
 
@@ -721,12 +721,12 @@ def train_one_epoch(
             density_ssim_loss = density_ssim_weight * ssim_criterion(et_dmap, gt_dmap)
             density_loss = density_loss + density_ssim_loss
 
-        pml_mse_aux_loss = torch.tensor(0.0, device=samples.device)
-        if pml_mse_aux is not None and pml_mse_aux_weight > 0:
-            pml_mse_aux_loss = (
-                pml_mse_aux(et_dmap, gt_dmap) / gt_dmap.shape[0] * pml_mse_aux_weight
+        density_mse_aux_loss = torch.tensor(0.0, device=samples.device)
+        if density_mse_aux is not None and density_mse_aux_weight > 0:
+            density_mse_aux_loss = (
+                density_mse_aux(et_dmap, gt_dmap) / gt_dmap.shape[0] * density_mse_aux_weight
             )
-            density_loss = density_loss + pml_mse_aux_loss
+            density_loss = density_loss + density_mse_aux_loss
 
         depth_aux_loss = torch.tensor(0.0, device=samples.device)
         depth_aux_pixel_loss = torch.tensor(0.0, device=samples.device)
@@ -943,8 +943,8 @@ def train_one_epoch(
             metric_logger.update(**_dm_components)
         if use_density_ssim:
             metric_logger.update(den_ssim=density_ssim_loss.item())
-        if pml_mse_aux is not None and pml_mse_aux_weight > 0:
-            metric_logger.update(pml_mse_aux=pml_mse_aux_loss.item())
+        if density_mse_aux is not None and density_mse_aux_weight > 0:
+            metric_logger.update(density_mse_aux=density_mse_aux_loss.item())
 
         if moe_aux_total is not None:
             metric_logger.update(

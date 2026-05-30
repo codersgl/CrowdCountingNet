@@ -112,7 +112,7 @@ FeatureTransformerBlock × 2:
 - Reuse code: `FeatureTransformerBlock` from `gcn.py`
 - Params: ~2M (2 blocks)
 
-### 4. Cross-Attention Fusion (Core Novell Module)
+### 4. Cross-Attention Fusion (Core Novel Module)
 
 **New module** — `ScaleDecoupledCrossAttention`:
 
@@ -191,7 +191,7 @@ All gates zero-initialized:
 
 ## Integration into DSGCNet
 
-### Modified `DSGCNet.forward()` (pseudocode)
+### Modified `DSGCNet.forward()` (pseudocode, using Option B fallback strategy)
 
 ```python
 def forward(self, images, targets=None):
@@ -199,28 +199,23 @@ def forward(self, images, targets=None):
     features = self.backbone(images)  # C2, C3, C4
 
     # Scale-decoupled streams (replace Neck)
-    F_s8  = self.cnn_stream(features["c2"])         # CNN @ s8
-    F_s16 = self.gcn_stream(features["c3"], density)  # GCN @ s16 (needs density)
-    F_s32 = self.transformer_stream(features["c4"])   # Transformer @ s32
+    F_s8  = self.cnn_stream(features["c2"])                    # CNN @ s8
+    F_s16 = self.gcn_stream(features["c3"], density=None)       # GCN @ s16 (feature-graph fallback)
+    F_s32 = self.transformer_stream(features["c4"])             # Transformer @ s32
 
     # Cross-Attention fusion (replace DGCN)
     f = self.cross_attention(F_s8, F_s16, F_s32)
 
-    # Density prediction (for next iteration's GCN input + modulation)
-    density = self.density_head(f)  # intermediate density
-
-    # Density modulation
+    # Density + point prediction
+    density = self.density_head(f)
     f_mod = self.density_modulation(f, density)
+    point_preds = self.point_head(f_mod)
 
-    # Final prediction heads
-    density_final = self.density_head(f_mod)  # or reuse same head
-    point_preds   = self.point_head(f_mod)
-
-    return {
-        "density": density_final,
-        "point": point_preds,
-    }
+    return {"density": density, "point": point_preds}
 ```
+
+The GCN stream uses `FeatureGraphBuilder` (cosine similarity) when density is `None`,
+and `DensityGraphBuilder` / `SpatialPriorDensityGraphBuilder` when density is provided.
 
 ### GCN Stream's Density Dependency
 

@@ -390,17 +390,16 @@ class ScaleDecoupledCrossAttention(nn.Module):
         k = self.k_norm(k)
         v = self.v_norm(v)
 
-        # --- Multi-Head Cross-Attention ---
+        # --- Multi-Head Cross-Attention (memory-efficient) ---
         N_q, N_kv = q.shape[1], k.shape[1]
 
         q_mh = q.view(B, N_q, self.num_heads, self.head_dim).transpose(1, 2)
         k_mh = k.view(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
         v_mh = v.view(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
 
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q_mh, k_mh.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        attn_out = torch.matmul(attn, v_mh)
+        attn_out = F.scaled_dot_product_attention(
+            q_mh, k_mh, v_mh, dropout_p=0.0, is_causal=False,
+        )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, N_q, C)
 
         attn_out = self.out_proj(attn_out)
@@ -582,8 +581,14 @@ class ScaleDecoupledFusion(nn.Module):
         f_gcn = self.gcn_stream(c3, density=density)
         f_trans = self.transformer_stream(c4)
 
+        # Pool CNN output to GCN resolution for K/V.
+        # Q at s8 can only query at s8 granularity — keeping K/V at s4
+        # explodes memory with no precision benefit.
+        if f_cnn.shape[-2:] != f_gcn.shape[-2:]:
+            f_cnn = F.max_pool2d(f_cnn, kernel_size=2, stride=2)
+
         # Q ← GCN (mid-resolution queries local + global context)
-        # K/V ← [CNN (high-res local), Transformer (low-res global)]
+        # K/V ← [CNN↓ (high-res local), Transformer (low-res global)]
         f = self.cross_attention(f_gcn, f_cnn, f_trans)
 
         return f, {}

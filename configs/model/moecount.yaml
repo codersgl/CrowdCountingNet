@@ -38,13 +38,20 @@ moe:
   # Expert configuration: control per-expert behavior
   expert_config:
     local_detail:
-      use_residual: false   # true = old gated residual (identity pass-through)
-      use_strip_convs: true          # parallel 1xK + Kx1 depthwise strip branches
-      strip_kernel: 7                # strip kernel size (recommend 5-9)
+      use_density_adaptive: true     # NEW: use DensityAdaptiveLocalExpert (dilated convs + FFN + density modulation)
+      dilations: [1, 2, 3]           # NEW: dilation rates for multi-scale dilated convs
+      groups: 16                     # NEW: grouped conv groups (16 = partial cross-channel; 256 = depthwise)
+      ffn_expansion: 2               # NEW: FFN channel expansion ratio
+      use_density_modulation: true   # NEW: density-adaptive per-pixel modulation (zero-init)
       use_multi_spectral_se: true    # FcaNet-style DCT multi-spectral attention
       ms_num_freqs: 4                # number of DCT frequency components
+      # --- legacy LocalDetailExpert options (used when use_density_adaptive: false) ---
+      use_residual: false            # gated residual (identity pass-through)
+      use_strip_convs: true          # parallel 1xK + Kx1 depthwise strip branches
+      strip_kernel: 7                # strip kernel size (recommend 5-9)
     global_density:
       use_residual: false   # true = old gated residual (identity pass-through)
+      use_density: true     # concatenate density map as additional input
 
   # Deformable Cross-Scale Expert — replaces SpatialRelationExpert's W-MSA
   # with DAT-style multi-scale deformable attention.

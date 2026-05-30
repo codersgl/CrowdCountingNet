@@ -160,6 +160,12 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         expert_local_detail_strip_kernel=int(getattr(local_detail_cfg, "strip_kernel", 7) if local_detail_cfg is not None else 7),
         expert_local_detail_use_multi_spectral_se=bool(getattr(local_detail_cfg, "use_multi_spectral_se", True) if local_detail_cfg is not None else True),
         expert_local_detail_ms_num_freqs=int(getattr(local_detail_cfg, "ms_num_freqs", 4) if local_detail_cfg is not None else 4),
+        expert_local_detail_use_density_adaptive=bool(getattr(local_detail_cfg, "use_density_adaptive", True) if local_detail_cfg is not None else True),
+        expert_local_detail_dilations=tuple(int(b) for b in getattr(local_detail_cfg, "dilations", [1, 2, 3])),
+        expert_local_detail_groups=int(getattr(local_detail_cfg, "groups", 16) if local_detail_cfg is not None else 16),
+        expert_local_detail_ffn_expansion=int(getattr(local_detail_cfg, "ffn_expansion", 2) if local_detail_cfg is not None else 2),
+        expert_local_detail_use_density_modulation=bool(getattr(local_detail_cfg, "use_density_modulation", True) if local_detail_cfg is not None else True),
+        expert_global_density_use_density=bool(getattr(global_density_cfg, "use_density", True) if global_density_cfg is not None else True),
         gate_type=str(getattr(moe_cfg, "gate_type", "sparse_top2")),
     )
     density_head = DensityHead(

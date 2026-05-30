@@ -119,6 +119,130 @@ class MultiSpectralChannelAttention(nn.Module):
         return x * attn
 
 
+class DensityAdaptiveLocalExpert(nn.Module):
+    """Stride-8 expert: density-adaptive multi-scale dilated conv + FFN + MSCA.
+
+    Replaces LocalDetailExpert with three design improvements:
+
+    1. **Multi-scale dilated convs** (d=1,2,3) replace strip convs — circular
+       (non-strip) receptive fields at progressive scales matching head sizes.
+       Grouped convs (default groups=16) provide partial cross-channel
+       interaction during spatial processing, unlike pure depthwise.
+
+    2. **FFN channel expansion** (default 256→512→256) for deeper non-linear
+       processing, matching the depth of SpatialRelationExpert's FFN.
+
+    3. **Density-adaptive modulation** — processing intensity scales with local
+       crowd density via a zero-init per-pixel gate. This gives e1 a unique
+       capability that e2 (stride-16 MSA) cannot provide: stride-8 resolution
+       density-aware local refinement.
+
+    Internal **standard** residuals (random-init, non-zero from step 1) on
+    both the multi-scale block and the FFN ensure stable gradient flow
+    while producing differentiated features (no identity collapse).
+    Output uses a zero-init gated residual for training stability.
+    """
+
+    def __init__(
+        self,
+        channels: int = 256,
+        dilations: tuple[int, ...] = (1, 2, 3),
+        groups: int = 16,
+        ffn_expansion: int = 2,
+        use_density_modulation: bool = True,
+        use_multi_spectral_se: bool = True,
+        ms_num_freqs: int = 4,
+    ) -> None:
+        super().__init__()
+        self.use_density_modulation = use_density_modulation
+
+        # ---- Stage 1: Multi-scale dilated conv block ----
+        self.ms_norm = nn.GroupNorm(min(32, channels), channels)
+        self.dilated_branches = nn.ModuleList()
+        for d in dilations:
+            self.dilated_branches.append(
+                nn.Sequential(
+                    nn.Conv2d(
+                        channels,
+                        channels,
+                        kernel_size=3,
+                        padding=d,         # padding = dilation to preserve spatial size
+                        dilation=d,
+                        groups=groups,
+                        bias=False,
+                    ),
+                    nn.GELU(),
+                )
+            )
+        # Per-dilation learnable scales so the network can weight branches
+        self.branch_scales = nn.Parameter(torch.ones(len(dilations)))
+        # Fuse multi-scale branches back to channels
+        branch_in = channels * len(dilations)
+        self.fuse_branches = nn.Sequential(
+            nn.Conv2d(branch_in, channels, kernel_size=1, bias=False),
+            nn.GroupNorm(min(32, channels), channels),
+        )
+
+        # ---- Stage 2: FFN channel expansion ----
+        ffn_hidden = channels * ffn_expansion
+        self.ffn_norm = nn.GroupNorm(min(32, channels), channels)
+        self.ffn = nn.Sequential(
+            nn.Conv2d(channels, ffn_hidden, kernel_size=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(ffn_hidden, channels, kernel_size=1, bias=False),
+        )
+
+        # ---- Stage 3: Channel attention ----
+        if use_multi_spectral_se:
+            self.channel_attn: nn.Module = MultiSpectralChannelAttention(
+                channels, reduction=4, num_freqs=ms_num_freqs,
+            )
+        else:
+            self.channel_attn = SE(channels, reduction=4)
+
+        # ---- Stage 4: Density-adaptive modulation ----
+        if use_density_modulation:
+            self.density_gate = nn.Sequential(
+                nn.Conv2d(1, channels, kernel_size=3, padding=1, bias=False),
+                nn.Sigmoid(),
+            )
+            self.density_gain = nn.Parameter(torch.zeros(1))
+
+        # ---- Output projection (standard residual, like e2's internal blocks) ----
+        self.output_norm = nn.GroupNorm(min(32, channels), channels)
+        self.output_proj = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.GELU(),
+        )
+
+    def forward(
+        self, features: torch.Tensor, density: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        # Stage 1: Multi-scale dilated conv block (internal standard residual)
+        normed = self.ms_norm(features)
+        branch_outputs: list[torch.Tensor] = []
+        for i, branch in enumerate(self.dilated_branches):
+            out = branch(normed)
+            branch_outputs.append(out * self.branch_scales[i])
+        multi_scale = self.fuse_branches(torch.cat(branch_outputs, dim=1))
+        x = features + multi_scale  # standard residual (random init, non-zero)
+
+        # Stage 2: FFN (pre-norm, internal standard residual)
+        x = x + self.ffn(self.ffn_norm(x))
+
+        # Stage 3: Channel attention
+        x = self.channel_attn(x)
+
+        # Stage 4: Density-adaptive modulation (zero-init → disabled at start)
+        if self.use_density_modulation and density is not None:
+            gate = self.density_gate(density.detach())
+            x = x * (1.0 + self.density_gain.tanh() * gate)
+
+        # Output: pure transform (no residual) — differentiated from e2's residual path.
+        # Internal residuals (dilated block + FFN) provide gradient stability.
+        return self.output_proj(self.output_norm(x))
+
+
 class SharedExpert(nn.Module):
     """Minimal shared expert — single conv, forcing routed experts to specialize."""
 
@@ -409,6 +533,12 @@ class HeterogeneousSparseMoE(nn.Module):
         gate_use_density_hint: bool = False,
         gate_density_hidden: int = 8,
         expert_global_density_use_density: bool = True,
+        # --- DensityAdaptiveLocalExpert config ---
+        expert_local_detail_use_density_adaptive: bool = True,
+        expert_local_detail_dilations: tuple[int, ...] = (1, 2, 3),
+        expert_local_detail_groups: int = 16,
+        expert_local_detail_ffn_expansion: int = 2,
+        expert_local_detail_use_density_modulation: bool = True,
     ) -> None:
         super().__init__()
         self.num_experts = 3
@@ -430,15 +560,28 @@ class HeterogeneousSparseMoE(nn.Module):
             )
         else:
             spatial_expert = SpatialRelationExpert(channels)
-        self.experts = nn.ModuleList([
-            LocalDetailExpert(
+        local_expert: nn.Module
+        if expert_local_detail_use_density_adaptive:
+            local_expert = DensityAdaptiveLocalExpert(
+                channels,
+                dilations=expert_local_detail_dilations,
+                groups=expert_local_detail_groups,
+                ffn_expansion=expert_local_detail_ffn_expansion,
+                use_density_modulation=expert_local_detail_use_density_modulation,
+                use_multi_spectral_se=expert_local_detail_use_multi_spectral_se,
+                ms_num_freqs=expert_local_detail_ms_num_freqs,
+            )
+        else:
+            local_expert = LocalDetailExpert(
                 channels,
                 use_residual=expert_local_detail_use_residual,
                 use_strip_convs=expert_local_detail_use_strip_convs,
                 strip_kernel=expert_local_detail_strip_kernel,
                 use_multi_spectral_se=expert_local_detail_use_multi_spectral_se,
                 ms_num_freqs=expert_local_detail_ms_num_freqs,
-            ),
+            )
+        self.experts = nn.ModuleList([
+            local_expert,
             spatial_expert,
             GlobalDensityExpert(
                 channels,
@@ -488,7 +631,7 @@ class HeterogeneousSparseMoE(nn.Module):
         expert_outputs = torch.stack(
             [
                 expert(features, density=density)
-                if isinstance(expert, (GlobalDensityExpert, DeformableCrossScaleExpert))
+                if isinstance(expert, (GlobalDensityExpert, DensityAdaptiveLocalExpert, DeformableCrossScaleExpert))
                 else expert(features)
                 for expert in self.experts
             ],

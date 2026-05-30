@@ -1301,6 +1301,21 @@ class DSGCnet(nn.Module):
                 expert_global_density_use_density=bool(
                     _def("expert_global_density_use_density", True)
                 ),
+                expert_local_detail_use_density_adaptive=bool(
+                    _def("expert_local_detail_use_density_adaptive", True)
+                ),
+                expert_local_detail_dilations=tuple(
+                    int(b) for b in _def("expert_local_detail_dilations", [1, 2, 3])
+                ),
+                expert_local_detail_groups=int(
+                    _def("expert_local_detail_groups", 16)
+                ),
+                expert_local_detail_ffn_expansion=int(
+                    _def("expert_local_detail_ffn_expansion", 2)
+                ),
+                expert_local_detail_use_density_modulation=bool(
+                    _def("expert_local_detail_use_density_modulation", True)
+                ),
                 deformable_use_density_bias=bool(
                     _def("deformable_use_density_bias", False)
                 ),

@@ -1287,11 +1287,16 @@ class DSGCnet(nn.Module):
                 warmup_epochs=_def("warmup_epochs", None),
                 lambda_importance=float(_def("lambda_importance", 0.01)),
                 lambda_load=float(_def("lambda_load", 0.01)),
-                shared_scale=float(_def("shared_scale", 0.3)),
+                shared_scale=float(_def("shared_scale", 0.5)),
+                shared_num_blocks=int(_def("shared_num_blocks", 3)),
+                shared_scale_learnable=bool(_def("shared_scale_learnable", True)),
                 use_deformable_expert=bool(_def("use_deformable_expert", False)),
                 use_input_residual=bool(_def("use_input_residual", True)),
                 gate_use_density_hint=bool(_def("gate_use_density_hint", False)),
                 gate_density_hidden=int(_def("gate_density_hidden", 8)),
+                gate_use_density_bias=bool(_def("gate_use_density_bias", False)),
+                gate_graph_k=int(_def("gate_graph_k", 4)),
+                expert_use_density=bool(_def("expert_use_density", True)),
                 expert_local_detail_use_residual=bool(
                     _def("expert_local_detail_use_residual", False)
                 ),
@@ -1319,6 +1324,44 @@ class DSGCnet(nn.Module):
                 deformable_use_density_bias=bool(
                     _def("deformable_use_density_bias", False)
                 ),
+                # --- Expert replacement flags ---
+                use_point_localization_expert=bool(
+                    _def("use_point_localization_expert", False)
+                ),
+                use_occlusion_reasoning_expert=bool(
+                    _def("use_occlusion_reasoning_expert", False)
+                ),
+                use_density_pattern_expert=bool(
+                    _def("use_density_pattern_expert", False)
+                ),
+                # --- PointLocalizationExpert (e0) config ---
+                expert_pl_use_point_aux=bool(
+                    _def("expert_pl_use_point_aux", False)
+                ),
+                expert_pl_point_hidden=int(_def("expert_pl_point_hidden", 64)),
+                expert_pl_point_loss_weight=float(_def("expert_pl_point_loss_weight", 1.0)),
+                expert_pl_point_cls_weight=float(_def("expert_pl_point_cls_weight", 1.0)),
+                expert_pl_point_reg_weight=float(_def("expert_pl_point_reg_weight", 0.0002)),
+                expert_pl_point_cost_class=float(_def("expert_pl_point_cost_class", 1.0)),
+                expert_pl_point_cost_point=float(_def("expert_pl_point_cost_point", 0.05)),
+                expert_pl_point_eos_coef=float(_def("expert_pl_point_eos_coef", 0.5)),
+                expert_pl_point_max_candidates=int(_def("expert_pl_point_max_candidates", 512)),
+                # --- OcclusionReasoningExpert (e1) config ---
+                expert_occ_use_aux=bool(_def("expert_occ_use_aux", False)),
+                expert_occ_emb_hidden=int(_def("expert_occ_emb_hidden", 16)),
+                expert_occ_consistency_weight=float(_def("expert_occ_consistency_weight", 1.0)),
+                expert_occ_density_threshold=float(_def("expert_occ_density_threshold", 5.0)),
+                expert_occ_head_hidden=int(_def("expert_occ_head_hidden", 128)),
+                expert_occ_use_residual=bool(_def("expert_occ_use_residual", True)),
+                # --- DensityPatternExpert (e2) config ---
+                expert_dp_use_aux=bool(_def("expert_dp_use_aux", False)),
+                expert_dp_ppm_bins=tuple(
+                    int(b) for b in _def("expert_dp_ppm_bins", [1, 2, 3, 6])
+                ),
+                expert_dp_ppm_reduction=int(_def("expert_dp_ppm_reduction", 4)),
+                expert_dp_pattern_num_bins=int(_def("expert_dp_pattern_num_bins", 8)),
+                expert_dp_pattern_class_weight=float(_def("expert_dp_pattern_class_weight", 1.0)),
+                expert_dp_use_residual=bool(_def("expert_dp_use_residual", True)),
             )
 
             self.density_gcn = None
@@ -2312,7 +2355,10 @@ class DSGCnet(nn.Module):
         elif self.use_moecount_moe:
             assert self.moecount_moe is not None
             feature_fl, moe_aux_losses, route = self.moecount_moe(
-                features_pa, density=density
+                features_pa,
+                density=density,
+                targets=targets if self.training else None,
+                gt_density=gt_density if self.training else None,
             )
             output_dict["moe_aux_losses"] = moe_aux_losses
             output_dict["moe_aux_total"] = moe_aux_losses.get("total_aux")

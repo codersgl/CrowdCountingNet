@@ -116,6 +116,18 @@ class TestHeterogeneousSparseMoEDensity:
         assert fused.shape == features.shape
 
     def test_gradient_through_density_path(self, features, density):
+        """Density gradient flows through GlobalDensityExpert.density_fuse path.
+
+        When ``expert_global_density_use_density=True``, GlobalDensityExpert
+        concatenates density as an extra input channel and fuses it via a 1×1
+        conv.  This creates a legitimate gradient highway from the MoE output
+        back to the density prediction head.
+
+        Note: at initialisation the gradient magnitude is near-zero because
+        ``residual_gate.tanh() ≈ 0`` gates the expert's non-identity output.
+        The test only asserts that density is *in the graph* (grad is not
+        None); the gradient magnitude grows as the residual gate opens.
+        """
         moe = HeterogeneousSparseMoE(
             channels=256, expert_global_density_use_density=True
         )

@@ -390,6 +390,11 @@ def train_one_epoch(
         moe_aux_weight = float(
             getattr(model_sdd_moe_cfg, "aux_loss_weight", moe_aux_weight)
         )
+    model_moecount_moe_cfg = getattr(getattr(cfg, "model", None), "moecount_moe", None)
+    if fusion_mode == "moe" and model_moecount_moe_cfg is not None:
+        moe_aux_weight = float(
+            getattr(model_moecount_moe_cfg, "aux_loss_weight", moe_aux_weight)
+        )
     moe_temperature_decay = (
         float(getattr(model_moe_cfg, "temperature_decay", 0.9999))
         if model_moe_cfg is not None
@@ -963,6 +968,12 @@ def train_one_epoch(
                 "l_ssim",
                 "neck_l_balance",
                 "neck_entropy",
+                # --- New expert-specific aux losses ---
+                "l_pl_point",
+                "l_pl_point_cls",
+                "l_pl_point_reg",
+                "l_occ_consistency",
+                "l_dp_class",
             ):
                 if key in moe_aux_losses:
                     metric_logger.update(**{key: float(moe_aux_losses[key].item())})
@@ -974,6 +985,7 @@ def train_one_epoch(
                 or getattr(model, "graph_attn_moe", None)
                 or getattr(model, "sdd_moe", None)
                 or getattr(model, "neck_moe", None)
+                or getattr(model, "moecount_moe", None)
             )
             if moe_module is not None:
                 # Temperature: direct attr or nested in router (SDDMoE)

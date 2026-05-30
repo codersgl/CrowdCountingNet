@@ -600,7 +600,7 @@ density_adaptive_fusion:
 # GlobalDensity stride-32) with per-pixel SparseTop2Gate routing replace the
 # dual-stream GCN entirely. Output shape [B, 256, H, W] is identical.
 moecount_moe:
-  gate_type: sparse_top2           # sparse_top2 | soft
+  gate_type: graph_aware           # sparse_top2 | soft | graph_aware
   top_k: 2
   temperature_init: 1.0
   temperature_min: 0.1
@@ -609,7 +609,9 @@ moecount_moe:
   warmup_fraction: 0.2
   lambda_importance: 0.01
   lambda_load: 0.01
-  shared_scale: 0.3
+  shared_scale: 0.5                    # Increased from 0.3: deeper shared expert provides stronger baseline
+  shared_num_blocks: 3                 # Residual blocks in shared expert (was effectively 1 before)
+  shared_scale_learnable: true         # Let the model adjust shared-vs-routed balance
   use_input_residual: true
   use_deformable_expert: true      # true -> DeformableCrossScaleExpert instead of window-MSA
   deformable_use_density_bias: true  # density-biased attention in deformable expert
@@ -618,5 +620,40 @@ moecount_moe:
   expert_local_detail_use_residual: false  # false = direct output; true = gated residual (starts identity)
   expert_global_density_use_residual: false
   expert_global_density_use_density: true   # concat density map as extra input channel to GlobalDensityExpert
-  gate_use_density_hint: false       # true -> density map conditions the router
+  gate_use_density_hint: false       # true -> density map conditions the router (recommended for task-oriented experts)
   gate_density_hidden: 8             # projection channels for density hint (only when gate_use_density_hint=true)
+  gate_use_density_bias: true        # true -> density→per-expert direct logit bias (zero-init, stable)
+  gate_graph_k: 4                   # k-NN graph degree for graph-aware gate (only used when gate_type: graph_aware)
+  expert_use_density: false          # false -> experts do NOT receive density (pure feature processors)
+
+  # --- Expert replacement flags (set all false for legacy behavior) ---
+  use_point_localization_expert: true    # e0: PointLocalizationExpert (internal point head + aux loss)
+  use_occlusion_reasoning_expert: true   # e1: OcclusionReasoningExpert (visibility + context completion)
+  use_density_pattern_expert: true       # e2: DensityPatternExpert (PSPNet PPM + density bin classifier)
+
+  # --- PointLocalizationExpert (e0) ---
+  expert_pl_use_point_aux: false
+  expert_pl_point_hidden: 64
+  expert_pl_point_loss_weight: 1.0
+  expert_pl_point_cls_weight: 1.0
+  expert_pl_point_reg_weight: 0.0002
+  expert_pl_point_cost_class: 1.0
+  expert_pl_point_cost_point: 0.05
+  expert_pl_point_eos_coef: 0.5
+  expert_pl_point_max_candidates: 512
+
+  # --- OcclusionReasoningExpert (e1) ---
+  expert_occ_use_aux: false
+  expert_occ_emb_hidden: 16
+  expert_occ_consistency_weight: 1.0
+  expert_occ_density_threshold: 5.0
+  expert_occ_head_hidden: 128
+  expert_occ_use_residual: true
+
+  # --- DensityPatternExpert (e2) ---
+  expert_dp_use_aux: false
+  expert_dp_ppm_bins: [1, 2, 3, 6]
+  expert_dp_ppm_reduction: 4
+  expert_dp_pattern_num_bins: 8
+  expert_dp_pattern_class_weight: 1.0
+  expert_dp_use_residual: true

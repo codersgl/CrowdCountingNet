@@ -47,7 +47,13 @@ class MoECountNet(nn.Module):
     def get_gate_parameters(self) -> list[nn.Parameter]:
         return [parameter for parameter in self.moe.gate.parameters() if parameter.requires_grad]
 
-    def forward(self, samples: torch.Tensor, epoch: int | None = None) -> dict[str, Any]:
+    def forward(
+        self,
+        samples: torch.Tensor,
+        epoch: int | None = None,
+        targets: list[dict[str, torch.Tensor]] | None = None,
+        gt_density: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
         if hasattr(samples, "tensors"):
             samples = samples.tensors
         if epoch is not None:
@@ -57,7 +63,9 @@ class MoECountNet(nn.Module):
             fused_neck = self.neck(feature_maps["c2"], feature_maps["c3"], feature_maps["c4"])
         else:
             fused_neck = self.neck(feature_maps["c2"], feature_maps["c3"])
-        moe_features, moe_aux_losses, route = self.moe(fused_neck)
+        moe_features, moe_aux_losses, route = self.moe(
+            fused_neck, targets=targets, gt_density=gt_density
+        )
         if self.gcn_refine is not None:
             moe_features = self.gcn_refine(moe_features)
         density = self.density_head(moe_features)
@@ -133,6 +141,8 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
     expert_config = getattr(moe_cfg, "expert_config", None)
     local_detail_cfg = getattr(expert_config, "local_detail", None) if expert_config is not None else None
     global_density_cfg = getattr(expert_config, "global_density", None) if expert_config is not None else None
+    occ_cfg = getattr(expert_config, "occlusion_reasoning", None) if expert_config is not None else None
+    dp_cfg = getattr(expert_config, "density_pattern", None) if expert_config is not None else None
     moe = HeterogeneousSparseMoE(
         channels=int(getattr(neck_cfg, "out_channels", 256)),
         gate_hidden_channels=int(getattr(moe_cfg, "gate_hidden_channels", 128)),
@@ -144,7 +154,9 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         warmup_epochs=getattr(moe_cfg, "warmup_epochs", None),
         lambda_importance=float(getattr(moe_cfg, "lambda_importance", 0.01)),
         lambda_load=float(getattr(moe_cfg, "lambda_load", 0.01)),
-        shared_scale=float(getattr(moe_cfg, "shared_scale", 0.3)),
+        shared_scale=float(getattr(moe_cfg, "shared_scale", 0.5)),
+        shared_num_blocks=int(getattr(moe_cfg, "shared_num_blocks", 3)),
+        shared_scale_learnable=bool(getattr(moe_cfg, "shared_scale_learnable", True)),
         use_deformable_expert=use_deformable,
         deformable_num_heads=int(getattr(deformable_cfg, "num_heads", 4)),
         deformable_num_sampling_points=int(getattr(deformable_cfg, "num_sampling_points", 8)),
@@ -167,6 +179,36 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         expert_local_detail_use_density_modulation=bool(getattr(local_detail_cfg, "use_density_modulation", True) if local_detail_cfg is not None else True),
         expert_global_density_use_density=bool(getattr(global_density_cfg, "use_density", True) if global_density_cfg is not None else True),
         gate_type=str(getattr(moe_cfg, "gate_type", "sparse_top2")),
+        gate_use_density_hint=bool(getattr(moe_cfg, "gate_use_density_hint", True)),
+        gate_use_density_bias=bool(getattr(moe_cfg, "gate_use_density_bias", False)),
+        # --- Expert replacement flags ---
+        use_point_localization_expert=bool(getattr(moe_cfg, "use_point_localization_expert", True)),
+        use_occlusion_reasoning_expert=bool(getattr(moe_cfg, "use_occlusion_reasoning_expert", True)),
+        use_density_pattern_expert=bool(getattr(moe_cfg, "use_density_pattern_expert", True)),
+        # --- PointLocalizationExpert (e0) config ---
+        expert_pl_use_point_aux=bool(getattr(local_detail_cfg, "use_point_aux", True) if local_detail_cfg is not None else False),
+        expert_pl_point_hidden=int(getattr(local_detail_cfg, "point_hidden", 64) if local_detail_cfg is not None else 64),
+        expert_pl_point_loss_weight=float(getattr(local_detail_cfg, "point_loss_weight", 1.0) if local_detail_cfg is not None else 1.0),
+        expert_pl_point_cls_weight=float(getattr(local_detail_cfg, "point_cls_weight", 1.0) if local_detail_cfg is not None else 1.0),
+        expert_pl_point_reg_weight=float(getattr(local_detail_cfg, "point_reg_weight", 0.0002) if local_detail_cfg is not None else 0.0002),
+        expert_pl_point_cost_class=float(getattr(local_detail_cfg, "point_cost_class", 1.0) if local_detail_cfg is not None else 1.0),
+        expert_pl_point_cost_point=float(getattr(local_detail_cfg, "point_cost_point", 0.05) if local_detail_cfg is not None else 0.05),
+        expert_pl_point_eos_coef=float(getattr(local_detail_cfg, "point_eos_coef", 0.5) if local_detail_cfg is not None else 0.5),
+        expert_pl_point_max_candidates=int(getattr(local_detail_cfg, "point_max_candidates", 512) if local_detail_cfg is not None else 512),
+        # --- OcclusionReasoningExpert (e1) config ---
+        expert_occ_use_aux=bool(getattr(occ_cfg, "use_aux", True) if occ_cfg is not None else False),
+        expert_occ_emb_hidden=int(getattr(occ_cfg, "emb_hidden", 16) if occ_cfg is not None else 16),
+        expert_occ_consistency_weight=float(getattr(occ_cfg, "consistency_weight", 1.0) if occ_cfg is not None else 1.0),
+        expert_occ_density_threshold=float(getattr(occ_cfg, "density_threshold", 5.0) if occ_cfg is not None else 5.0),
+        expert_occ_head_hidden=int(getattr(occ_cfg, "head_hidden", 128) if occ_cfg is not None else 128),
+        expert_occ_use_residual=bool(getattr(occ_cfg, "use_residual", True) if occ_cfg is not None else True),
+        # --- DensityPatternExpert (e2) config ---
+        expert_dp_use_aux=bool(getattr(dp_cfg, "use_aux", True) if dp_cfg is not None else False),
+        expert_dp_ppm_bins=tuple(int(b) for b in getattr(dp_cfg, "ppm_bins", [1, 2, 3, 6])),
+        expert_dp_ppm_reduction=int(getattr(dp_cfg, "ppm_reduction", 4) if dp_cfg is not None else 4),
+        expert_dp_pattern_num_bins=int(getattr(dp_cfg, "pattern_num_bins", 8) if dp_cfg is not None else 8),
+        expert_dp_pattern_class_weight=float(getattr(dp_cfg, "pattern_class_weight", 1.0) if dp_cfg is not None else 1.0),
+        expert_dp_use_residual=bool(getattr(dp_cfg, "use_residual", True) if dp_cfg is not None else True),
     )
     density_head = DensityHead(
         in_channels=int(getattr(neck_cfg, "out_channels", 256)),

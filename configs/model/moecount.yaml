@@ -22,7 +22,8 @@ neck:
   use_depthwise_refine: true
 
 moe:
-  gate_type: soft  # "soft" (PixelSoftGate) or "sparse_top2" (SparseTop2Gate with Gumbel-ST)
+  gate_type: sparse_top2  # "soft" (PixelSoftGate) or "sparse_top2" (SparseTop2Gate with Gumbel-ST)
+  gate_use_density_bias: true  # density→per-expert direct logit bias (zero-init, zero-risk)
   top_k: 2
   gate_hidden_channels: 128
   temperature_init: 1.0
@@ -32,7 +33,9 @@ moe:
   warmup_epochs: 60
   lambda_importance: 0.1
   lambda_load: 0.001
-  shared_scale: 0.3
+  shared_scale: 0.5  # Increased from 0.3: deeper shared expert provides stronger baseline
+  shared_num_blocks: 3  # Residual blocks in shared expert (was effectively 1 before)
+  shared_scale_learnable: true  # Let the model adjust shared-vs-routed balance
   use_input_residual: true  # adds features identity to MoE output
 
   # Expert configuration: control per-expert behavior
@@ -45,13 +48,42 @@ moe:
       use_density_modulation: true   # NEW: density-adaptive per-pixel modulation (zero-init)
       use_multi_spectral_se: true    # FcaNet-style DCT multi-spectral attention
       ms_num_freqs: 4                # number of DCT frequency components
+      # --- PointLocalizationExpert options (used when use_point_localization_expert: true) ---
+      use_point_aux: true
+      point_hidden: 64
+      point_loss_weight: 1.0
+      point_cls_weight: 1.0
+      point_reg_weight: 0.0002
+      point_cost_class: 1.0
+      point_cost_point: 0.05
+      point_eos_coef: 0.5
+      point_max_candidates: 512
       # --- legacy LocalDetailExpert options (used when use_density_adaptive: false) ---
       use_residual: false            # gated residual (identity pass-through)
       use_strip_convs: true          # parallel 1xK + Kx1 depthwise strip branches
       strip_kernel: 7                # strip kernel size (recommend 5-9)
+    occlusion_reasoning:
+      use_aux: true
+      emb_hidden: 16
+      consistency_weight: 1.0
+      density_threshold: 5.0
+      head_hidden: 128
+      use_residual: true
     global_density:
       use_residual: false   # true = old gated residual (identity pass-through)
       use_density: true     # concatenate density map as additional input
+    density_pattern:
+      use_aux: true
+      ppm_bins: [1, 2, 3, 6]
+      ppm_reduction: 4
+      pattern_num_bins: 8
+      pattern_class_weight: 1.0
+      use_residual: true
+
+  # --- Expert replacement flags (set false for legacy behavior) ---
+  use_point_localization_expert: true    # e0: PointLocalizationExpert
+  use_occlusion_reasoning_expert: true   # e1: OcclusionReasoningExpert
+  use_density_pattern_expert: true       # e2: DensityPatternExpert
 
   # Deformable Cross-Scale Expert — replaces SpatialRelationExpert's W-MSA
   # with DAT-style multi-scale deformable attention.

@@ -460,9 +460,11 @@ class Trainer:
             Path(vis_dir).mkdir(parents=True, exist_ok=True)
 
         for epoch in range(cfg.start_epoch, cfg.epochs):
-            moe_module = getattr(self.model, "moe", None)
+            moe_module = getattr(self.model, "moe", None) or getattr(self.model, "moecount_moe", None)
             if self.use_moe and moe_module is not None:
-                moe_module.update_noise_scale(epoch / cfg.epochs)
+                _update_noise = getattr(moe_module, "update_noise_scale", None)
+                if callable(_update_noise):
+                    _update_noise(epoch / cfg.epochs)
 
             # Inject epoch into density criteria that support it (e.g. MDS warmup)
             _set_epoch = getattr(self.density_criterion, "set_epoch", None)

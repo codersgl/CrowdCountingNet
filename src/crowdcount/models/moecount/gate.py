@@ -8,6 +8,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from crowdcount.models.gcn import DensityGraphBuilder
+from torch_geometric.nn import GCNConv
+
 
 class SparseTop2Gate(nn.Module):
     """Full-resolution dilated router with warmup soft routing and ST Top-2.
@@ -15,6 +18,11 @@ class SparseTop2Gate(nn.Module):
     Optionally accepts a density hint (e.g. a density map) that is projected and
     concatenated with features before the router, giving the gate a direct
     signal about where people are located.
+
+    When ``use_density_bias=True``, an additional density→per-expert bias
+    (zero-init, small Conv3×3) is added directly to the routing logits, providing
+    the gate with an explicit density→routing shortcut that does not compete
+    with the feature-driven router path.
     """
 
     def __init__(
@@ -31,6 +39,7 @@ class SparseTop2Gate(nn.Module):
         eps: float = 1e-8,
         use_density_hint: bool = False,
         density_hidden: int = 8,
+        use_density_bias: bool = False,
     ) -> None:
         super().__init__()
         if num_experts < 2:
@@ -56,6 +65,7 @@ class SparseTop2Gate(nn.Module):
         self.temperature = float(temperature_init)
         self.use_density_hint = bool(use_density_hint)
         self.density_hidden = int(density_hidden)
+        self.use_density_bias = bool(use_density_bias)
 
         self.register_buffer("expert_bias", torch.zeros(num_experts))
         self.logit_scale = nn.Parameter(torch.tensor(1.0))
@@ -65,6 +75,13 @@ class SparseTop2Gate(nn.Module):
                 nn.Conv2d(1, density_hidden, kernel_size=1),
                 nn.ReLU(inplace=True),
             )
+        if self.use_density_bias:
+            self.density_bias_proj = nn.Sequential(
+                nn.Conv2d(1, 8, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(8, num_experts, kernel_size=1),
+            )
+            self.density_bias_gain = nn.Parameter(torch.zeros(1))
         self.router = nn.Sequential(
             nn.Conv2d(router_in, hidden_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -148,6 +165,16 @@ class SparseTop2Gate(nn.Module):
         if not torch.isfinite(self.expert_bias).all():
             self.expert_bias.zero_()
         logits = self.router(features) * self.logit_scale.clamp(0.1, 10.0) + self.expert_bias.view(1, -1, 1, 1)
+
+        # Density→expert direct bias: gives the gate an explicit density→routing
+        # shortcut without competing with the feature-driven router.
+        if self.use_density_bias and density is not None:
+            _db = density
+            if _db.shape[-2:] != features.shape[-2:]:
+                _db = F.interpolate(_db, size=features.shape[-2:], mode="bilinear", align_corners=False)
+            density_bias = self.density_bias_proj(_db)  # [B, K, H, W]
+            logits = logits + density_bias * self.density_bias_gain.tanh()
+
         warmup_active = self._in_warmup()
         temperature = max(float(self.temperature), self.temperature_min)
 
@@ -188,6 +215,89 @@ class SparseTop2Gate(nn.Module):
             "temperature": logits.new_tensor(temperature),
             "warmup_active": warmup_active,
         }
+
+
+class GraphAwareSparseTop2Gate(SparseTop2Gate):
+    """SparseTop2Gate with GNN-based neighbourhood context for routing.
+
+    Before the router computes per-pixel logits, a single GCNConv layer
+    aggregates features from k-NN neighbours (graph built via density
+    similarity), giving each pixel visibility into what similar regions
+    are doing.  A zero-init residual gate keeps the module identical to a
+    standard SparseTop2Gate at training start, so graph context is
+    gradually adopted without destabilising early optimisation.
+
+    Parameters
+    ----------
+    graph_k : int
+        Number of nearest neighbours for the density-based k-NN graph.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        hidden_channels: int = 128,
+        num_experts: int = 3,
+        top_k: int = 2,
+        temperature_init: float = 1.0,
+        temperature_min: float = 0.1,
+        temperature_decay: float = 0.99998,
+        warmup_fraction: float = 0.2,
+        warmup_epochs: int | None = None,
+        eps: float = 1e-8,
+        use_density_hint: bool = False,
+        density_hidden: int = 8,
+        use_density_bias: bool = False,
+        graph_k: int = 4,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            num_experts=num_experts,
+            top_k=top_k,
+            temperature_init=temperature_init,
+            temperature_min=temperature_min,
+            temperature_decay=temperature_decay,
+            warmup_fraction=warmup_fraction,
+            warmup_epochs=warmup_epochs,
+            eps=eps,
+            use_density_hint=use_density_hint,
+            density_hidden=density_hidden,
+            use_density_bias=use_density_bias,
+        )
+        self.graph_k = int(graph_k)
+        self.graph_builder = DensityGraphBuilder(k=self.graph_k)
+        self.gcn_conv = GCNConv(in_channels, in_channels)
+        self.graph_gate = nn.Parameter(torch.zeros(1))
+
+    def _apply_graph_context(
+        self, features: torch.Tensor, density: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Build density k-NN graph, run 1-layer GCN, return zero-init residual."""
+        B, C, H, W = features.shape
+        graph_input = (
+            density if density is not None
+            else features.mean(dim=1, keepdim=True)
+        )
+        if graph_input.shape[-2:] != (H, W):
+            graph_input = F.interpolate(
+                graph_input, size=(H, W), mode="bilinear", align_corners=False
+            )
+        edge_index, _, N_total, _, _ = self.graph_builder.build_batch_graph(
+            graph_input
+        )
+        nodes = features.permute(0, 2, 3, 1).reshape(N_total, C)
+        graph_feat = self.gcn_conv(nodes, edge_index)
+        graph_feat = F.relu(graph_feat)
+        graph_feat = graph_feat.view(B, H, W, C).permute(0, 3, 1, 2)
+        return features + self.graph_gate.tanh() * graph_feat
+
+    def forward(
+        self, features: torch.Tensor, density: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor | bool]:
+        # GCN neighbourhood aggregation before routing (zero-init → identity at start)
+        enhanced = self._apply_graph_context(features, density)
+        return super().forward(enhanced, density=density)
 
 
 class PixelSoftGate(nn.Module):
@@ -331,6 +441,15 @@ class MultiScaleSparseTop2Gate(SparseTop2Gate):
         if not torch.isfinite(self.expert_bias).all():
             self.expert_bias.zero_()
         logits = self.router(compressed) * self.logit_scale.clamp(0.1, 10.0) + self.expert_bias.view(1, -1, 1, 1)
+
+        # Density→expert direct bias (inherited from SparseTop2Gate)
+        if self.use_density_bias and density is not None:
+            _db = density
+            if _db.shape[-2:] != features.shape[-2:]:
+                _db = F.interpolate(_db, size=features.shape[-2:], mode="bilinear", align_corners=False)
+            density_bias = self.density_bias_proj(_db)
+            logits = logits + density_bias * self.density_bias_gain.tanh()
+
         warmup_active = self._in_warmup()
         temperature = max(float(self.temperature), self.temperature_min)
 

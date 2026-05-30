@@ -108,9 +108,35 @@ src/crowdcount/
 
 **MoECountNet forward flow**: Backbone(C2/C3/C4) → BiFPN Neck → HeterogeneousSparseMoE (shared expert + 3 routed experts with SparseTop2Gate Gumbel-Softmax routing) → optional GCN refine → DensityHead + PointPredHead.
 
-The three experts are: `LocalDetailExpert` (stride-8, DWConv + SE), `DeformableCrossScaleExpert` (stride-8, DAT-style multi-scale deformable attention; replaces `SpatialRelationExpert`'s W-MSA when `use_deformable: true`), `GlobalDensityExpert` (stride-32, large-kernel DWConv + SE). All experts internally handle their own downsampling via SPD. `SparseTop2Gate` provides Gumbel-Softmax Top-2 sparse routing with temperature annealing (warmup → hard routing with straight-through gradients).
+The three default routed experts are now **task-oriented** (controlled by `use_point_localization_expert`, `use_occlusion_reasoning_expert`, `use_density_pattern_expert`):
+
+| Slot | Flag | Expert | Scale | Description |
+|------|------|--------|-------|-------------|
+| e0 | `use_point_localization_expert` (default: true in dsgcnet.yaml) | **DensityAdaptiveLocalExpert** (or PointLocalizationExpert mode) | stride-8 | Multi-scale dilated convs (d=1,2,3) + FFN + density-adaptive modulation. When `expert_pl_use_point_aux=true`, adds an internal point head (Hungarian matching + focal loss) for per-pixel point localization. |
+| e1 | `use_occlusion_reasoning_expert` (default: true) | **OcclusionReasoningExpert** (or DeformableCrossScaleExpert) | stride-8 | Visibility assessment + 3×3 neighborhood context completion for occluded heads. Falls back to `DeformableCrossScaleExpert` (DAT-style multi-scale deformable attention) when disabled, or `SpatialRelationExpert` (W-MSA) when `use_deformable_expert=false`. |
+| e2 | `use_density_pattern_expert` (default: true) | **DensityPatternExpert** (or GlobalDensityExpert) | stride-32 | PSPNet PPM + density bin classifier (8 bins). Falls back to `GlobalDensityExpert` (large-kernel DWConv + SE) when disabled. |
+
+All three flags false → legacy experts: `LocalDetailExpert` / `SpatialRelationExpert` / `GlobalDensityExpert`.
+
+All experts internally handle downsampling via SPD. **SharedExpert** (always active, × `shared_scale`) provides a common gradient highway. Recent enhancement: deepened to 3 residual blocks (`shared_num_blocks: 3`) with learnable `shared_scale` (default 0.5, `shared_scale_learnable: true`).
+
+**Expert density dispatch** (`needs_density`): Each expert declares whether it receives the predicted density map as a kwarg. DensityAdaptiveLocalExpert uses it via a **zero-init modulation gate** (`density.detach()` — feed-forward only, no gradient feedback). GlobalDensityExpert concat-fuses it via Conv1×1 (gradient flows). DensityPatternExpert receives it for the density-bin classifier.
+
+**Expert auxiliary supervision** (`compute_aux_loss`): Each expert can contribute auxiliary losses during training — e0 point localization loss, e1 occlusion consistency loss, e2 density bin classification loss. These are collected in `moe_aux_losses` and summed into `total_aux`.
 
 **MoECountNet loss**: `MoECountLoss` composites: primary density loss (BayesianLoss or ProximalMappingLoss) + CountLoss (L1) + LoadBalanceLoss (CV² importance+batch load) + optional PointPredHead auxiliary loss (Hungarian matching + focal) + optional SinkhornOT loss + Total Variation smoothness regularizer (`tv.weight: 0.0005`) + density map MSE supervision against pre-computed GT density maps (`density_map.weight: 0.1`). Balance loss decays linearly to 0 after warmup.
+
+**Gate variants**: Two router types in `gate.py`:
+- **SparseTop2Gate** (default in DSGCNet `fusion_mode=moe`): Gumbel-Softmax Top-2 sparse routing with temperature annealing. Uses conv3×3 + dilated conv3×3 router. Supports `use_density_hint` (concat density features) and `use_density_bias` (per-expert logit bias from density). During warmup, all experts contribute with soft weights; after warmup, hard Top-2 with straight-through gradients.
+- **PixelSoftGate**: HMoDE-style per-pixel softmax — all experts always contribute, no sparsity. Simpler, no temperature schedule. Default in standalone MoECountNet (`configs/model/moecount.yaml`).
+- **MultiScaleSparseTop2Gate**: Extends SparseTop2Gate with stride-8/16/32 pooled features for the router.
+
+**DSGCNet `fusion_mode=moe` integration**: When `model.fusion_mode=moe`, DSGCNet replaces the dual-stream GCN with `HeterogeneousSparseMoE` as a drop-in module:
+```
+features_pa [B,256,H/8,W/8] → HeterogeneousSparseMoE → feature_fl [B,256,H/8,W/8]
+                                ↑ density as conditioning
+```
+The MoE output feeds directly into the standard DSGCNet prediction trunk (SharedPredictionTrunk → Regression + Classification heads). Density map is produced by DSGCNet's own `Density_pred` head (not MoECountNet's), and passed to the MoE as a conditioning signal. MoE auxiliary losses (`moe_aux_losses`, `total_aux`) are merged into the DSGCNet training loop.
 
 ### Plugins (experimental modules for DSGCNet)
 
@@ -192,6 +218,8 @@ model:
 - MoECountNet uses SparseTop2Gate with Gumbel-Softmax temperature annealing. The gate starts in soft-routing warmup (all experts contribute with soft weights), then transitions to hard Top-2 routing with straight-through gradients. `model.moe.temperature_init`, `temperature_decay`, `warmup_epochs` control the schedule.
 - Balance loss (CV² of expert load/importance) decays linearly to 0 over `decay_epochs` after warmup
 - The deformable expert's residual gate is initialized to 0 (identity pass-through), so it needs many epochs to "warm up" — expect e2 gate load to start low and gradually increase
+- **SharedExpert** now uses `shared_num_blocks` (default 3) residual blocks instead of a single conv. This provides a stronger gradient highway; `shared_scale` is learnable by default (`shared_scale_learnable: true`) so the model can balance shared vs routed contributions
+- **Expert `needs_density` dispatch**: Experts declare `needs_density = True` (class attribute) to receive the predicted density map. DensityAdaptiveLocalExpert uses `.detach()` for feed-forward modulation (no gradient feedback to the density head). GlobalDensityExpert concat-fuses density with features (gradient flows through the fusion conv)
 - DSGCNet default `clip_max_norm=0.1`; MoECountNet uses `clip_max_norm=5.0`
 - MoECountNet uses `mixed_precision.enabled: true` by default; DSGCNet does not
 - MoECountNet active development is on branch `exp1`
@@ -200,6 +228,8 @@ model:
 
 - `configs/moecount_config.yaml`: `epochs: 1500`, `weight_decay: 0.0001`, `use_pml: true` (ProximalMappingLoss; set `false` for BayesianLoss)
 - `configs/model/moecount.yaml`: `output_stride: 8`, `backbone.arch: convnext_tiny`, `moe.top_k: 2`, `head.final_activation: softplus`, `head.final_weight_std: 0.01`
+- `configs/model/dsgcnet.yaml` (DSGCNet `fusion_mode=moe` path): uses SparseTop2Gate with `moecount_moe.*` config; `shared_scale: 0.5`, `shared_num_blocks: 3`, `shared_scale_learnable: true`
 - The default primary density loss is ProximalMappingLoss (`use_pml: true`). When using BayesianLoss (`use_pml: false`), it uses `use_background: true`, `bg_ratio: 0.15`
 - Point prediction auxiliary head is enabled by default (`head.use_point_head: true`)
 - Sinkhorn OT loss is disabled by default (`moecount_loss.ot.enabled: false`)
+- Expert replacement flags (dsgcnet.yaml): all three default to `true` (PointLocalization, OcclusionReasoning, DensityPattern). Set all to `false` for legacy LocalDetail/SpatialRelation/GlobalDensity experts.

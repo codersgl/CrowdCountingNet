@@ -1386,9 +1386,9 @@ class DSGCnet(nn.Module):
                 return getattr(_sdf_cfg, key, default) if _sdf_cfg is not None else default
 
             self.scale_decoupled_fusion = ScaleDecoupledFusion(
-                c2_channels=512,  # VGG body3: stride-8, 512ch
-                c3_channels=512,  # VGG body4: stride-16, 512ch
-                c4_channels=512,  # VGG body4→pool: stride-32, 512ch
+                c2_channels=256,  # VGG body2: stride-4, 256ch
+                c3_channels=512,  # VGG body3: stride-8, 512ch
+                c4_channels=512,  # VGG body4: stride-16, 512ch
                 unified_dim=int(_sc("unified_dim", 256)),
                 cnn_dilations=tuple(int(d) for d in _sc("cnn_dilations", [1, 2, 3])),
                 cnn_groups=int(_sc("cnn_groups", 16)),
@@ -2199,16 +2199,17 @@ class DSGCnet(nn.Module):
         if self.use_scale_decoupled:
             assert self.scale_decoupled_fusion is not None
             assert self.density_pred is not None
-            # Map VGG backbone features to expected scale-decoupled streams:
-            # features_list: [body1(s2), body2(s4,256), body3(s8,512), body4(s16,512)]
-            # scale_decoupled expects: s8, s16, s32
-            # Use body3 as s8, body4 as s16, body4→pool as s32
-            c3_s8 = features_list[2]   # VGG body3: stride-8, 512ch
-            c4_s16 = features_list[3]  # VGG body4: stride-16, 512ch
-            c5_s32 = F.adaptive_avg_pool2d(
-                c4_s16, (max(1, c4_s16.shape[-2] // 2), max(1, c4_s16.shape[-1] // 2))
+            # VGG backbone features: [body1(s2), body2(s4,256), body3(s8,512), body4(s16,512)]
+            # Scale-decoupled mapping: s4→CNN, s8→GCN, s16→Transformer
+            feature_fl, _ = self.scale_decoupled_fusion(
+                features_list[1],  # body2: stride-4, 256ch
+                features_list[2],  # body3: stride-8, 512ch
+                features_list[3],  # body4: stride-16, 512ch
             )
-            feature_fl, _ = self.scale_decoupled_fusion(c3_s8, c4_s16, c5_s32)
+            # Downsample to stride-8 for downstream heads (anchor points are fixed at s8)
+            target_size = features_list[2].shape[-2:]
+            if feature_fl.shape[-2:] != target_size:
+                feature_fl = F.adaptive_avg_pool2d(feature_fl, target_size)
             features_pa = feature_fl
             features_pa = F.dropout2d(
                 features_pa, p=self.neck_dropout, training=self.training

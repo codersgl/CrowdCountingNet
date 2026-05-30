@@ -213,7 +213,8 @@ class TestScaleDecoupledFusion:
         c3 = torch.randn(2, 512, 14, 14)
         c4 = torch.randn(2, 512, 7, 7)
         f, aux = fusion(c2, c3, c4)
-        assert f.shape == (2, 256, 28, 28)
+        # Q←GCN(c3) → output follows Q resolution (14×14)
+        assert f.shape == (2, 256, 14, 14)
         assert isinstance(aux, dict)
 
     def test_with_modulation(self, fusion):
@@ -221,16 +222,17 @@ class TestScaleDecoupledFusion:
         c3 = torch.randn(1, 512, 14, 14)
         c4 = torch.randn(1, 512, 7, 7)
         f, _ = fusion(c2, c3, c4)
-        density = torch.rand(1, 1, 28, 28)
+        density = torch.rand(1, 1, 28, 28)  # density interpolated to 14×14 internally
         f_mod = fusion.density_modulation(f, density)
-        assert f_mod.shape == (1, 256, 28, 28)
+        assert f_mod.shape == (1, 256, 14, 14)
 
     def test_varying_sizes(self, fusion):
         c2 = torch.randn(1, 256, 32, 32)
         c3 = torch.randn(1, 512, 16, 16)
         c4 = torch.randn(1, 512, 8, 8)
         f, _ = fusion(c2, c3, c4)
-        assert f.shape == (1, 256, 32, 32)
+        # Q←GCN(c3) → output at 16×16
+        assert f.shape == (1, 256, 16, 16)
 
     def test_training_mode(self, fusion):
         fusion.train()
@@ -238,7 +240,8 @@ class TestScaleDecoupledFusion:
         c3 = torch.randn(2, 512, 14, 14)
         c4 = torch.randn(2, 512, 7, 7)
         f, aux = fusion(c2, c3, c4)
-        assert f.shape == (2, 256, 28, 28)
+        # Q←GCN(c3) → output at 14×14
+        assert f.shape == (2, 256, 14, 14)
 
     def test_no_nan(self, fusion):
         c2 = torch.randn(2, 256, 28, 28)

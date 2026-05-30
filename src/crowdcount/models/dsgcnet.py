@@ -2200,16 +2200,13 @@ class DSGCnet(nn.Module):
             assert self.scale_decoupled_fusion is not None
             assert self.density_pred is not None
             # VGG backbone features: [body1(s2), body2(s4,256), body3(s8,512), body4(s16,512)]
-            # Scale-decoupled mapping: s4→CNN, s8→GCN, s16→Transformer
+            # Scale-decoupled: s4→CNN, s8→GCN(Q), s16→Transformer
+            # Q←s8(GCN), K/V←s4(CNN)+s16(Transformer) → output naturally at s8
             feature_fl, _ = self.scale_decoupled_fusion(
-                features_list[1],  # body2: stride-4, 256ch
-                features_list[2],  # body3: stride-8, 512ch
-                features_list[3],  # body4: stride-16, 512ch
+                features_list[1],  # body2: stride-4, 256ch → K/V
+                features_list[2],  # body3: stride-8, 512ch → Q
+                features_list[3],  # body4: stride-16, 512ch → K/V
             )
-            # Downsample to stride-8 for downstream heads (anchor points are fixed at s8)
-            target_size = features_list[2].shape[-2:]
-            if feature_fl.shape[-2:] != target_size:
-                feature_fl = F.adaptive_avg_pool2d(feature_fl, target_size)
             features_pa = feature_fl
             features_pa = F.dropout2d(
                 features_pa, p=self.neck_dropout, training=self.training

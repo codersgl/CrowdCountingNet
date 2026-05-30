@@ -578,10 +578,12 @@ class ScaleDecoupledFusion(nn.Module):
             f: fused features [B, unified_dim, H/8, W/8]
             aux: auxiliary dict (reserved for future use)
         """
-        f_s8 = self.cnn_stream(c2)
-        f_s16 = self.gcn_stream(c3, density=density)
-        f_s32 = self.transformer_stream(c4)
+        f_cnn = self.cnn_stream(c2)
+        f_gcn = self.gcn_stream(c3, density=density)
+        f_trans = self.transformer_stream(c4)
 
-        f = self.cross_attention(f_s8, f_s16, f_s32)
+        # Q ← GCN (mid-resolution queries local + global context)
+        # K/V ← [CNN (high-res local), Transformer (low-res global)]
+        f = self.cross_attention(f_gcn, f_cnn, f_trans)
 
         return f, {}

@@ -397,6 +397,7 @@ class HeterogeneousSparseMoE(nn.Module):
         deformable_max_offset: float = 8.0,
         deformable_dropout: float = 0.1,
         deformable_use_se: bool = True,
+        deformable_use_density_bias: bool = False,
         use_input_residual: bool = True,
         expert_local_detail_use_residual: bool = True,
         expert_global_density_use_residual: bool = True,
@@ -425,6 +426,7 @@ class HeterogeneousSparseMoE(nn.Module):
                 max_offset=deformable_max_offset,
                 dropout=deformable_dropout,
                 use_se=deformable_use_se,
+                use_density_bias=deformable_use_density_bias,
             )
         else:
             spatial_expert = SpatialRelationExpert(channels)
@@ -486,7 +488,7 @@ class HeterogeneousSparseMoE(nn.Module):
         expert_outputs = torch.stack(
             [
                 expert(features, density=density)
-                if isinstance(expert, GlobalDensityExpert)
+                if isinstance(expert, (GlobalDensityExpert, DeformableCrossScaleExpert))
                 else expert(features)
                 for expert in self.experts
             ],

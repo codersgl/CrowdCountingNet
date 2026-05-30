@@ -1352,6 +1352,9 @@ class DSGCnet(nn.Module):
                 expert_global_density_use_density=bool(
                     _def("expert_global_density_use_density", True)
                 ),
+                deformable_use_density_bias=bool(
+                    _def("deformable_use_density_bias", False)
+                ),
             )
             self.esca = None
             self.moe = None

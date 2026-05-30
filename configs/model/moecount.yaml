@@ -57,6 +57,7 @@ moe:
     max_offset: 8.0           # max offset in stride-8 pixels (tanh clamp)
     dropout: 0.1              # attention + FFN dropout
     use_se: true              # SE channel attention after FFN
+    use_density_bias: false   # density-similarity bias in deformable attention (beta=0 at init)
 
 head:
   hidden_channels: 128

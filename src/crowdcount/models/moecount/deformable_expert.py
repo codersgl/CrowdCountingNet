@@ -53,6 +53,7 @@ class DeformableCrossScaleExpert(nn.Module):
         ffn_expansion: int = 4,
         dropout: float = 0.1,
         use_se: bool = True,
+        use_density_bias: bool = False,
     ) -> None:
         super().__init__()
         if channels % num_heads != 0:
@@ -129,6 +130,9 @@ class DeformableCrossScaleExpert(nn.Module):
         self.level_embeds = nn.Parameter(
             torch.zeros(num_scale_levels, num_sampling_points)
         )
+        self.use_density_bias = use_density_bias
+        if use_density_bias:
+            self.density_beta = nn.Parameter(torch.tensor(0.0))
 
         # Optional SE channel attention after FFN
         if use_se:
@@ -141,11 +145,14 @@ class DeformableCrossScaleExpert(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, features: torch.Tensor, density: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Forward pass.
 
         Args:
             features: [B, C, H, W] stride-8 fused neck output.
+            density:  [B, 1, H, W] optional density map for density-biased attention.
 
         Returns:
             [B, C, H, W] refined features at the same resolution.
@@ -193,6 +200,19 @@ class DeformableCrossScaleExpert(nn.Module):
 
         all_sampled_k: list[torch.Tensor] = []
         all_sampled_v: list[torch.Tensor] = []
+        all_sampled_d: list[torch.Tensor] = []  # density at sampled positions
+
+        # Pre-sample query density once (stride-8 density map at base grid)
+        density_q: torch.Tensor | None = None
+        if self.use_density_bias and density is not None:
+            if density.shape[1] != 1:
+                density = density.mean(dim=1, keepdim=True)
+            if density.shape[-2:] != features.shape[-2:]:
+                density = F.interpolate(
+                    density, size=features.shape[-2:],
+                    mode="bilinear", align_corners=False,
+                )
+            density_q = density.detach().flatten(2).transpose(1, 2)  # [B, N, 1]
 
         for lvl in range(self.num_levels):
             feat = normed_maps[lvl]
@@ -224,6 +244,15 @@ class DeformableCrossScaleExpert(nn.Module):
             all_sampled_k.append(k_s)
             all_sampled_v.append(v_s)
 
+            # Sample density at the same offset positions (if enabled)
+            if self.use_density_bias and density is not None:
+                d_s = F.grid_sample(
+                    density, coords_flat, mode="bilinear",
+                    padding_mode="border", align_corners=True,
+                )
+                d_s = d_s.squeeze(-1).transpose(1, 2).reshape(B, N, self.num_points, 1)
+                all_sampled_d.append(d_s)
+
         k_all = torch.cat(all_sampled_k, dim=2)  # [B, N, L·K, C]
         v_all = torch.cat(all_sampled_v, dim=2)  # [B, N, L·K, C]
 
@@ -254,6 +283,14 @@ class DeformableCrossScaleExpert(nn.Module):
         distance = distance.reshape(B, N, -1)  # [B, N, L·K]
         distance_lambda = self.distance_lambda.clamp_min(0.0)
         attn = attn - distance_lambda * distance.unsqueeze(1)
+
+        # Density similarity bias: prefer sampling points with similar density.
+        # density_beta starts at 0 → identity behaviour at training start.
+        if self.use_density_bias and density_q is not None and all_sampled_d:
+            d_k = torch.cat(all_sampled_d, dim=2)  # [B, N, L·K, 1]
+            density_diff = (density_q.unsqueeze(2) - d_k).abs()  # [B, N, L·K, 1]
+            density_diff = density_diff.squeeze(-1)  # [B, N, L·K]
+            attn = attn - self.density_beta * density_diff.unsqueeze(1)
 
         attn = F.softmax(attn.clamp(-1e4, 1e4), dim=-1)
         attn = self.attn_drop(attn)

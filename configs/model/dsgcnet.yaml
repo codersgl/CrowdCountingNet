@@ -449,7 +449,7 @@ semc:
 # NOTE: alpha is only used when eos_coef-based class_weight is NOT provided.
 # Since class_weight (empty_weight) is always set, alpha is effectively unused
 # and foreground/background balance is controlled by eos_coef instead.
-use_focal_loss: true
+use_focal_loss: false
 focal_loss:
   alpha: 0.75 # Foreground weight (only effective without class_weight)
   gamma: 2.0 # Focusing parameter; higher = more focus on hard examples
@@ -615,7 +615,8 @@ moecount_moe:
   lambda_load: 0.01
   shared_scale: 0.3
   use_input_residual: true
-  use_deformable_expert: false     # true -> DeformableCrossScaleExpert instead of window-MSA
+  use_deformable_expert: true      # true -> DeformableCrossScaleExpert instead of window-MSA
+  deformable_use_density_bias: true  # density-biased attention in deformable expert
   aux_loss_weight: 0.01            # global multiplier applied in training loop
   # Expert config (mirrors moecount.yaml defaults)
   expert_local_detail_use_residual: false  # false = direct output; true = gated residual (starts identity)

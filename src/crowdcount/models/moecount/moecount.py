@@ -152,6 +152,7 @@ def build_moecount(cfg: DictConfig) -> MoECountNet:
         deformable_max_offset=float(getattr(deformable_cfg, "max_offset", 8.0)),
         deformable_dropout=float(getattr(deformable_cfg, "dropout", 0.1)),
         deformable_use_se=bool(getattr(deformable_cfg, "use_se", True)),
+        deformable_use_density_bias=bool(getattr(deformable_cfg, "use_density_bias", False)),
         use_input_residual=bool(getattr(moe_cfg, "use_input_residual", True)),
         expert_local_detail_use_residual=bool(getattr(local_detail_cfg, "use_residual", True) if local_detail_cfg is not None else True),
         expert_global_density_use_residual=bool(getattr(global_density_cfg, "use_residual", True) if global_density_cfg is not None else True),

@@ -9,7 +9,7 @@ from crowdcount.plugins.depth_residual_gating import (
 from crowdcount.plugins.isfm.depth_fusion import DepthFusionModule
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.mamba_vss_dual_fusion import MambaVSSDualFusion
-from crowdcount.plugins.moe import ESCA, MoE
+from crowdcount.plugins.moe import ESCA, LightMoE
 from crowdcount.plugins.sdd_moe import SDDMoE
 from crowdcount.plugins.msaa import (
     FPNAttentionGate,
@@ -37,6 +37,6 @@ __all__ = [
     "FPNAttentionGate",
     "FPNSpatialAttention",
     "ESCA",
-    "MoE",
+    "LightMoE",
     "SDDMoE",
 ]

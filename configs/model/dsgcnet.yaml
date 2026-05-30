@@ -98,7 +98,7 @@ clip_prompt_density:
 use_rccformer_neck: false
 rccformer_deab_blocks: 2 # Number of DEAB blocks in density prediction branch
 
-# Feature fusion branch selection: gcn | esca_moe | gcn_moe | graph_attn_moe | graph_moe | mamba_moe | mamba_vss_dual | sdd_moe | sa_dgat | deformable_dual | moe
+# Feature fusion branch selection: gcn | gcn_moe | graph_attn_moe | graph_moe | mamba_moe | mamba_vss_dual | sdd_moe | sa_dgat | deformable_dual | moe
 # gcn_moe: GCN dual-stream + LightMoE post-refinement (recommended)
 # graph_attn_moe: 2-expert MoE (local conv + graph-biased attention)
 # graph_moe: 5-expert unified GraphMoE replacement for dual-stream GCN
@@ -198,14 +198,10 @@ deformable_dual:
   debug: false # include sample coordinates in deformable_dual_aux
 
 moe:
-  top_k: 3 # all experts active (soft routing); kept for API compat
-  temperature_init: 1.0
-  temperature_min: 0.4
-  temperature_decay: 0.99998
-  aux_loss_weight: 0.2
-  lambda_balance: 0.01
+  # LightMoE post-GCN refinement config (used when fusion_mode: gcn_moe)
   grid_stride: 4
   use_density_hint: true
+  lambda_balance: 0.01
 
 # Graph-Aware MoE (only used when fusion_mode: graph_attn_moe)
 graph_attn_moe:

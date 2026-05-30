@@ -55,7 +55,7 @@ from crowdcount.plugins.geo_prior import DepthGeoPriorAttention
 from crowdcount.models.backbone import DepthBackbone_VGG
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.mamba_vss_dual_fusion import MambaVSSDualFusion
-from crowdcount.plugins.moe import ESCA, MoE, LightMoE
+from crowdcount.plugins.moe import LightMoE
 from crowdcount.plugins.graph_moe import GraphAwareMoE, GraphMoE
 from crowdcount.plugins.sdd_moe import SDDMoE
 from crowdcount.plugins.sa_dgat import SADGATFusion
@@ -279,7 +279,6 @@ class DSGCnet(nn.Module):
             regularization_drop_path, "drop_path"
         )
         self.fusion_mode = fusion_mode
-        self.use_moe = fusion_mode == "esca_moe"
         self.use_gcn_moe = fusion_mode == "gcn_moe"
         self.use_graph_attn_moe = fusion_mode == "graph_attn_moe"
         self.use_graph_moe = fusion_mode == "graph_moe"
@@ -501,7 +500,6 @@ class DSGCnet(nn.Module):
 
         if self.fusion_mode not in {
             "gcn",
-            "esca_moe",
             "gcn_moe",
             "graph_attn_moe",
             "graph_moe",
@@ -513,7 +511,7 @@ class DSGCnet(nn.Module):
             "moe",
         }:
             raise ValueError(
-                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'esca_moe', 'gcn_moe', 'graph_attn_moe', 'graph_moe', 'mamba_moe', 'mamba_vss_dual', 'sdd_moe', 'sa_dgat', 'deformable_dual', or 'moe'"
+                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'gcn_moe', 'graph_attn_moe', 'graph_moe', 'mamba_moe', 'mamba_vss_dual', 'sdd_moe', 'sa_dgat', 'deformable_dual', or 'moe'"
             )
         if self.feature_stream_type not in {"gcn", "transformer", "window_transformer"}:
             raise ValueError(
@@ -909,49 +907,7 @@ class DSGCnet(nn.Module):
             if self.use_fuse_to_gcn:
                 self.density_fuse = MultiScaleDensityFusion(num_scales=4)
 
-        if self.use_moe:
-            top_k = int(getattr(moe_cfg, "top_k", 2)) if moe_cfg is not None else 2
-            temperature_init = (
-                float(getattr(moe_cfg, "temperature_init", 1.0))
-                if moe_cfg is not None
-                else 1.0
-            )
-            temperature_min = (
-                float(getattr(moe_cfg, "temperature_min", 0.4))
-                if moe_cfg is not None
-                else 0.4
-            )
-            lambda_balance = (
-                float(getattr(moe_cfg, "lambda_balance", 0.01))
-                if moe_cfg is not None
-                else 0.01
-            )
-            use_density_hint = (
-                bool(getattr(moe_cfg, "use_density_hint", True))
-                if moe_cfg is not None
-                else True
-            )
-            grid_stride = (
-                int(getattr(moe_cfg, "grid_stride", 4)) if moe_cfg is not None else 4
-            )
-
-            self.esca: ESCA | None = ESCA(256)
-            self.moe: MoE | None = MoE(
-                input_dim=256,
-                top_k=top_k,
-                temperature_init=temperature_init,
-                temperature_min=temperature_min,
-                lambda_balance=lambda_balance,
-                use_density_hint=use_density_hint,
-                grid_stride=grid_stride,
-            )
-            self.density_gcn = None
-            self.feature_gcn = None
-            self.alpha = None
-            self.gm = None
-            self.graph_attn_moe = None
-            self.mamba_moe = None
-        elif self.use_graph_moe:
+        if self.use_graph_moe:
             _gm_cfg = graph_moe_cfg
             self.graph_moe = GraphMoE(
                 input_dim=256,
@@ -1076,8 +1032,7 @@ class DSGCnet(nn.Module):
                 if _gm_cfg
                 else False,
             )
-            self.esca = None
-            self.moe = None
+
             self.density_gcn = None
             self.feature_gcn = None
             self.alpha = None
@@ -1131,8 +1086,7 @@ class DSGCnet(nn.Module):
                 if _gam
                 else False,
             )
-            self.esca = None
-            self.moe = None
+
             self.density_gcn = None
             self.feature_gcn = None
             self.alpha = None
@@ -1167,8 +1121,7 @@ class DSGCnet(nn.Module):
                 else False,
                 d_spectral=int(getattr(_mmm, "d_spectral", 256)) if _mmm else 256,
             )
-            self.esca = None
-            self.moe = None
+
             self.density_gcn = None
             self.feature_gcn = None
             self.alpha = None
@@ -1224,8 +1177,7 @@ class DSGCnet(nn.Module):
                 if _mvd
                 else 1e-3,
             )
-            self.esca = None
-            self.moe = None
+
             self.density_gcn = None
             self.feature_gcn = None
             self.alpha = None
@@ -1240,8 +1192,7 @@ class DSGCnet(nn.Module):
                 in_channels=256,
                 cfg=sdd_moe_cfg,
             )
-            self.esca = None
-            self.moe = None
+
             self.density_gcn = None
             self.feature_gcn = None
             self.alpha = None
@@ -1278,8 +1229,7 @@ class DSGCnet(nn.Module):
                 residual_gate_init=float(_get_dd("residual_gate_init", 0.001)),
                 debug=bool(_get_dd("debug", False)),
             )
-            self.esca = None
-            self.moe = None
+
             self.density_gcn = None
             self.feature_gcn = None
             self.alpha = None
@@ -1314,8 +1264,7 @@ class DSGCnet(nn.Module):
                 use_cross_scale=bool(_get("use_cross_scale", True)),
                 dropout=float(_get("dropout", 0.1)),
             )
-            self.esca = None
-            self.moe = None
+
             self.density_gcn = None
             self.feature_gcn = None
             self.alpha = None
@@ -1356,8 +1305,7 @@ class DSGCnet(nn.Module):
                     _def("deformable_use_density_bias", False)
                 ),
             )
-            self.esca = None
-            self.moe = None
+
             self.density_gcn = None
             self.feature_gcn = None
             self.alpha = None
@@ -1502,8 +1450,7 @@ class DSGCnet(nn.Module):
                 self.gm = None
             else:
                 self.density_adaptive_fusion = None
-            self.esca = None
-            self.moe = None
+
             self.graph_attn_moe = None
             self.mamba_moe = None
 
@@ -1844,10 +1791,6 @@ class DSGCnet(nn.Module):
             else False
         )
         if _use_semc:
-            if self.use_moe:
-                raise ValueError(
-                    "SEMCEnhancer is currently supported only for fusion_mode='gcn'"
-                )
             _semc_cfg = (
                 getattr(_model_cfg, "semc", None) if _model_cfg is not None else None
             )
@@ -1960,8 +1903,7 @@ class DSGCnet(nn.Module):
 
     def supports_moe(self) -> bool:
         return (
-            (self.use_moe and self.moe is not None)
-            or (self.use_mamba_moe and self.mamba_moe is not None)
+            (self.use_mamba_moe and self.mamba_moe is not None)
             or (self.use_mamba_vss_dual and self.mamba_vss_dual is not None)
             or (self.use_sdd_moe and self.sdd_moe is not None)
             or self.light_moe is not None
@@ -1985,15 +1927,9 @@ class DSGCnet(nn.Module):
             return self.mamba_vss_dual.get_router_parameters()
         if self.moecount_moe is not None:
             return list(self.moecount_moe.gate.parameters())
-        if self.moe is None:
-            return []
-        return list(self.moe.context_encoder.parameters()) + list(
-            self.moe.router.parameters()
-        )
+        return []
 
     def update_moe_temperature(self, decay_rate: float = 0.9999) -> None:
-        if self.moe is not None:
-            self.moe.update_temperature(decay_rate=decay_rate)
         if self.sdd_moe is not None:
             self.sdd_moe.update_temperature(decay_rate=decay_rate)
         if self.moecount_moe is not None:
@@ -2291,16 +2227,7 @@ class DSGCnet(nn.Module):
             )
             features_pa = features_pa * pre_mask
 
-        if self.use_moe:
-            assert self.esca is not None and self.moe is not None
-            esca_feature = self.esca(features_pa)
-            feature_fl, moe_aux_losses, moe_weights = self.moe(
-                esca_feature, density_hint=density, training=self.training
-            )
-            output_dict["moe_aux_losses"] = moe_aux_losses
-            output_dict["moe_aux_total"] = moe_aux_losses.get("total_aux")
-            output_dict["moe_weights"] = moe_weights
-        elif self.use_graph_moe:
+        if self.use_graph_moe:
             assert self.graph_moe is not None
             feature_fl, graph_aux_losses, graph_weights = self.graph_moe(
                 features_pa,
@@ -2443,7 +2370,7 @@ class DSGCnet(nn.Module):
                     )
 
         # LightMoE post-GCN conditional refinement (gcn_moe mode)
-        if self.light_moe is not None and not self.use_moe and not self.use_moecount_moe:
+        if self.light_moe is not None and not self.use_moecount_moe:
             feature_fl, light_aux, light_weights = self.light_moe(
                 feature_fl, density_hint=density, training=self.training
             )
@@ -2477,7 +2404,7 @@ class DSGCnet(nn.Module):
             )
 
         # SEMC post-GCN enhancement (optional, disabled by default)
-        if self.semc_enhancer is not None and not self.use_moe and not self.use_moecount_moe:
+        if self.semc_enhancer is not None and not self.use_moecount_moe:
             feature_fl = self.semc_enhancer(
                 feature_fl,
                 density if self._semc_use_density_hint else None,

@@ -21,7 +21,7 @@ from crowdcount.models.semc_blocks import SEMCEnhancer
 from crowdcount.plugins.gm import GateMechanism, SpatialGateMechanism
 from crowdcount.plugins.mamba_moe import MambaMoEFusion
 from crowdcount.plugins.mamba_vss_dual_fusion import MambaVSSDualFusion
-from crowdcount.plugins.moe import ESCA, MoE, LightMoE
+from crowdcount.plugins.moe import LightMoE
 from crowdcount.plugins.msaa import MsaaAdaptiveLayer
 
 
@@ -111,13 +111,6 @@ def test_alpha_learnable(model):
     """alpha parameters should be learnable."""
     assert model.alpha is not None
     assert model.alpha.requires_grad
-
-
-def test_alpha_absent_in_moe_mode() -> None:
-    backbone = TinyVGGBackbone()
-    cfg = OmegaConf.create({"top_k": 2})
-    model = DSGCnet(backbone, row=2, line=2, fusion_mode="esca_moe", moe_cfg=cfg)
-    assert model.alpha is None
 
 
 def test_mamba_moe_mode_forward() -> None:
@@ -392,54 +385,6 @@ def test_multiscale_density_outputs_absent_when_disabled() -> None:
     assert "density_block5" not in out
 
 
-def test_moe_initialized_when_enabled() -> None:
-    backbone = TinyVGGBackbone()
-    cfg = OmegaConf.create({"top_k": 2})
-    model = DSGCnet(backbone, row=2, line=2, fusion_mode="esca_moe", moe_cfg=cfg)
-    assert model.esca is not None
-    assert model.moe is not None
-    assert isinstance(model.esca, ESCA)
-    assert isinstance(model.moe, MoE)
-
-
-def test_moe_forward_shapes_match() -> None:
-    backbone = TinyVGGBackbone()
-    cfg = OmegaConf.create({"top_k": 2})
-    model = DSGCnet(
-        backbone,
-        row=2,
-        line=2,
-        fusion_mode="esca_moe",
-        moe_cfg=cfg,
-    ).eval()
-
-    with torch.no_grad():
-        out = model(torch.zeros(2, 3, 128, 128))
-
-    assert out["pred_logits"].shape[0] == 2
-    assert out["pred_logits"].shape[2] == 2
-    assert out["pred_points"].shape[0] == 2
-    assert out["pred_points"].shape[2] == 2
-    assert out["density_out"].shape[0] == 2
-    assert out["moe_weights"] is not None
-
-
-def test_moe_outputs_aux_losses_in_train_mode() -> None:
-    backbone = TinyVGGBackbone()
-    cfg = OmegaConf.create({"top_k": 2})
-    model = DSGCnet(
-        backbone,
-        row=2,
-        line=2,
-        fusion_mode="esca_moe",
-        moe_cfg=cfg,
-    ).train()
-
-    out = model(torch.zeros(1, 3, 128, 128))
-    assert out["moe_aux_losses"] is not None
-    assert out["moe_aux_total"] is not None
-
-
 # ---------------------------------------------------------------------------
 # SEMCEnhancer tests
 # ---------------------------------------------------------------------------
@@ -511,108 +456,6 @@ def test_semc_enhancer_invalid_position_raises() -> None:
         DSGCnet(backbone, row=2, line=2, cfg=cfg)
 
 
-def test_semc_enhancer_with_moe_mode_raises() -> None:
-    """SEMCEnhancer should not silently alter the MoE path."""
-    backbone = TinyVGGBackbone()
-    cfg = OmegaConf.create({"top_k": 2, "use_semc_enhancer": True})
-
-    with pytest.raises(ValueError, match="fusion_mode='gcn'"):
-        DSGCnet(
-            backbone,
-            row=2,
-            line=2,
-            fusion_mode="esca_moe",
-            moe_cfg=cfg,
-            cfg=cfg,
-        )
-
-
-# ---------------------------------------------------------------------------
-# MoE wiring and checkpoint restore tests
-# ---------------------------------------------------------------------------
-
-
-def test_density_hint_wired_through_to_moe() -> None:
-    """density_hint 应传入 MoE，并进入路由网络的输入通道。"""
-    backbone = TinyVGGBackbone()
-    moe_cfg = OmegaConf.create({"top_k": 2, "use_density_hint": True})
-    model = DSGCnet(
-        backbone, row=2, line=2, fusion_mode="esca_moe", moe_cfg=moe_cfg
-    ).eval()
-
-    x = torch.randn(1, 3, 128, 128)
-    captured: dict = {}
-    _orig_forward = model.moe.forward  # type: ignore[union-attr]
-
-    def _spy_forward(feat, density_hint=None, training=True):
-        captured["density_hint"] = density_hint
-        return _orig_forward(feat, density_hint=density_hint, training=training)
-
-    model.moe.forward = _spy_forward  # type: ignore[union-attr]
-    with torch.no_grad():
-        model(x)
-
-    assert captured.get("density_hint") is not None, (
-        "DSGCnet 未将 density map 传递给 MoE.forward()"
-    )
-
-    first_conv_inputs: list[torch.Tensor] = []
-
-    def _capture_first_conv_input(module, args):
-        first_conv_inputs.append(args[0].detach().clone())
-
-    hook = model.moe.context_encoder.score_net[0].register_forward_pre_hook(  # type: ignore[union-attr]
-        _capture_first_conv_input
-    )
-    with torch.no_grad():
-        features = model.backbone(x)
-        features_list = [features[0], features[1], features[2], features[3]]
-        c3, c4, c5 = features_list[1], features_list[2], features_list[3]
-        features_pa = model.pa([c3, c4, c5])
-        density = model.density_pred(features_pa)
-        esca_feature = model.esca(features_pa)  # type: ignore[union-attr]
-        model.moe.context_encoder(esca_feature, density_hint=density)  # type: ignore[union-attr]
-
-    hook.remove()
-    assert len(first_conv_inputs) == 1, "未捕获到 context_encoder 的第一层输入"
-    routed_input = first_conv_inputs[0]
-    assert routed_input.shape[1] == esca_feature.shape[1] + 1
-    # GridSoftRouter uses AvgPool (grid_stride) before score_net, so the
-    # captured input is at coarse resolution.  Verify that the density
-    # channel is present and comes from avg-pooling the original density.
-    coarse_density = routed_input[:, -1:]
-    grid_stride = model.moe.router.grid_stride  # type: ignore[union-attr]
-    expected_density = F.avg_pool2d(
-        density, kernel_size=grid_stride, stride=grid_stride
-    )
-    assert coarse_density.shape == expected_density.shape, (
-        f"coarse density shape {coarse_density.shape} != expected {expected_density.shape}"
-    )
-    assert torch.allclose(coarse_density, expected_density, atol=1e-5), (
-        "density_hint 没有作为额外通道送入路由网络"
-    )
-    model.moe.forward = _orig_forward  # type: ignore[union-attr]
-
-
-def test_checkpoint_temperature_restore_syncs_router() -> None:
-    """模拟 checkpoint 恢复：必须同时将 temperature 写入 moe 和 moe.router。"""
-    backbone = TinyVGGBackbone()
-    moe_cfg = OmegaConf.create({"top_k": 2})
-    model = DSGCnet(backbone, row=2, line=2, fusion_mode="esca_moe", moe_cfg=moe_cfg)
-
-    saved_temp = 0.6
-    # Simulate the checkpoint restore pattern used in trainer.py
-    model.moe.temperature = saved_temp  # type: ignore[union-attr]
-    model.moe.router.temperature = saved_temp  # type: ignore[union-attr]
-
-    assert model.moe.temperature == saved_temp  # type: ignore[union-attr]
-    assert model.moe.router.temperature == saved_temp  # type: ignore[union-attr]
-    # Subsequent decay must start from the restored value
-    model.update_moe_temperature(decay_rate=0.9)
-    assert model.moe.temperature < saved_temp  # type: ignore[union-attr]
-    assert model.moe.router.temperature == model.moe.temperature  # type: ignore[union-attr]
-
-
 # ---------------------------------------------------------------------------
 # GCN + LightMoE (gcn_moe mode) tests
 # ---------------------------------------------------------------------------
@@ -634,9 +477,6 @@ def test_gcn_moe_init_has_both_gcn_and_light_moe(gcn_moe_model) -> None:
     assert gcn_moe_model.alpha is not None
     assert gcn_moe_model.light_moe is not None
     assert isinstance(gcn_moe_model.light_moe, LightMoE)
-    # esca_moe-specific modules should be absent
-    assert gcn_moe_model.esca is None
-    assert gcn_moe_model.moe is None
 
 
 def test_gcn_moe_forward_output_keys(gcn_moe_model) -> None:

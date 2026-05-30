@@ -58,12 +58,6 @@ uv run python scripts/predict.py \
 tensorboard --logdir runs/
 ```
 
-Alternative entry points are registered in pyproject.toml:
-```bash
-crowdcount-train data.data_root=DATA_ROOT     # ≡ scripts/train.py
-crowdcount-predict +predict.weight_path=...    # ≡ scripts/predict.py
-```
-
 Outputs are written to `outputs/<YYYY-MM-DD>/<HH-MM-SS>/`.
 
 **`hydra.job.chdir: false`** is set in configs, so the working directory stays at the repo root during runs. All relative paths (e.g., `resume=checkpoints/latest.pth`) resolve from the project root, not from the output directory.
@@ -116,12 +110,12 @@ src/crowdcount/
 
 The three experts are: `LocalDetailExpert` (stride-8, DWConv + SE), `DeformableCrossScaleExpert` (stride-8, DAT-style multi-scale deformable attention; replaces `SpatialRelationExpert`'s W-MSA when `use_deformable: true`), `GlobalDensityExpert` (stride-32, large-kernel DWConv + SE). All experts internally handle their own downsampling via SPD. `SparseTop2Gate` provides Gumbel-Softmax Top-2 sparse routing with temperature annealing (warmup → hard routing with straight-through gradients).
 
-**MoECountNet loss**: `MoECountLoss` composites: primary density loss (BayesianLoss or ProximalMappingLoss) + CountLoss (L1) + LoadBalanceLoss (CV² importance+batch load) + optional PointPredHead auxiliary loss (Hungarian matching + focal) + optional SinkhornOT loss. Balance loss decays linearly to 0 after warmup.
+**MoECountNet loss**: `MoECountLoss` composites: primary density loss (BayesianLoss or ProximalMappingLoss) + CountLoss (L1) + LoadBalanceLoss (CV² importance+batch load) + optional PointPredHead auxiliary loss (Hungarian matching + focal) + optional SinkhornOT loss + Total Variation smoothness regularizer (`tv.weight: 0.0005`) + density map MSE supervision against pre-computed GT density maps (`density_map.weight: 0.1`). Balance loss decays linearly to 0 after warmup.
 
 ### Plugins (experimental modules for DSGCNet)
 
 Key plugins in `src/crowdcount/plugins/`:
-- `moe.py` — ESCA attention + 3-expert MoE (count calibration / localization / density)
+- `moe.py` — ESCA spatial/channel attention + LightMoE (post-GCN micro-expert refinement, used in `gcn_moe` mode)
 - `deformable_dual.py` — GuidedDeformableAttention + DeformableDualFusion (dual deformable-attention branches)
 - `graph_moe.py` — GraphAttentionExpert (MHSA with density-similarity bias) + 5-expert GraphMoE
 - `sdd_moe.py` — Scale-Decoupled MoE with OcclusionReasoningExpert
@@ -137,10 +131,11 @@ Key plugins in `src/crowdcount/plugins/`:
 
 ### DSGCNet config
 - `configs/config.yaml` — Root (epochs=3500, seed=42, clip_max_norm=0.1, optimizer=adamw, scheduler=cosine_annealing)
-- `configs/model/dsgcnet.yaml` — Model architecture + fusion_mode (gcn, esca_moe, deformable_dual, etc.)
+- `configs/model/dsgcnet.yaml` — Model architecture + fusion_mode (gcn, gcn_moe, graph_attn_moe, graph_moe, mamba_moe, mamba_vss_dual, sdd_moe, sa_dgat, deformable_dual, moe)
 - `configs/data/shha.yaml` — Data settings
-- `configs/optimizer/adamw.yaml` — Default: lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4
+- `configs/optimizer/adamw.yaml` — Default: lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4. `adam` optimizer also available.
 - Note: `step_lr` is available but not the root default; it was used as an override in the best known run (`scheduler=step_lr scheduler.lr_drop=800`)
+- Schedulers (`configs/scheduler/`): `cosine_annealing` (DSGCNet warmup=100 epochs, MoECountNet warmup=5 epochs) and `step_lr` (default lr_drop=3500). Both have `warmup_epochs` and `warmup_start_factor` params.
 
 ### MoECountNet config
 - `configs/moecount_config.yaml` — Root (epochs=1500, clip_max_norm=5.0, AMP enabled)
@@ -203,8 +198,8 @@ model:
 
 ## MoECountNet Config Defaults
 
-- `configs/moecount_config.yaml`: `epochs: 1500`, `weight_decay: 0.0001`, `use_pml: false` (BayesianLoss)
+- `configs/moecount_config.yaml`: `epochs: 1500`, `weight_decay: 0.0001`, `use_pml: true` (ProximalMappingLoss; set `false` for BayesianLoss)
 - `configs/model/moecount.yaml`: `output_stride: 8`, `backbone.arch: convnext_tiny`, `moe.top_k: 2`, `head.final_activation: softplus`, `head.final_weight_std: 0.01`
-- The primary density loss is BayesianLoss (ICCV 2019) with `use_background: true`, `bg_ratio: 0.15`
+- The default primary density loss is ProximalMappingLoss (`use_pml: true`). When using BayesianLoss (`use_pml: false`), it uses `use_background: true`, `bg_ratio: 0.15`
 - Point prediction auxiliary head is enabled by default (`head.use_point_head: true`)
 - Sinkhorn OT loss is disabled by default (`moecount_loss.ot.enabled: false`)

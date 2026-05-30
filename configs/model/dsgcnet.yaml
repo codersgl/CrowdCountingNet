@@ -657,3 +657,27 @@ moecount_moe:
   expert_dp_pattern_num_bins: 8
   expert_dp_pattern_class_weight: 1.0
   expert_dp_use_residual: true
+
+# Scale-Decoupled CNN/GCN/Transformer Fusion (fusion_mode: scale_decoupled)
+# Replaces Neck + DGCN: backbone C3/C4/C5 → CNN@s8/GCN@s16/Transformer@s32 → CrossAttn → SE Mod
+scale_decoupled_fusion:
+  unified_dim: 256
+  cnn_dilations: [1, 2, 3]
+  cnn_groups: 16
+  cnn_ffn_expansion: 2
+  cnn_use_multi_spectral_se: true
+  gcn_k: 4
+  gcn_spatial_alpha: 1.0
+  gcn_spatial_beta: 1.0
+  gcn_hidden_channels: 512
+  gcn_heads: 4
+  gcn_dropout: 0.1
+  trans_num_blocks: 2
+  trans_num_heads: 4
+  trans_embed_dim: 128
+  trans_mlp_ratio: 4.0
+  ca_num_heads: 4
+  ca_dropout: 0.1
+  ca_ff_expansion: 2
+  dm_density_hidden: 64
+  dm_reduction: 4

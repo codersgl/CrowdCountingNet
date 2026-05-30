@@ -78,6 +78,7 @@ class CNNStream(nn.Module):
     def __init__(
         self,
         in_channels: int = 256,
+        out_channels: int = 256,
         dilations: tuple[int, ...] = (1, 2, 3),
         groups: int = 16,
         ffn_expansion: int = 2,
@@ -87,12 +88,14 @@ class CNNStream(nn.Module):
         super().__init__()
         from crowdcount.models.moecount.experts import MultiSpectralChannelAttention, SE
 
+        self.out_channels = out_channels
+
         # ---- Stage 1: Multi-scale dilated conv block ----
         self.ms_norm = nn.GroupNorm(min(32, in_channels), in_channels)
         self.dilated_branches = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(in_channels, in_channels, 3, padding=d, dilation=d,
-                          groups=groups, bias=False),
+                          groups=min(groups, in_channels), bias=False),
                 nn.GELU(),
             )
             for d in dilations
@@ -120,10 +123,10 @@ class CNNStream(nn.Module):
         else:
             self.channel_attn = SE(in_channels, reduction=4)
 
-        # ---- Output projection ----
+        # ---- Output projection to unified channels ----
         self.output_norm = nn.GroupNorm(min(32, in_channels), in_channels)
         self.output_proj = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 1, bias=False),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
             nn.GELU(),
         )
 
@@ -517,6 +520,7 @@ class ScaleDecoupledFusion(nn.Module):
 
         self.cnn_stream = CNNStream(
             in_channels=c2_channels,
+            out_channels=unified_dim,
             dilations=cnn_dilations,
             groups=cnn_groups,
             ffn_expansion=cnn_ffn_expansion,

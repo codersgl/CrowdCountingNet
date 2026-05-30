@@ -70,6 +70,7 @@ from crowdcount.plugins.cross_scale_density import (
 from crowdcount.plugins.clip_prompt_density import CLIPPromptDensityGuide
 from crowdcount.plugins.neck_moe import NeckScaleMoE
 from crowdcount.models.moecount.experts import HeterogeneousSparseMoE
+from crowdcount.models.scale_decoupled_fusion import ScaleDecoupledFusion
 
 
 class _DepthEncoder(nn.Module):
@@ -288,6 +289,8 @@ class DSGCnet(nn.Module):
         self.use_sa_dgat = fusion_mode == "sa_dgat"
         self.use_deformable_dual = fusion_mode == "deformable_dual"
         self.use_moecount_moe = fusion_mode == "moe"
+        self.use_scale_decoupled = fusion_mode == "scale_decoupled"
+        self.scale_decoupled_fusion: ScaleDecoupledFusion | None = None
         self.mamba_vss_dual: MambaVSSDualFusion | None = None
         self.sdd_moe: SDDMoE | None = None
         self.sa_dgat_fusion: SADGATFusion | None = None
@@ -509,9 +512,10 @@ class DSGCnet(nn.Module):
             "sa_dgat",
             "deformable_dual",
             "moe",
+            "scale_decoupled",
         }:
             raise ValueError(
-                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'gcn_moe', 'graph_attn_moe', 'graph_moe', 'mamba_moe', 'mamba_vss_dual', 'sdd_moe', 'sa_dgat', 'deformable_dual', or 'moe'"
+                f"Unsupported fusion_mode={self.fusion_mode}, expected 'gcn', 'gcn_moe', 'graph_attn_moe', 'graph_moe', 'mamba_moe', 'mamba_vss_dual', 'sdd_moe', 'sa_dgat', 'deformable_dual', 'moe', or 'scale_decoupled'"
             )
         if self.feature_stream_type not in {"gcn", "transformer", "window_transformer"}:
             raise ValueError(
@@ -1373,6 +1377,53 @@ class DSGCnet(nn.Module):
             self.supernode_gcn = None
             self.cross_stream_gcn = None
             self.sdd_moe = None
+        elif self.use_scale_decoupled:
+            _sdf_cfg = getattr(
+                getattr(cfg, "model", cfg), "scale_decoupled_fusion", None
+            ) if cfg is not None else None
+
+            def _sc(key: str, default):
+                return getattr(_sdf_cfg, key, default) if _sdf_cfg is not None else default
+
+            self.scale_decoupled_fusion = ScaleDecoupledFusion(
+                c2_channels=512,  # VGG body3: stride-8, 512ch
+                c3_channels=512,  # VGG body4: stride-16, 512ch
+                c4_channels=512,  # VGG body4→pool: stride-32, 512ch
+                unified_dim=int(_sc("unified_dim", 256)),
+                cnn_dilations=tuple(int(d) for d in _sc("cnn_dilations", [1, 2, 3])),
+                cnn_groups=int(_sc("cnn_groups", 16)),
+                cnn_ffn_expansion=int(_sc("cnn_ffn_expansion", 2)),
+                cnn_use_multi_spectral_se=bool(_sc("cnn_use_multi_spectral_se", True)),
+                gcn_k=int(_sc("gcn_k", 4)),
+                gcn_spatial_alpha=float(_sc("gcn_spatial_alpha", 1.0)),
+                gcn_spatial_beta=float(_sc("gcn_spatial_beta", 1.0)),
+                gcn_hidden_channels=int(_sc("gcn_hidden_channels", 512)),
+                gcn_heads=int(_sc("gcn_heads", 4)),
+                gcn_dropout=float(_sc("gcn_dropout", 0.1)),
+                trans_num_blocks=int(_sc("trans_num_blocks", 2)),
+                trans_num_heads=int(_sc("trans_num_heads", 4)),
+                trans_embed_dim=int(_sc("trans_embed_dim", 128)),
+                trans_mlp_ratio=float(_sc("trans_mlp_ratio", 4.0)),
+                ca_num_heads=int(_sc("ca_num_heads", 4)),
+                ca_dropout=float(_sc("ca_dropout", 0.1)),
+                ca_ff_expansion=int(_sc("ca_ff_expansion", 2)),
+                dm_density_hidden=int(_sc("dm_density_hidden", 64)),
+                dm_reduction=int(_sc("dm_reduction", 4)),
+            )
+
+            # Nullify other fusion components
+            self.density_gcn = None
+            self.feature_gcn = None
+            self.alpha = None
+            self.gm = None
+            self.graph_attn_moe = None
+            self.mamba_moe = None
+            self.supernode_gcn = None
+            self.cross_stream_gcn = None
+            self.sdd_moe = None
+            self.light_moe = None
+            # Nullify neck (not used in scale_decoupled mode)
+            self.pa = None  # type: ignore[assignment]
         else:
             if gcn_mode == "supernode":
                 self.supernode_gcn: SuperNodeGCNProcessor | None = (
@@ -2143,9 +2194,28 @@ class DSGCnet(nn.Module):
                 c4 = self.depth_attn_c4(c4, depth_map)  # type: ignore[misc]
                 c5 = self.depth_attn_c5(c5, depth_map)  # type: ignore[misc]
 
-        # --- MSCADecoder path: replaces PA-FPN + Density_pred, GCN runs downstream ---
+        # --- Scale-Decoupled Fusion path: replaces Neck + DGCN entirely ---
         fpn_intermediates = None
-        if self.use_msca_decoder:
+        if self.use_scale_decoupled:
+            assert self.scale_decoupled_fusion is not None
+            assert self.density_pred is not None
+            # Map VGG backbone features to expected scale-decoupled streams:
+            # features_list: [body1(s2), body2(s4,256), body3(s8,512), body4(s16,512)]
+            # scale_decoupled expects: s8, s16, s32
+            # Use body3 as s8, body4 as s16, body4→pool as s32
+            c3_s8 = features_list[2]   # VGG body3: stride-8, 512ch
+            c4_s16 = features_list[3]  # VGG body4: stride-16, 512ch
+            c5_s32 = F.adaptive_avg_pool2d(
+                c4_s16, (max(1, c4_s16.shape[-2] // 2), max(1, c4_s16.shape[-1] // 2))
+            )
+            feature_fl, _ = self.scale_decoupled_fusion(c3_s8, c4_s16, c5_s32)
+            features_pa = feature_fl
+            features_pa = F.dropout2d(
+                features_pa, p=self.neck_dropout, training=self.training
+            )
+            density = self.density_pred(features_pa)
+        # --- MSCADecoder path: replaces PA-FPN + Density_pred, GCN runs downstream ---
+        elif self.use_msca_decoder:
             assert self.msca_decoder is not None
             feature_fl, density = self.msca_decoder([c3, c4, c5])
             features_pa = feature_fl  # alias for downstream consumers
@@ -2285,7 +2355,9 @@ class DSGCnet(nn.Module):
             )
             features_pa = features_pa * pre_mask
 
-        if self.use_graph_moe:
+        if self.use_scale_decoupled:
+            pass  # fusion already done by ScaleDecoupledFusion above
+        elif self.use_graph_moe:
             assert self.graph_moe is not None
             feature_fl, graph_aux_losses, graph_weights = self.graph_moe(
                 features_pa,

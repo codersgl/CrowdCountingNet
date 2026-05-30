@@ -130,28 +130,43 @@ FeatureTransformerBlock × 2:
    K = LayerNorm(K_proj)
    V = LayerNorm(V_proj)
 
-2. Scale-Level Embeddings:
-   K += self.scale_embed_s16  ← broadcast over N_s16 tokens
-   K += self.scale_embed_s32  ← broadcast over N_s32 tokens
-   (learnable params: [1, 256] per scale)
+2. Position Encoding (2D spatial PE + scale-level embedding):
+   a) 2D Spatial PE (sinusoidal):
+      pos_s8  = sinusoidal_2D(s8, s8,  D)  →  [1, N_s8,  256]
+      pos_s16 = sinusoidal_2D(s16, s16, D)  →  [1, N_s16, 256]
+      pos_s32 = sinusoidal_2D(s32, s32, D)  →  [1, N_s32, 256]
+      Q += pos_s8
+      K += cat([pos_s16, pos_s32], dim=1)
+   b) Scale-Level Embeddings (learnable):
+      K += self.scale_embed[0]  ← broadcast over N_s16 tokens
+      K += self.scale_embed[1]  ← broadcast over N_s32 tokens
+      self.scale_embed = nn.Embedding(2, D)
 
-3. Multi-Head Cross-Attention (h=4, head_dim=64):
-   scores = Q @ K^T  →  [B, 4, ≈784, ≈245]
-   attn   = softmax(scores / 8.0)  ← √64 = 8
-   output = attn @ V  →  [B, ≈784, 256]
-   output = output + attn_gate.tanh() * out_proj(output)
+   Without 2D spatial PE, the attention degenerates to channel-only mixing
+   — Q cannot establish geometric correspondence with K/V across scales.
 
-4. FFN + Residual:
-   normed = LayerNorm(output)
-   f = output + mlp_gate.tanh() * MLP(normed)
+3. Multi-Head Cross-Attention (h=4, head_dim=64, batch_first=True):
+   attn_out, _ = nn.MultiheadAttention(
+       embed_dim=256, num_heads=4, batch_first=True
+   )(Q, K, V)   ← is_causal=False (default, correct for cross-attn)
+   attn_out = self.out_proj(attn_out)  →  [B, N_q, 256]
+
+   # Residual around Q (not around attn_out):
+   # gate=0 → f_attn = Q (identity), gate>0 → gradually adds attention
+   f_attn = Q + self.attn_gate.tanh() * attn_out
+
+4. FFN + Residual (same identity-preserving pattern):
+   normed = LayerNorm(f_attn)
+   f = f_attn + self.mlp_gate.tanh() * MLP(normed)
      └─ MLP: Linear(256→512) → GELU → Linear(512→256)
 
 5. Reshape:
    f → [B, 256, s8, s8]
 
 All gates zero-initialized:
-  attn_gate = 0  → output = identity(Q_proj) at start
-  mlp_gate  = 0  → f = output at start
+  attn_gate = 0  → f_attn = Q (identity: attention bypassed)
+  mlp_gate  = 0  → f = f_attn (identity: FFN bypassed)
+  At training step 0: f = Q_proj (input pass-through, stable start)
 ```
 
 - Attention pairs: 784 × 245 ≈ 192K — moderate, well within limits
@@ -167,7 +182,8 @@ All gates zero-initialized:
   d_pred:  [B, 1, H_d, W_d]  ← from Density Head (detached)
 
 1. Density encoding:
-   d = interpolate(d_pred.detach(), size=s8)
+   d_pred_safe = d_pred.detach() if d_pred.requires_grad else d_pred
+   d = interpolate(d_pred_safe, size=s8)
    d_feat = Conv(1→64) → BN → GELU  →  [B, 64, s8, s8]
 
 2. SE Channel Attention:

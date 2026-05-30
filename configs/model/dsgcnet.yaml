@@ -106,8 +106,7 @@ rccformer_deab_blocks: 2 # Number of DEAB blocks in density prediction branch
 # mamba_vss_dual: density-guided VSS stream + MambaMoE feature stream
 # deformable_dual: dual-stream residual deformable attention replacement for GCN
 # sa_dgat: Scale-Aware Deformable Graph Attention Network
-# scale_decoupled: CNN/GCN/Transformer cross-attention fusion
-fusion_mode: scale_decoupled
+fusion_mode: gcn
 
 # Adaptive GCN graph construction (only used when fusion_mode: gcn)
 gcn_adaptive: false # true: density/sim-adaptive k | false: fixed k=gcn_k

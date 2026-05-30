@@ -581,14 +581,12 @@ class ScaleDecoupledFusion(nn.Module):
         f_gcn = self.gcn_stream(c3, density=density)
         f_trans = self.transformer_stream(c4)
 
-        # Pool CNN output to GCN resolution for K/V.
-        # Q at s8 can only query at s8 granularity — keeping K/V at s4
-        # explodes memory with no precision benefit.
+        # Align CNN to GCN resolution so Q can be at s8 (matches anchor stride).
         if f_cnn.shape[-2:] != f_gcn.shape[-2:]:
             f_cnn = F.max_pool2d(f_cnn, kernel_size=2, stride=2)
 
-        # Q ← GCN (mid-resolution queries local + global context)
-        # K/V ← [CNN↓ (high-res local), Transformer (low-res global)]
-        f = self.cross_attention(f_gcn, f_cnn, f_trans)
+        # Q ← CNN (high-res local features ask "am I a head?")
+        # K/V ← [GCN (relational), Transformer (global)]
+        f = self.cross_attention(f_cnn, f_gcn, f_trans)
 
         return f, {}

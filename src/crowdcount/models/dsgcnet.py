@@ -1423,11 +1423,51 @@ class DSGCnet(nn.Module):
                 int(_sc("unified_dim", 256)) * 2, int(_sc("unified_dim", 256)), 1, bias=False,
             )
 
-            # Nullify other fusion components
-            self.density_gcn = None
-            self.feature_gcn = None
-            self.alpha = None
-            self.gm = None
+            # Dual-stream GCN + 3-way fusion (mirrors original DSGCNet design).
+            # DensityGCN (density-guided graph) and FeatureGCN (feature-similarity
+            # graph) provide complementary views fused by a learned gate.
+            self.density_gcn = DensityGCNProcessor(
+                k=gcn_k,
+                adaptive=gcn_adaptive,
+                k_min=gcn_k_min,
+                k_max=gcn_k_max,
+                density_scale=gcn_density_scale,
+                use_uncertainty=use_uncertainty,
+                uncertainty_scale=uncertainty_scale,
+                anisotropic=gcn_aniso,
+                conv_type=gcn_conv_type,
+                spatial_prior=gcn_spatial_prior,
+                spatial_alpha=gcn_spatial_alpha,
+                spatial_beta=gcn_spatial_beta,
+                depth_prior_cfg=(
+                    getattr(getattr(cfg, "model", cfg), "depth_graph_prior", None)
+                    if cfg is not None
+                    else None
+                ),
+                dropout=gcn_dropout,
+            )
+            self.feature_gcn = FeatureGCNProcessor(
+                k=gcn_k,
+                adaptive=gcn_adaptive,
+                k_min=gcn_k_min,
+                k_max=gcn_k_max,
+                sim_threshold=gcn_sim_threshold,
+                anisotropic=gcn_aniso,
+                conv_type=gcn_conv_type,
+                dropout=gcn_dropout,
+            )
+            self.alpha: nn.Parameter | None = nn.Parameter(
+                torch.ones(3, dtype=torch.float32)
+            )
+            if use_gm:
+                if gm_spatial:
+                    self.gm = SpatialGateMechanism(input_dim=gm_input_dim)
+                else:
+                    self.gm = GateMechanism(
+                        input_dim=gm_input_dim, hidden_dim=gm_hidden_dim
+                    )
+            else:
+                self.gm = None
             self.graph_attn_moe = None
             self.mamba_moe = None
             self.supernode_gcn = None
@@ -2235,18 +2275,55 @@ class DSGCnet(nn.Module):
             density_input = self.sd_density_feat_proj(density_input)
             density = self.density_pred(density_input)
 
-            # Step 2: Density-driven GCN refinement.
-            #   Uses the predicted density map to build a spatial-prior k-NN
-            #   graph, then runs GATv2 message passing on the fused features.
-            #   Mirrors the original DSGCNet DensityGCN design.
-            f_refined = self.scale_decoupled_fusion.refine_with_density(
-                features_pa, density,
+            # Step 2: Dual-stream GCN + 3-way fusion.
+            #   Mirrors the original DSGCNet: DensityGCN (density-guided
+            #   graph) and FeatureGCN (feature-similarity graph) provide
+            #   complementary views of the feature space, fused by a
+            #   learned gate.  GCN transformers replace input features
+            #   (no outer residual — GATv2Model internal residual suffices).
+            density_gcn_feat = self.density_gcn(
+                density, features_pa,
+                uncertainty=None,   # computed after this block
+                depth_map=depth_map,
             )
-            scale_decoupled_dgcn_feat = f_refined  # stored for viz below
+            feature_gcn_feat = self.feature_gcn(features_pa)
+
+            if self.gm is not None:
+                gate_weight = self.gm(features_pa)
+                if gate_weight.dim() == 4:
+                    # SpatialGateMechanism: [B, 3, H, W]
+                    feature_fl = (
+                        features_pa * gate_weight[:, 0:1]
+                        + density_gcn_feat * gate_weight[:, 1:2]
+                        + feature_gcn_feat * gate_weight[:, 2:3]
+                    )
+                else:
+                    # Legacy GateMechanism: [B, 3]
+                    w_1 = gate_weight[:, 0].view(-1, 1, 1, 1)
+                    w_2 = gate_weight[:, 1].view(-1, 1, 1, 1)
+                    w_3 = gate_weight[:, 2].view(-1, 1, 1, 1)
+                    feature_fl = (
+                        features_pa * w_1
+                        + density_gcn_feat * w_2
+                        + feature_gcn_feat * w_3
+                    )
+            elif self.alpha is not None:
+                w = F.softmax(self.alpha, dim=0)
+                feature_fl = (
+                    w[0] * features_pa
+                    + w[1] * density_gcn_feat
+                    + w[2] * feature_gcn_feat
+                )
+            else:
+                feature_fl = (
+                    features_pa + density_gcn_feat + feature_gcn_feat
+                ) / 3.0
+
+            scale_decoupled_dgcn_feat = density_gcn_feat  # stored for viz
 
             # Step 3: SE-style density modulation.
             features_pa = self.scale_decoupled_fusion.density_modulation(
-                f_refined, density,
+                feature_fl, density,
             )
         # --- MSCADecoder path: replaces PA-FPN + Density_pred, GCN runs downstream ---
         elif self.use_msca_decoder:
@@ -2349,9 +2426,9 @@ class DSGCnet(nn.Module):
         if scale_decoupled_intermediates is not None:
             output_dict["sd_intermediates"] = scale_decoupled_intermediates
             output_dict["sd_dgcn_feat"] = scale_decoupled_dgcn_feat
-            # All ScaleDecoupledFusion submodules now use standard ungated
-            # residuals (ResNet / Transformer convention).  No gate scalars
-            # to monitor — the feature diff map is the main visual signal.
+            # ScaleDecoupledFusion uses dual-stream GCN with 3-way gate fusion
+            # (matching original DSGCNet).  Gate weights (gm / alpha) and GCN
+            # feature diff maps are the main visual signals for TensorBoard.
         if self.neck_moe is not None:
             output_dict["moe_aux_losses"] = neck_moe_aux_losses
             output_dict["moe_aux_total"] = neck_moe_aux_total
@@ -2396,7 +2473,7 @@ class DSGCnet(nn.Module):
             features_pa = features_pa * pre_mask
 
         if self.use_scale_decoupled:
-            feature_fl = features_pa  # already refined by DensityGCN + SE modulation
+            feature_fl = features_pa  # already processed by dual-stream GCN + SE modulation
         elif self.use_graph_moe:
             assert self.graph_moe is not None
             feature_fl, graph_aux_losses, graph_weights = self.graph_moe(

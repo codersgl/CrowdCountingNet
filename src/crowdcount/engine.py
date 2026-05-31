@@ -151,6 +151,40 @@ def _featmap_to_image(feat: torch.Tensor, output_path: Path) -> torch.Tensor:
     return rgb
 
 
+def _featmap_diff_image(
+    feat_a: torch.Tensor, feat_b: torch.Tensor, output_path: Path,
+) -> torch.Tensor:
+    """Render the absolute difference between two feature maps.
+
+    Uses channel-mean of both, computes |mean(a) - mean(b)|, and renders
+    with a shared normalisation based on feat_a's dynamic range so the
+    difference is comparable across epochs.
+    Returns [3, H, W] float tensor in [0, 1].
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fa = feat_a[0].detach().cpu().float()  # [C, H, W]
+    fb = feat_b[0].detach().cpu().float()  # [C, H, W]
+    ma = fa.mean(dim=0)  # [H, W]
+    mb = fb.mean(dim=0)  # [H, W]
+    diff = (ma - mb).abs()  # [H, W]
+
+    # Shared scale: % of feat_a's dynamic range
+    a_range = ma.max() - ma.min()
+    a_range = max(a_range.item(), 1e-8)
+    diff_clipped = (diff / a_range).clamp(0, 1)
+
+    h, w = diff.shape
+    rgb = torch.zeros(3, h, w)
+    rgb[0] = diff_clipped          # R = larger diff
+    rgb[1] = diff_clipped * 0.3   # G = slight green tint
+    rgb[2] = 1.0 - diff_clipped   # B = inverse
+    rgb = rgb.clamp(0, 1)
+
+    rgb_uint8 = (rgb.permute(1, 2, 0) * 255).byte().numpy()
+    Image.fromarray(rgb_uint8).save(output_path)
+    return rgb
+
+
 def _eval_point_head(
     pred_logits: torch.Tensor,
     pred_points: torch.Tensor,
@@ -1117,6 +1151,22 @@ def train_one_epoch(
                 dgcn_img = _featmap_to_image(sd_dgcn, dgcn_path)
                 if writer is not None:
                     writer.add_image("scale_decoupled/dgcn_feat", dgcn_img, epoch)
+
+            # CrossAttn → DGCN difference map (uses shared scale, catches dead gates)
+            sd_cross = sd_intermediates.get("cross_attn_feat")
+            if sd_cross is not None and sd_dgcn is not None:
+                diff_path = Path(vis_dir) / "sd_cross_to_dgcn_diff_latest.png"
+                diff_img = _featmap_diff_image(sd_cross, sd_dgcn, diff_path)
+                if writer is not None:
+                    writer.add_image("scale_decoupled/cross_to_dgcn_diff", diff_img, epoch)
+
+            # Gate scalars — the ground truth of whether learning is happening
+            sd_gates = outputs.get("sd_gate_values")
+            if sd_gates is not None and writer is not None:
+                for gate_name, gate_val in sd_gates.items():
+                    writer.add_scalar(
+                        f"scale_decoupled/gates/{gate_name}", gate_val, epoch,
+                    )
 
             # Density overlay (predicted density + GT)
             pd_density_sd = outputs.get("pred_density")

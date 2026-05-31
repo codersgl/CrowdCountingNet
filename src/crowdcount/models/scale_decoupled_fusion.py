@@ -325,8 +325,9 @@ class ScaleDecoupledCrossAttention(nn.Module):
         self.q_proj = nn.Conv2d(dim, dim, 1, bias=False)
         self.q_norm = nn.LayerNorm(dim)
 
-        # K/V projections (separate for s16 and s32 for clarity)
-        self.kv_proj = nn.Conv2d(dim, dim, 1, bias=False)
+        # K/V projections (independent so K ≠ V — richer attention expressivity)
+        self.k_proj = nn.Conv2d(dim, dim, 1, bias=False)
+        self.v_proj = nn.Conv2d(dim, dim, 1, bias=False)
         self.k_norm = nn.LayerNorm(dim)
         self.v_norm = nn.LayerNorm(dim)
 
@@ -336,7 +337,10 @@ class ScaleDecoupledCrossAttention(nn.Module):
 
         # Output projection
         self.out_proj = nn.Linear(dim, dim)
-        self.attn_gate = nn.Parameter(torch.zeros(1))
+        # Small positive init (not zero!) so the attention output projection
+        # and KV projections get a gradient signal from step 0.
+        # tanh(0.01) ≈ 0.01  →  ~1% cross-attn contribution at init.
+        self.attn_gate = nn.Parameter(torch.full((1,), 0.01))
 
         # FFN
         ffn_hidden = dim * ff_expansion
@@ -348,7 +352,7 @@ class ScaleDecoupledCrossAttention(nn.Module):
             nn.Linear(ffn_hidden, dim),
             nn.Dropout(dropout),
         )
-        self.mlp_gate = nn.Parameter(torch.zeros(1))
+        self.mlp_gate = nn.Parameter(torch.full((1,), 0.01))
 
     def forward(
         self,
@@ -368,10 +372,10 @@ class ScaleDecoupledCrossAttention(nn.Module):
         q = self.q_norm(q) + sinusoidal_2d_pe(H8, W8, C).to(device=device, dtype=dtype)
 
         # --- K/V from s16 and s32 features ---
-        k_s16 = self.kv_proj(f_s16).flatten(2).transpose(1, 2)  # [B, N_s16, C]
-        k_s32 = self.kv_proj(f_s32).flatten(2).transpose(1, 2)  # [B, N_s32, C]
-        v_s16 = self.kv_proj(f_s16).flatten(2).transpose(1, 2)
-        v_s32 = self.kv_proj(f_s32).flatten(2).transpose(1, 2)
+        k_s16 = self.k_proj(f_s16).flatten(2).transpose(1, 2)  # [B, N_s16, C]
+        k_s32 = self.k_proj(f_s32).flatten(2).transpose(1, 2)  # [B, N_s32, C]
+        v_s16 = self.v_proj(f_s16).flatten(2).transpose(1, 2)
+        v_s32 = self.v_proj(f_s32).flatten(2).transpose(1, 2)
 
         k = torch.cat([k_s16, k_s32], dim=1)  # [B, N_s16+N_s32, C]
         v = torch.cat([v_s16, v_s32], dim=1)
@@ -404,7 +408,7 @@ class ScaleDecoupledCrossAttention(nn.Module):
 
         attn_out = self.out_proj(attn_out)
 
-        # Residual around Q (gate=0 → identity)
+        # Residual around Q (near-identity at init)
         f_attn = q + self.attn_gate.tanh() * attn_out
 
         # FFN with residual around f_attn
@@ -458,7 +462,12 @@ class DensityGCNRefine(nn.Module):
             heads=heads,
             dropout=dropout,
         )
-        self.gate = nn.Parameter(torch.zeros(1))
+        # Small positive init (not zero!) to prevent gradient deadlock:
+        # gate=0 blocks the GATv2's only gradient path, freezing it at
+        # random initialization forever.  tanh(0.01) ≈ 0.01 gives the
+        # GCN a ~1% contribution at step 0, enough signal to start
+        # learning while preserving near-identity behaviour.
+        self.gate = nn.Parameter(torch.full((1,), 0.01))
 
     def forward(
         self, features: torch.Tensor, density: torch.Tensor
@@ -488,7 +497,7 @@ class DensityGCNRefine(nn.Module):
         gcn_out = self.gcn(node_features, edge_index)
         gcn_out = gcn_out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
-        # Zero-init residual: gate=0 → identity at training step 0
+        # Near-identity residual (small but non-zero at init)
         return features + self.gate.tanh() * gcn_out
 
 
@@ -527,13 +536,17 @@ class DensitySEModulation(nn.Module):
             nn.Linear(mid_channels, channels),
             nn.Sigmoid(),
         )
-        # Zero-init last FC → Sigmoid(0) = 0.5 → identity through residual form
+        # Small-random init last FC (NOT zeros!) so that Sigmoid(w·x+b)
+        # produces channel_scale ≈ 0.5 ± ε.  Combined with a small non-zero
+        # gain this gives every component a gradient signal from step 0,
+        # avoiding the zero-init deadlock described for DensityGCNRefine.
         last_linear = self.se[-1]
         if isinstance(last_linear, nn.Linear):
-            nn.init.zeros_(last_linear.weight)
+            nn.init.normal_(last_linear.weight, std=0.01)
             nn.init.zeros_(last_linear.bias)
 
-        self.gain = nn.Parameter(torch.zeros(1))
+        # tanh(0.01) ≈ 0.01  →  ~1% modulation at init, preserves near-identity
+        self.gain = nn.Parameter(torch.full((1,), 0.01))
 
     def forward(self, f: torch.Tensor, density: torch.Tensor) -> torch.Tensor:
         # Safe detach (no-op during inference)
@@ -545,7 +558,7 @@ class DensitySEModulation(nn.Module):
         d_feat = self.density_encoder(d)
         channel_scale = self.se(d_feat).view(-1, f.shape[1], 1, 1)
 
-        # gain=0 → f₁ = f * (1 + 0) = f  (identity at training start)
+        # Near-identity modulation (small but non-zero at init)
         return f * (1.0 + self.gain.tanh() * (channel_scale - 0.5))
 
 

@@ -179,13 +179,20 @@ class TestDensitySEModulation:
         out = mod(f, density)
         assert out.shape == (2, 256, 28, 28)
 
-    def test_identity_at_init(self, mod):
+    def test_near_identity_at_init(self, mod):
+        """Gate init at 0.01 → output ≈ input but NOT exactly equal.
+
+        The small non-zero gate prevents a gradient deadlock where a
+        zero-init gate blocks all gradient signal to the SE layers.
+        """
         f = torch.randn(2, 256, 16, 16)
         density = torch.rand(2, 1, 16, 16)
         mod.eval()
         with torch.no_grad():
             out = mod(f, density)
-        torch.testing.assert_close(out, f)
+        # ~1% modulation at init — allow 5% tolerance for the random
+        # channel_scale distribution around 0.5.
+        torch.testing.assert_close(out, f, rtol=0.05, atol=0.05)
 
     def test_density_interpolation(self, mod):
         f = torch.randn(1, 256, 28, 28)
@@ -213,14 +220,20 @@ class TestDensityGCNRefine:
         out = refine(f, density)
         assert out.shape == (2, 256, 14, 14)
 
-    def test_identity_at_init(self, refine):
+    def test_near_identity_at_init(self, refine):
+        """Gate init at 0.01 → output ≈ input but NOT exactly equal.
+
+        The small non-zero gate prevents a gradient deadlock where a
+        zero-init gate blocks the GATv2's only gradient path.
+        """
         f = torch.randn(2, 256, 14, 14)
         density = torch.rand(2, 1, 14, 14)
         refine.eval()
         with torch.no_grad():
             out = refine(f, density)
-        # gate=0 → output ≈ input (identity at training start)
-        torch.testing.assert_close(out, f)
+        # ~1% GCN contribution at init; with random GATv2 weights the
+        # deviation can be moderate.  10% tolerance covers this.
+        torch.testing.assert_close(out, f, rtol=0.15, atol=0.15)
 
     def test_no_nan(self, refine):
         f = torch.randn(1, 256, 10, 10)
@@ -298,7 +311,12 @@ class TestScaleDecoupledFusion:
         f_refined = fusion.refine_with_density(f, density)
         assert f_refined.shape == f.shape
 
-    def test_refine_with_density_identity_at_init(self, fusion):
+    def test_refine_with_density_near_identity_at_init(self, fusion):
+        """Gate init at 0.01 → refined ≈ input but NOT exactly equal.
+
+        The small non-zero gate gives the GATv2 a gradient signal from
+        step 0, avoiding the zero-init deadlock.
+        """
         c2 = torch.randn(2, 256, 28, 28)
         c3 = torch.randn(2, 512, 14, 14)
         c4 = torch.randn(2, 512, 7, 7)
@@ -307,5 +325,5 @@ class TestScaleDecoupledFusion:
             f, _ = fusion(c2, c3, c4)
             density = torch.rand(2, 1, 14, 14)
             f_refined = fusion.refine_with_density(f, density)
-        # gate=0 → output ≈ input at init
-        torch.testing.assert_close(f_refined, f)
+        # ~1% GCN contribution at init; moderate tolerance for random GATv2
+        torch.testing.assert_close(f_refined, f, rtol=0.15, atol=0.15)

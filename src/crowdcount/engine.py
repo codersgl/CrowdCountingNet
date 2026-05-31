@@ -123,6 +123,34 @@ def _save_density_overlay(
     return combined
 
 
+def _featmap_to_image(feat: torch.Tensor, output_path: Path) -> torch.Tensor:
+    """Convert a [B, C, H, W] feature map to a 3-channel RGB image for TensorBoard.
+
+    Uses mean over channels → pseudo-color (red=high, blue=low) for visualisation.
+    Returns [3, H, W] float tensor in [0, 1].
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    f = feat[0].detach().cpu().float()  # [C, H, W]
+    # Mean activation across channels as a proxy for "where the stream responds"
+    mean_act = f.mean(dim=0)  # [H, W]
+    # Normalize to [0, 1] per-sample for consistent rendering
+    a_min, a_max = mean_act.min(), mean_act.max()
+    if a_max - a_min > 1e-8:
+        mean_act = (mean_act - a_min) / (a_max - a_min)
+    else:
+        mean_act = mean_act.zero_()
+    # Simple heatmap: red=high, blue=low
+    h, w = mean_act.shape
+    rgb = torch.zeros(3, h, w)
+    rgb[0] = mean_act  # R channel = activation
+    rgb[2] = 1.0 - mean_act  # B channel = inverse
+    rgb = rgb.clamp(0, 1)
+    # Save
+    rgb_uint8 = (rgb.permute(1, 2, 0) * 255).byte().numpy()
+    Image.fromarray(rgb_uint8).save(output_path)
+    return rgb
+
+
 def _eval_point_head(
     pred_logits: torch.Tensor,
     pred_points: torch.Tensor,
@@ -1066,7 +1094,55 @@ def train_one_epoch(
                             if writer is not None:
                                 writer.add_image("moe/density_overlay", overlay_img, epoch)
 
-            batch_idx += 1
+        # --- Scale-Decoupled visualization ---
+        sd_intermediates = outputs.get("sd_intermediates")
+        if (
+            vis_dir is not None
+            and sd_intermediates is not None
+            and batch_idx % vis_interval == 0
+        ):
+            # Feature maps from CNN, GCN, Transformer streams + CrossAttn output
+            for key in ("cnn_feat", "gcn_feat", "trans_feat", "cross_attn_feat"):
+                fmap = sd_intermediates.get(key)
+                if fmap is not None and isinstance(fmap, torch.Tensor):
+                    feat_path = Path(vis_dir) / f"sd_{key}_latest.png"
+                    feat_img = _featmap_to_image(fmap, feat_path)
+                    if writer is not None:
+                        writer.add_image(f"scale_decoupled/{key}", feat_img, epoch)
+
+            # DensityGCN refined features (post-CrossAttn)
+            sd_dgcn = outputs.get("sd_dgcn_feat")
+            if sd_dgcn is not None and isinstance(sd_dgcn, torch.Tensor):
+                dgcn_path = Path(vis_dir) / "sd_dgcn_feat_latest.png"
+                dgcn_img = _featmap_to_image(sd_dgcn, dgcn_path)
+                if writer is not None:
+                    writer.add_image("scale_decoupled/dgcn_feat", dgcn_img, epoch)
+
+            # Density overlay (predicted density + GT)
+            pd_density_sd = outputs.get("pred_density")
+            if pd_density_sd is None:
+                pd_density_sd = outputs.get("density_out")
+            if pd_density_sd is not None and isinstance(pd_density_sd, torch.Tensor):
+                _pred_pts_sd = None
+                _pred_logits_sd = outputs.get("pred_logits")
+                _pred_points_sd = outputs.get("pred_points")
+                if _pred_logits_sd is not None and _pred_points_sd is not None:
+                    _probs_sd = _pred_logits_sd[0].softmax(dim=-1)
+                    _fg_sd = _probs_sd[:, 1] > 0.5
+                    if _fg_sd.any():
+                        _pred_pts_sd = _pred_points_sd[0][_fg_sd]
+                _gt_pts_sd = targets[0].get("point") if targets else None
+
+                overlay_path_sd = Path(vis_dir) / "sd_density_overlay_latest.png"
+                overlay_img_sd = _save_density_overlay(
+                    samples, pd_density_sd, gt_dmap, overlay_path_sd,
+                    pred_points=_pred_pts_sd,
+                    gt_points=_gt_pts_sd,
+                )
+                if writer is not None:
+                    writer.add_image("scale_decoupled/density_overlay", overlay_img_sd, epoch)
+
+        batch_idx += 1
 
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 

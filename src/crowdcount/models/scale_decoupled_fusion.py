@@ -658,19 +658,23 @@ class ScaleDecoupledFusion(nn.Module):
         c3: torch.Tensor,
         c4: torch.Tensor,
         density: torch.Tensor | None = None,
+        return_intermediates: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Forward pass.
 
         Args:
-            c2: backbone stride-8 features  [B, C2, H/8, W/8]
-            c3: backbone stride-16 features [B, C3, H/16, W/16]
-            c4: backbone stride-32 features [B, C4, H/32, W/32]
+            c2: backbone stride-4 features  [B, C2, H/4, W/4]
+            c3: backbone stride-8 features [B, C3, H/8, W/8]
+            c4: backbone stride-16 features [B, C4, H/16, W/16]
             density: optional density map for GCN graph building.
                      If None, GCN uses feature-similarity fallback.
+            return_intermediates: if True, aux dict includes ``cnn_feat``,
+                ``gcn_feat``, ``trans_feat``, and ``cross_attn_feat`` for
+                TensorBoard visualization.
 
         Returns:
             f: fused features [B, unified_dim, H/8, W/8]
-            aux: auxiliary dict (reserved for future use)
+            aux: auxiliary dict (intermediate features when requested)
         """
         f_cnn = self.cnn_stream(c2)
         f_gcn = self.gcn_stream(c3, density=density)
@@ -684,7 +688,14 @@ class ScaleDecoupledFusion(nn.Module):
         # K/V ← [GCN (relational), Transformer (global)]
         f = self.cross_attention(f_cnn, f_gcn, f_trans)
 
-        return f, {}
+        aux: dict[str, torch.Tensor] = {}
+        if return_intermediates:
+            aux["cnn_feat"] = f_cnn
+            aux["gcn_feat"] = f_gcn
+            aux["trans_feat"] = f_trans
+            aux["cross_attn_feat"] = f
+
+        return f, aux
 
     def refine_with_density(
         self, features: torch.Tensor, density: torch.Tensor

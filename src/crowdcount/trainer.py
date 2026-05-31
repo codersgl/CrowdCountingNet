@@ -448,10 +448,10 @@ class Trainer:
         mse_history, density_mse_history = [], []
         step = 0
 
-        # Create visualization directory when using MoECountNet MoE
+        # Create visualization directory for MoE and scale_decoupled modes
         fusion_mode = str(getattr(getattr(cfg, "model", None), "fusion_mode", "gcn"))
         vis_dir: str | None = None
-        if fusion_mode == "moe":
+        if fusion_mode in ("moe", "scale_decoupled"):
             try:
                 hydra_output = Path(HydraConfig.get().runtime.output_dir)
             except Exception:

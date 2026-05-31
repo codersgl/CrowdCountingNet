@@ -2202,17 +2202,21 @@ class DSGCnet(nn.Module):
 
         # --- Scale-Decoupled Fusion path: replaces Neck + DGCN entirely ---
         fpn_intermediates = None
+        scale_decoupled_intermediates: dict[str, torch.Tensor] | None = None
+        scale_decoupled_dgcn_feat: torch.Tensor | None = None
         if self.use_scale_decoupled:
             assert self.scale_decoupled_fusion is not None
             assert self.density_pred is not None
             # Step 1: Feature-driven CrossAttn fusion.
             #   GCN stream uses feature-similarity k-NN (no density yet).
             #   Q ← CNN(pooled s8), K/V ← FeatureGCN(s8) + Transformer(s16).
-            f_cross, _ = self.scale_decoupled_fusion(
+            f_cross, intermediates = self.scale_decoupled_fusion(
                 features_list[1],  # body2: stride-4, 256ch → CNN → pool → Q
                 features_list[2],  # body3: stride-8, 512ch → FeatureGCN → K/V
                 features_list[3],  # body4: stride-16, 512ch → Transformer → K/V
+                return_intermediates=True,
             )
+            scale_decoupled_intermediates = intermediates  # stored for viz below
             features_pa = F.dropout2d(
                 f_cross, p=self.neck_dropout, training=self.training
             )
@@ -2225,6 +2229,7 @@ class DSGCnet(nn.Module):
             f_refined = self.scale_decoupled_fusion.refine_with_density(
                 features_pa, density,
             )
+            scale_decoupled_dgcn_feat = f_refined  # stored for viz below
 
             # Step 3: SE-style density modulation.
             features_pa = self.scale_decoupled_fusion.density_modulation(
@@ -2328,6 +2333,9 @@ class DSGCnet(nn.Module):
         }
         if depth_aux_out is not None:
             output_dict["depth_aux_out"] = depth_aux_out
+        if scale_decoupled_intermediates is not None:
+            output_dict["sd_intermediates"] = scale_decoupled_intermediates
+            output_dict["sd_dgcn_feat"] = scale_decoupled_dgcn_feat
         if self.neck_moe is not None:
             output_dict["moe_aux_losses"] = neck_moe_aux_losses
             output_dict["moe_aux_total"] = neck_moe_aux_total

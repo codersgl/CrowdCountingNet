@@ -337,12 +337,8 @@ class ScaleDecoupledCrossAttention(nn.Module):
 
         # Output projection
         self.out_proj = nn.Linear(dim, dim)
-        # Small positive init (not zero!) so the attention output projection
-        # and KV projections get a gradient signal from step 0.
-        # tanh(0.01) ≈ 0.01  →  ~1% cross-attn contribution at init.
-        self.attn_gate = nn.Parameter(torch.full((1,), 0.01))
 
-        # FFN
+        # FFN — standard Transformer block, ungated residuals
         ffn_hidden = dim * ff_expansion
         self.ffn_norm = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
@@ -352,7 +348,6 @@ class ScaleDecoupledCrossAttention(nn.Module):
             nn.Linear(ffn_hidden, dim),
             nn.Dropout(dropout),
         )
-        self.mlp_gate = nn.Parameter(torch.full((1,), 0.01))
 
     def forward(
         self,
@@ -408,11 +403,9 @@ class ScaleDecoupledCrossAttention(nn.Module):
 
         attn_out = self.out_proj(attn_out)
 
-        # Residual around Q (near-identity at init)
-        f_attn = q + self.attn_gate.tanh() * attn_out
-
-        # FFN with residual around f_attn
-        f = f_attn + self.mlp_gate.tanh() * self.mlp(self.ffn_norm(f_attn))
+        # Standard Transformer residuals — no gates needed
+        f_attn = q + attn_out
+        f = f_attn + self.mlp(self.ffn_norm(f_attn))
 
         # Reshape to spatial
         return f.transpose(1, 2).view(B, C, H8, W8)
@@ -462,12 +455,10 @@ class DensityGCNRefine(nn.Module):
             heads=heads,
             dropout=dropout,
         )
-        # Small positive init (not zero!) to prevent gradient deadlock:
-        # gate=0 blocks the GATv2's only gradient path, freezing it at
-        # random initialization forever.  tanh(0.01) ≈ 0.01 gives the
-        # GCN a ~1% contribution at step 0, enough signal to start
-        # learning while preserving near-identity behaviour.
-        self.gate = nn.Parameter(torch.full((1,), 0.01))
+        # No gate — direct residual like a standard ResNet block.
+        # GATv2 uses Xavier init and produces bounded outputs, so the
+        # residual doesn't destabilise early training.  The GCN gets
+        # full gradient from step 0 — no deadlock risk.
 
     def forward(
         self, features: torch.Tensor, density: torch.Tensor
@@ -479,7 +470,7 @@ class DensityGCNRefine(nn.Module):
             density: [B, 1, H, W] predicted density map for graph building.
 
         Returns:
-            [B, C, H, W] refined features (residual: f + gate * gcn_out).
+            [B, C, H, W] refined features (direct residual: f + gcn_out).
         """
         B, C, H, W = features.shape
 
@@ -497,8 +488,8 @@ class DensityGCNRefine(nn.Module):
         gcn_out = self.gcn(node_features, edge_index)
         gcn_out = gcn_out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
-        # Near-identity residual (small but non-zero at init)
-        return features + self.gate.tanh() * gcn_out
+        # Direct residual — standard ResNet pattern, no gating
+        return features + gcn_out
 
 
 # ---------------------------------------------------------------------------
@@ -507,11 +498,14 @@ class DensityGCNRefine(nn.Module):
 
 
 class DensitySEModulation(nn.Module):
-    """SE-style density → channel attention modulation.
+    """SE-style density → per-channel modulation (residual form).
 
-    Density map (detached) is encoded, globally pooled, and used to produce
-    per-channel scaling factors.  Zero-init gain ensures identity at
-    training step 0: ``f₁ = f * (1 + 0) = f``.
+    ``output = f * (0.5 + channel_scale)`` where ``channel_scale ∈ [0, 1]``,
+    giving a modulation range of ``[0.5, 1.5]`` around unity.
+
+    This is equivalent to ``f + f * (channel_scale - 0.5)`` — a residual
+    multiplicative modulation.  No gate needed: the Sigmoid already provides
+    learnable gating per channel.
     """
 
     def __init__(
@@ -536,17 +530,9 @@ class DensitySEModulation(nn.Module):
             nn.Linear(mid_channels, channels),
             nn.Sigmoid(),
         )
-        # Small-random init last FC (NOT zeros!) so that Sigmoid(w·x+b)
-        # produces channel_scale ≈ 0.5 ± ε.  Combined with a small non-zero
-        # gain this gives every component a gradient signal from step 0,
-        # avoiding the zero-init deadlock described for DensityGCNRefine.
-        last_linear = self.se[-1]
-        if isinstance(last_linear, nn.Linear):
-            nn.init.normal_(last_linear.weight, std=0.01)
-            nn.init.zeros_(last_linear.bias)
-
-        # tanh(0.01) ≈ 0.01  →  ~1% modulation at init, preserves near-identity
-        self.gain = nn.Parameter(torch.full((1,), 0.01))
+        # Standard Xavier init — Sigmoid output distributes across [0, 1],
+        # giving a natural range of [0.5, 1.5] in the residual form below.
+        # No zero-init, no gain parameter needed.
 
     def forward(self, f: torch.Tensor, density: torch.Tensor) -> torch.Tensor:
         # Safe detach (no-op during inference)
@@ -558,8 +544,9 @@ class DensitySEModulation(nn.Module):
         d_feat = self.density_encoder(d)
         channel_scale = self.se(d_feat).view(-1, f.shape[1], 1, 1)
 
-        # Near-identity modulation (small but non-zero at init)
-        return f * (1.0 + self.gain.tanh() * (channel_scale - 0.5))
+        # Residual SE: f * (0.5 + σ)  =  f + f * (σ - 0.5)
+        # σ ∈ [0, 1] → modulation ∈ [0.5, 1.5] around unity
+        return f * (0.5 + channel_scale)
 
 
 # ---------------------------------------------------------------------------

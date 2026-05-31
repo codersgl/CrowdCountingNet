@@ -2336,16 +2336,9 @@ class DSGCnet(nn.Module):
         if scale_decoupled_intermediates is not None:
             output_dict["sd_intermediates"] = scale_decoupled_intermediates
             output_dict["sd_dgcn_feat"] = scale_decoupled_dgcn_feat
-            # Gate values for TensorBoard scalars — these are the ground
-            # truth of whether the fusion is learning, independent of the
-            # per-image min-max normalisation used for feature-map images.
-            sf = self.scale_decoupled_fusion
-            output_dict["sd_gate_values"] = {
-                "ca_attn_gate": sf.cross_attention.attn_gate.tanh().item(),
-                "ca_mlp_gate":  sf.cross_attention.mlp_gate.tanh().item(),
-                "dgcn_gate":    sf.density_gcn_refine.gate.tanh().item(),
-                "dm_gain":      sf.density_modulation.gain.tanh().item(),
-            }
+            # All ScaleDecoupledFusion submodules now use standard ungated
+            # residuals (ResNet / Transformer convention).  No gate scalars
+            # to monitor — the feature diff map is the main visual signal.
         if self.neck_moe is not None:
             output_dict["moe_aux_losses"] = neck_moe_aux_losses
             output_dict["moe_aux_total"] = neck_moe_aux_total

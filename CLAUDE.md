@@ -26,6 +26,7 @@ uv sync --extra dev  # includes pytest
 # Tests (no GPU or real data required)
 uv run pytest tests/ -v
 uv run pytest tests/test_deformable_expert.py -v  # single test file
+uv run pytest tests/test_scale_decoupled_fusion.py -v  # scale_decoupled module
 uv run pytest tests/ --cov=src/crowdcount --cov-report=term-missing  # with coverage
 
 # === DSGCNet (paper model) ===
@@ -39,6 +40,9 @@ uv run python scripts/train.py data.data_root=DATA_ROOT \
   model.density_head_version=v3 model.gcn_conv_type=gatv2 \
   scheduler=step_lr scheduler.lr_drop=800 \
   data.density_generation.hybrid=true
+
+# === DSGCNet with ScaleDecoupledFusion (newer architecture) ===
+uv run python scripts/train.py data.data_root=DATA_ROOT model.fusion_mode=scale_decoupled
 
 # === MoECountNet (newer architecture) ===
 uv run python scripts/train_moecount.py data.data_root=DATA_ROOT
@@ -78,7 +82,8 @@ src/crowdcount/
     backbone.py           → VGG16/VGG16-BN, DINOv2 wrappers
     neck.py               → Decoder_SPD_PAFPN (SPD=Space-to-Depth), SPDBiFPNNeck
     head.py               → Density_pred, RegressionModel, ClassificationModel
-    gcn.py                → DensityGCNProcessor, FeatureGCNProcessor (k=4)
+    gcn.py                → DensityGCNProcessor, FeatureGCNProcessor (k=4), FeatureTransformerBlock
+    scale_decoupled_fusion.py → ScaleDecoupledFusion: CNN/GCN/Transformer + CrossAttn (fusion_mode=scale_decoupled)
     anchor.py             → AnchorPoints spatial grid
     criterion.py          → SetCriterion_Crowd: multi-task loss
     matcher.py            → HungarianMatcher_Crowd
@@ -138,6 +143,39 @@ features_pa [B,256,H/8,W/8] → HeterogeneousSparseMoE → feature_fl [B,256,H/8
 ```
 The MoE output feeds directly into the standard DSGCNet prediction trunk (SharedPredictionTrunk → Regression + Classification heads). Density map is produced by DSGCNet's own `Density_pred` head (not MoECountNet's), and passed to the MoE as a conditioning signal. MoE auxiliary losses (`moe_aux_losses`, `total_aux`) are merged into the DSGCNet training loop.
 
+### ScaleDecoupledFusion (`fusion_mode=scale_decoupled`)
+
+A newer DSGCNet fusion mode that replaces Neck + DGCN entirely with scale-decoupled parallel streams:
+
+```
+VGG body2(s4,256ch) → CNN(dilated d=1,2,3 + FFN + SE) → pool→s8 ─┐
+VGG body3(s8,512ch) → GCN(GATv2, spatial-prior k-NN)            ─┤
+VGG body4(s16,512ch)→ Transformer(global MHA×2 + 2D PE)         ─┘
+                                      ↓
+    Cross-Attention: Q←CNN(pooled s8), K/V←GCN(s8)+Transformer(s16)
+    + 2D sinusoidal PE + learnable scale-level embeddings
+    + zero-init residual gates (gate=0 → identity at training start)
+                                      ↓
+                              f [B,256,s8,s8]
+                                      ↓
+    Density_pred → density_out ──→ DensitySEModulation(detach) → f₁
+                                      ↓
+                         SharedPredictionTrunk
+                         ├─ Regression → pred_points
+                         └─ Classification → pred_logits
+```
+
+**Design rationale**: CNN excels at local texture, GCN at relational reasoning (head proximity), Transformer at global context. Cross-Attention lets local features query relational+global context. CNN is pooled to s8 before K/V to keep memory manageable — full-image SHA evaluation (~12K Q × ~15K KV tokens) uses `F.scaled_dot_product_attention` (flash attention) to avoid materializing the attention matrix.
+
+**Key files**:
+- `src/crowdcount/models/scale_decoupled_fusion.py` — `CNNStream`, `GCNStream`, `TransformerStream`, `ScaleDecoupledCrossAttention`, `DensitySEModulation`, `ScaleDecoupledFusion`
+- Config: `configs/model/dsgcnet.yaml` → `scale_decoupled_fusion.*`
+- Tests: `tests/test_scale_decoupled_fusion.py` (29 synthetic tests)
+
+**Usage**: `uv run python scripts/train.py data.data_root=DATA_ROOT model.fusion_mode=scale_decoupled`
+
+**Memory**: Requires ~6GB VRAM for full-image evaluation with flash attention. On smaller GPUs, reduce `ca_num_heads` or downsample evaluation inputs.
+
 ### Plugins (experimental modules for DSGCNet)
 
 Key plugins in `src/crowdcount/plugins/`:
@@ -157,7 +195,7 @@ Key plugins in `src/crowdcount/plugins/`:
 
 ### DSGCNet config
 - `configs/config.yaml` — Root (epochs=3500, seed=42, clip_max_norm=0.1, optimizer=adamw, scheduler=cosine_annealing)
-- `configs/model/dsgcnet.yaml` — Model architecture + fusion_mode (gcn, gcn_moe, graph_attn_moe, graph_moe, mamba_moe, mamba_vss_dual, sdd_moe, sa_dgat, deformable_dual, moe)
+- `configs/model/dsgcnet.yaml` — Model architecture + fusion_mode (gcn, gcn_moe, graph_attn_moe, graph_moe, mamba_moe, mamba_vss_dual, sdd_moe, sa_dgat, deformable_dual, moe, scale_decoupled)
 - `configs/data/shha.yaml` — Data settings
 - `configs/optimizer/adamw.yaml` — Default: lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4. `adam` optimizer also available.
 - Note: `step_lr` is available but not the root default; it was used as an override in the best known run (`scheduler=step_lr scheduler.lr_drop=800`)
@@ -209,6 +247,8 @@ model:
 - Experiment reports (consult instead of duplicating findings):
   - `docs/ablation_full_report_2026-04-26.md`
   - `docs/density_generation_quality_report_2026-05-08.md`
+- ScaleDecoupledFusion design spec: `docs/superpowers/specs/2026-05-31-scale-decoupled-fusion-design.md`
+- Implementation plan: `docs/superpowers/plans/2026-05-31-scale-decoupled-fusion-plan.md`
 - Best known run: `outputs/2026-04-25/22-51-51/` (MAE=48.51, MSE=79.87 on SHA). Checkpoint at `checkpoints/best_mae.pth`. Use this as the performance baseline before claiming improvement.
 - Diagnostic scripts in `scripts/` are useful for debugging: `analyze_density_generation_quality.py`, `analyze_hard_score_band.py`, `calibrate_counts.py`, `search_threshold.py`, plus `diag_*.py` and `probe_*.py` tools.
 

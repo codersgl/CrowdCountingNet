@@ -216,17 +216,18 @@ class TestDensityGCNRefine:
         assert out.shape == (2, 256, 14, 14)
 
     def test_residual_has_effect(self, refine):
-        """Direct residual (no gate) → output ≠ input at init.
+        """GCN transform → output ≠ input at init (GATv2 internal residual).
 
-        The GATv2 uses standard Xavier init and contributes a non-trivial
-        residual from step 0, just like a standard ResNet block.
+        No outer residual — the GCN output replaces input features,
+        following the original DensityGCNProcessor design.  The GATv2Model
+        internal residual (h + x) still differs from x at Xavier init.
         """
         f = torch.randn(2, 256, 14, 14)
         density = torch.rand(2, 1, 14, 14)
         refine.eval()
         with torch.no_grad():
             out = refine(f, density)
-        # Direct residual — output should differ from input
+        # GATv2 internal residual ensures output ≠ input
         assert not torch.allclose(out, f)
 
     def test_no_nan(self, refine):
@@ -306,10 +307,11 @@ class TestScaleDecoupledFusion:
         assert f_refined.shape == f.shape
 
     def test_refine_with_density_has_effect(self, fusion):
-        """Direct residual (no gate) → refined ≠ input at init.
+        """GCN transform → refined ≠ input at init (GATv2 internal residual).
 
-        The GATv2 uses standard Xavier init — its residual contribution
-        is non-trivial from step 0, like any ResNet block.
+        No outer residual — follows original DensityGCNProcessor where
+        GCN output replaces input features.  GATv2Model internal residual
+        (h + x) is non-trivial at Xavier init.
         """
         c2 = torch.randn(2, 256, 28, 28)
         c3 = torch.randn(2, 512, 14, 14)
@@ -319,5 +321,5 @@ class TestScaleDecoupledFusion:
             f, _ = fusion(c2, c3, c4)
             density = torch.rand(2, 1, 14, 14)
             f_refined = fusion.refine_with_density(f, density)
-        # Direct residual — output must differ from input
+        # GATv2 internal residual ensures output ≠ input
         assert not torch.allclose(f_refined, f)

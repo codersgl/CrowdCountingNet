@@ -417,15 +417,20 @@ class ScaleDecoupledCrossAttention(nn.Module):
 
 
 class DensityGCNRefine(nn.Module):
-    """Density-driven GCN refinement after Cross-Attention fusion.
+    """Density-driven GCN after Cross-Attention fusion.
 
-    Builds a density-based k-NN graph (SpatialPriorDensityGraphBuilder) from
-    the predicted density map, then runs GATv2 message passing on the fused
-    features.  A zero-init residual gate ensures identity at training step 0.
+    Mirrors the original DSGCNet :class:`DensityGCNProcessor` design:
 
-    This mirrors the original DSGCNet DensityGCN design: density guides which
-    pixels exchange information, encoding the prior that semantically similar
-    density regions (e.g. two crowded patches) should share features.
+    * Builds a density-based k-NN graph (SpatialPriorDensityGraphBuilder) from
+      the predicted density map.
+    * Runs GATv2 message passing — GCN output **replaces** the input features
+      (no outer residual), just like DensityGCNProcessor.
+    * The GATv2Model internal residual (``h + res_proj(x)``) provides the
+      gradient highway, making an extra outer residual both unnecessary and
+      semantically wrong (double-counting the input).
+
+    In the original DSGCNet this GCN competes with PA-FPN + FeatureGCN via
+    3-way gate fusion; here it transforms the fused features directly.
     """
 
     def __init__(
@@ -455,41 +460,34 @@ class DensityGCNRefine(nn.Module):
             heads=heads,
             dropout=dropout,
         )
-        # No gate — direct residual like a standard ResNet block.
-        # GATv2 uses Xavier init and produces bounded outputs, so the
-        # residual doesn't destabilise early training.  The GCN gets
-        # full gradient from step 0 — no deadlock risk.
+        # No outer gate or residual — follows the original DensityGCNProcessor
+        # design where GCN output directly replaces the input features.
+        # GATv2Model's internal residual (h + x) provides the gradient highway.
 
     def forward(
         self, features: torch.Tensor, density: torch.Tensor
     ) -> torch.Tensor:
-        """Refine fused features with density-guided graph message passing.
+        """Transform fused features with density-guided graph message passing.
 
         Args:
             features: [B, C, H, W] fused features from Cross-Attention.
             density: [B, 1, H, W] predicted density map for graph building.
 
         Returns:
-            [B, C, H, W] refined features (direct residual: f + gcn_out).
+            [B, C, H, W] transformed features (GCN output, no outer residual).
         """
         B, C, H, W = features.shape
 
-        # Detach density: density guides graph topology as a spatial prior,
-        # not as a learnable signal.  Gradients through the ranking-based
-        # k-NN selection are noisy and create a circular dependency with
-        # the density head that can destabilize training.
-        d = density.detach() if density.requires_grad else density
-
-        # Build density-based k-NN graph
-        edge_index, _, _, _, _ = self.graph_builder.build_batch_graph(d)
+        # Build density-based k-NN graph.
+        # Following the original DensityGCNProcessor, density is passed
+        # without detach — the topk-based k-NN selection is non-differentiable
+        # anyway, so no gradient can flow through the ranking operation.
+        edge_index, _, _, _, _ = self.graph_builder.build_batch_graph(density)
 
         # GCN propagation (node ↔ grid 1:1 mapping, reshape is lossless)
         node_features = features.permute(0, 2, 3, 1).reshape(-1, C)
         gcn_out = self.gcn(node_features, edge_index)
-        gcn_out = gcn_out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
-
-        # Direct residual — standard ResNet pattern, no gating
-        return features + gcn_out
+        return gcn_out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -700,18 +698,19 @@ class ScaleDecoupledFusion(nn.Module):
     def refine_with_density(
         self, features: torch.Tensor, density: torch.Tensor
     ) -> torch.Tensor:
-        """Post-CrossAttn density-driven GCN refinement.
+        """Post-CrossAttn density-driven GCN transformation.
 
-        Uses the predicted density map to build a spatial-prior k-NN graph,
-        then runs GATv2 message passing on the fused features.  This mirrors
-        the original DSGCNet DensityGCN: density guides which pixels exchange
-        information.
+        Mirrors the original DSGCNet :class:`DensityGCNProcessor`: builds a
+        spatial-prior k-NN graph from the predicted density map and runs
+        GATv2 message passing.  The GCN output **replaces** the input
+        features (no outer residual) — the GATv2Model internal residual
+        provides the gradient highway.
 
         Args:
             features: [B, C, H, W] fused features from Cross-Attention.
             density: [B, 1, H, W] predicted density map.
 
         Returns:
-            [B, C, H, W] refined features.
+            [B, C, H, W] transformed features.
         """
         return self.density_gcn_refine(features, density)

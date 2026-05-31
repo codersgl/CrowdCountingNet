@@ -1417,6 +1417,12 @@ class DSGCnet(nn.Module):
                 dm_reduction=int(_sc("dm_reduction", 4)),
             )
 
+            # 1×1 projection to fuse CrossAttn features (256ch, contains PE)
+            # with CNN stream local features (256ch, no PE) before density_pred.
+            self.sd_density_feat_proj = nn.Conv2d(
+                int(_sc("unified_dim", 256)) * 2, int(_sc("unified_dim", 256)), 1, bias=False,
+            )
+
             # Nullify other fusion components
             self.density_gcn = None
             self.feature_gcn = None
@@ -2220,7 +2226,14 @@ class DSGCnet(nn.Module):
             features_pa = F.dropout2d(
                 f_cross, p=self.neck_dropout, training=self.training
             )
-            density = self.density_pred(features_pa)
+            # Concat CNN stream local features (no PE, pure local texture)
+            # with CrossAttn features before density_pred.  This gives the
+            # density head a direct local-feature pathway that bypasses the
+            # global attention mixing in CrossAttention.
+            cnn_feat = intermediates["cnn_feat"]  # [B, 256, H/8, W/8], no PE
+            density_input = torch.cat([features_pa, cnn_feat], dim=1)
+            density_input = self.sd_density_feat_proj(density_input)
+            density = self.density_pred(density_input)
 
             # Step 2: Density-driven GCN refinement.
             #   Uses the predicted density map to build a spatial-prior k-NN

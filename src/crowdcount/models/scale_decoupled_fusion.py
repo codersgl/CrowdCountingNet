@@ -474,8 +474,14 @@ class DensityGCNRefine(nn.Module):
         """
         B, C, H, W = features.shape
 
+        # Detach density: density guides graph topology as a spatial prior,
+        # not as a learnable signal.  Gradients through the ranking-based
+        # k-NN selection are noisy and create a circular dependency with
+        # the density head that can destabilize training.
+        d = density.detach() if density.requires_grad else density
+
         # Build density-based k-NN graph
-        edge_index, _, _, _, _ = self.graph_builder.build_batch_graph(density)
+        edge_index, _, _, _, _ = self.graph_builder.build_batch_graph(d)
 
         # GCN propagation (node ↔ grid 1:1 mapping, reshape is lossless)
         node_features = features.permute(0, 2, 3, 1).reshape(-1, C)

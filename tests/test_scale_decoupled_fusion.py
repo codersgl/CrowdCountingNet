@@ -7,6 +7,7 @@ import torch
 
 from crowdcount.models.scale_decoupled_fusion import (
     CNNStream,
+    DensityGCNRefine,
     DensitySEModulation,
     GCNStream,
     ScaleDecoupledCrossAttention,
@@ -201,6 +202,42 @@ class TestDensitySEModulation:
         assert not torch.isnan(out).any()
 
 
+class TestDensityGCNRefine:
+    @pytest.fixture
+    def refine(self):
+        return DensityGCNRefine(channels=256, k=4)
+
+    def test_output_shape(self, refine):
+        f = torch.randn(2, 256, 14, 14)
+        density = torch.rand(2, 1, 14, 14)
+        out = refine(f, density)
+        assert out.shape == (2, 256, 14, 14)
+
+    def test_identity_at_init(self, refine):
+        f = torch.randn(2, 256, 14, 14)
+        density = torch.rand(2, 1, 14, 14)
+        refine.eval()
+        with torch.no_grad():
+            out = refine(f, density)
+        # gate=0 → output ≈ input (identity at training start)
+        torch.testing.assert_close(out, f)
+
+    def test_no_nan(self, refine):
+        f = torch.randn(1, 256, 10, 10)
+        density = torch.rand(1, 1, 10, 10)
+        refine.eval()
+        with torch.no_grad():
+            out = refine(f, density)
+        assert not torch.isnan(out).any()
+
+    def test_training_mode(self, refine):
+        refine.train()
+        f = torch.randn(2, 256, 14, 14)
+        density = torch.rand(2, 1, 14, 14)
+        out = refine(f, density)
+        assert out.shape == (2, 256, 14, 14)
+
+
 class TestScaleDecoupledFusion:
     @pytest.fixture
     def fusion(self):
@@ -251,3 +288,24 @@ class TestScaleDecoupledFusion:
         with torch.no_grad():
             f, _ = fusion(c2, c3, c4)
         assert not torch.isnan(f).any()
+
+    def test_refine_with_density(self, fusion):
+        c2 = torch.randn(2, 256, 28, 28)
+        c3 = torch.randn(2, 512, 14, 14)
+        c4 = torch.randn(2, 512, 7, 7)
+        f, _ = fusion(c2, c3, c4)
+        density = torch.rand(2, 1, 14, 14)
+        f_refined = fusion.refine_with_density(f, density)
+        assert f_refined.shape == f.shape
+
+    def test_refine_with_density_identity_at_init(self, fusion):
+        c2 = torch.randn(2, 256, 28, 28)
+        c3 = torch.randn(2, 512, 14, 14)
+        c4 = torch.randn(2, 512, 7, 7)
+        fusion.eval()
+        with torch.no_grad():
+            f, _ = fusion(c2, c3, c4)
+            density = torch.rand(2, 1, 14, 14)
+            f_refined = fusion.refine_with_density(f, density)
+        # gate=0 → output ≈ input at init
+        torch.testing.assert_close(f_refined, f)

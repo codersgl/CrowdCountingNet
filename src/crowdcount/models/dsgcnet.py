@@ -1407,6 +1407,12 @@ class DSGCnet(nn.Module):
                 ca_num_heads=int(_sc("ca_num_heads", 4)),
                 ca_dropout=float(_sc("ca_dropout", 0.1)),
                 ca_ff_expansion=int(_sc("ca_ff_expansion", 2)),
+                dgcn_k=int(_sc("dgcn_k", 4)),
+                dgcn_spatial_alpha=float(_sc("dgcn_spatial_alpha", 1.0)),
+                dgcn_spatial_beta=float(_sc("dgcn_spatial_beta", 1.0)),
+                dgcn_hidden_channels=int(_sc("dgcn_hidden_channels", 512)),
+                dgcn_heads=int(_sc("dgcn_heads", 4)),
+                dgcn_dropout=float(_sc("dgcn_dropout", 0.1)),
                 dm_density_hidden=int(_sc("dm_density_hidden", 64)),
                 dm_reduction=int(_sc("dm_reduction", 4)),
             )
@@ -2199,19 +2205,31 @@ class DSGCnet(nn.Module):
         if self.use_scale_decoupled:
             assert self.scale_decoupled_fusion is not None
             assert self.density_pred is not None
-            # VGG backbone features: [body1(s2), body2(s4,256), body3(s8,512), body4(s16,512)]
-            # Scale-decoupled: s4→CNN, s8→GCN(Q), s16→Transformer
-            # Q←s8(GCN), K/V←s4(CNN)+s16(Transformer) → output naturally at s8
-            feature_fl, _ = self.scale_decoupled_fusion(
-                features_list[1],  # body2: stride-4, 256ch → K/V
-                features_list[2],  # body3: stride-8, 512ch → Q
-                features_list[3],  # body4: stride-16, 512ch → K/V
+            # Step 1: Feature-driven CrossAttn fusion.
+            #   GCN stream uses feature-similarity k-NN (no density yet).
+            #   Q ← CNN(pooled s8), K/V ← FeatureGCN(s8) + Transformer(s16).
+            f_cross, _ = self.scale_decoupled_fusion(
+                features_list[1],  # body2: stride-4, 256ch → CNN → pool → Q
+                features_list[2],  # body3: stride-8, 512ch → FeatureGCN → K/V
+                features_list[3],  # body4: stride-16, 512ch → Transformer → K/V
             )
-            features_pa = feature_fl
             features_pa = F.dropout2d(
-                features_pa, p=self.neck_dropout, training=self.training
+                f_cross, p=self.neck_dropout, training=self.training
             )
             density = self.density_pred(features_pa)
+
+            # Step 2: Density-driven GCN refinement.
+            #   Uses the predicted density map to build a spatial-prior k-NN
+            #   graph, then runs GATv2 message passing on the fused features.
+            #   Mirrors the original DSGCNet DensityGCN design.
+            f_refined = self.scale_decoupled_fusion.refine_with_density(
+                features_pa, density,
+            )
+
+            # Step 3: SE-style density modulation.
+            features_pa = self.scale_decoupled_fusion.density_modulation(
+                f_refined, density,
+            )
         # --- MSCADecoder path: replaces PA-FPN + Density_pred, GCN runs downstream ---
         elif self.use_msca_decoder:
             assert self.msca_decoder is not None
@@ -2354,7 +2372,7 @@ class DSGCnet(nn.Module):
             features_pa = features_pa * pre_mask
 
         if self.use_scale_decoupled:
-            pass  # fusion already done by ScaleDecoupledFusion above
+            feature_fl = features_pa  # already refined by DensityGCN + SE modulation
         elif self.use_graph_moe:
             assert self.graph_moe is not None
             feature_fl, graph_aux_losses, graph_weights = self.graph_moe(

@@ -679,5 +679,13 @@ scale_decoupled_fusion:
   ca_num_heads: 4
   ca_dropout: 0.1
   ca_ff_expansion: 2
+  # Density-driven GCN refinement (post-CrossAttn, spatial-prior graph)
+  dgcn_k: 4
+  dgcn_spatial_alpha: 1.0
+  dgcn_spatial_beta: 1.0
+  dgcn_hidden_channels: 512
+  dgcn_heads: 4
+  dgcn_dropout: 0.1
+  # Density SE modulation
   dm_density_hidden: 64
   dm_reduction: 4

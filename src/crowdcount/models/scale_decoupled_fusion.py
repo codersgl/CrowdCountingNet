@@ -415,6 +415,78 @@ class ScaleDecoupledCrossAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Density-Driven GCN Refinement (Post-CrossAttn, Spatial-Prior Graph)
+# ---------------------------------------------------------------------------
+
+
+class DensityGCNRefine(nn.Module):
+    """Density-driven GCN refinement after Cross-Attention fusion.
+
+    Builds a density-based k-NN graph (SpatialPriorDensityGraphBuilder) from
+    the predicted density map, then runs GATv2 message passing on the fused
+    features.  A zero-init residual gate ensures identity at training step 0.
+
+    This mirrors the original DSGCNet DensityGCN design: density guides which
+    pixels exchange information, encoding the prior that semantically similar
+    density regions (e.g. two crowded patches) should share features.
+    """
+
+    def __init__(
+        self,
+        channels: int = 256,
+        k: int = 4,
+        spatial_alpha: float = 1.0,
+        spatial_beta: float = 1.0,
+        hidden_channels: int = 512,
+        heads: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        from crowdcount.models.gcn import (
+            GATv2Model,
+            SpatialPriorDensityGraphBuilder,
+        )
+
+        self.channels = channels
+        self.graph_builder = SpatialPriorDensityGraphBuilder(
+            k=k, alpha=spatial_alpha, beta=spatial_beta,
+        )
+        self.gcn = GATv2Model(
+            in_channels=channels,
+            hidden_channels=hidden_channels,
+            out_channels=channels,
+            heads=heads,
+            dropout=dropout,
+        )
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self, features: torch.Tensor, density: torch.Tensor
+    ) -> torch.Tensor:
+        """Refine fused features with density-guided graph message passing.
+
+        Args:
+            features: [B, C, H, W] fused features from Cross-Attention.
+            density: [B, 1, H, W] predicted density map for graph building.
+
+        Returns:
+            [B, C, H, W] refined features (residual: f + gate * gcn_out).
+        """
+        B, C, H, W = features.shape
+
+        # Build density-based k-NN graph
+        edge_index, _, _, _, _ = self.graph_builder.build_batch_graph(density)
+
+        # GCN propagation (node ↔ grid 1:1 mapping, reshape is lossless)
+        node_features = features.permute(0, 2, 3, 1).reshape(-1, C)
+        gcn_out = self.gcn(node_features, edge_index)
+        gcn_out = gcn_out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+
+        # Zero-init residual: gate=0 → identity at training step 0
+        return features + self.gate.tanh() * gcn_out
+
+
+# ---------------------------------------------------------------------------
 # Density Modulation (SE-style Channel Attention)
 # ---------------------------------------------------------------------------
 
@@ -510,6 +582,13 @@ class ScaleDecoupledFusion(nn.Module):
         ca_num_heads: int = 4,
         ca_dropout: float = 0.1,
         ca_ff_expansion: int = 2,
+        # Density-driven GCN refinement (post-CrossAttn)
+        dgcn_k: int = 4,
+        dgcn_spatial_alpha: float = 1.0,
+        dgcn_spatial_beta: float = 1.0,
+        dgcn_hidden_channels: int = 512,
+        dgcn_heads: int = 4,
+        dgcn_dropout: float = 0.1,
         # Density modulation
         dm_density_hidden: int = 64,
         dm_reduction: int = 4,
@@ -551,6 +630,16 @@ class ScaleDecoupledFusion(nn.Module):
             ff_expansion=ca_ff_expansion,
         )
 
+        self.density_gcn_refine = DensityGCNRefine(
+            channels=unified_dim,
+            k=dgcn_k,
+            spatial_alpha=dgcn_spatial_alpha,
+            spatial_beta=dgcn_spatial_beta,
+            hidden_channels=dgcn_hidden_channels,
+            heads=dgcn_heads,
+            dropout=dgcn_dropout,
+        )
+
         self.density_modulation = DensitySEModulation(
             channels=unified_dim,
             density_hidden=dm_density_hidden,
@@ -590,3 +679,22 @@ class ScaleDecoupledFusion(nn.Module):
         f = self.cross_attention(f_cnn, f_gcn, f_trans)
 
         return f, {}
+
+    def refine_with_density(
+        self, features: torch.Tensor, density: torch.Tensor
+    ) -> torch.Tensor:
+        """Post-CrossAttn density-driven GCN refinement.
+
+        Uses the predicted density map to build a spatial-prior k-NN graph,
+        then runs GATv2 message passing on the fused features.  This mirrors
+        the original DSGCNet DensityGCN: density guides which pixels exchange
+        information.
+
+        Args:
+            features: [B, C, H, W] fused features from Cross-Attention.
+            density: [B, 1, H, W] predicted density map.
+
+        Returns:
+            [B, C, H, W] refined features.
+        """
+        return self.density_gcn_refine(features, density)

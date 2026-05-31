@@ -305,6 +305,85 @@ class DepthAwareDensityGraphBuilder:
         return edge_index, edge_attr, num_nodes_total, H, W
 
 
+class DepthGraphBuilder:
+    """Depth-feature k-NN graph builder with spatial regularisation.
+
+    Edge cost: ``alpha * ‖Δf‖₂ / scale_d  +  beta * ‖Δp‖₂ / sigma_p``,
+    where ``Δf`` is the L2 distance in a (possibly multi-channel) depth
+    feature space and ``sigma_p ≈ 0.38×image_diagonal``.
+
+    Caller is expected to pre-process the raw depth map (resize, min-max
+    normalise, learnable stem) before passing it to this builder.  The
+    builder no longer does its own normalisation so that learnable stems
+    always see a consistent [0, 1] input range.
+
+    Nodes with similar depth features connect, encoding the prior that
+    same-scale regions (near-near, far-far) should share features —
+    complementary to density-based graphs (count-level similarity).
+    """
+
+    def __init__(self, k: int = 4, alpha: float = 1.0, beta: float = 1.0):
+        self.k = k
+        self.alpha = alpha
+        self.beta = beta
+
+    def build_batch_graph(self, depth_feats: torch.Tensor):
+        """Build depth-similarity graph from (possibly multi-channel) features.
+
+        Args:
+            depth_feats: [B, C, H, W] pre-processed depth features.
+        """
+        B, C, H, W = depth_feats.shape
+        num_nodes = H * W
+        device = depth_feats.device
+        dtype = depth_feats.dtype
+
+        # Spatial coordinates and sigma_p (shared across batch)
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device=device, dtype=dtype),
+            torch.arange(W, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        coords = torch.stack([xs.reshape(-1), ys.reshape(-1)], dim=-1)
+        p_dist = torch.cdist(coords, coords, p=2.0)
+        sigma_p = max(0.38 * float((H * H + W * W) ** 0.5), 1e-6)
+
+        # Pairwise L2 distance in C-dimensional depth feature space
+        flat = depth_feats.permute(0, 2, 3, 1).reshape(B, num_nodes, C)
+        d_dist = torch.cdist(flat, flat, p=2.0)  # [B, N, N]
+        d_scale = d_dist.reshape(B, -1).mean(dim=1).view(B, 1, 1).clamp_min(1e-6)
+
+        # Joint cost: depth-feature similarity + spatial proximity
+        cost = self.alpha * d_dist / d_scale + self.beta * (
+            p_dist.unsqueeze(0) / sigma_p
+        )
+
+        sorted_indices = torch.topk(cost, k=self.k + 1, dim=2, largest=False).indices[
+            :, :, 1 : self.k + 1
+        ]
+
+        # Edge attribute: depth-feature similarity
+        edge_d = torch.gather(d_dist, 2, sorted_indices)
+        edge_attr = torch.exp(-edge_d).reshape(-1, 1)
+
+        src_nodes = (
+            torch.arange(num_nodes, device=device)
+            .view(1, num_nodes, 1)
+            .expand(B, num_nodes, self.k)
+        )
+        tgt_nodes = sorted_indices
+        batch_offset = torch.arange(B, device=device).view(B, 1, 1) * num_nodes
+        src_nodes = (src_nodes + batch_offset).reshape(-1)
+        tgt_nodes = (tgt_nodes + batch_offset).reshape(-1)
+        edge_index = torch.stack([src_nodes, tgt_nodes], dim=0)
+
+        num_nodes_total = B * num_nodes
+        edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes_total)
+        self_loop_attr = torch.ones(num_nodes_total, 1, device=device)
+        edge_attr = torch.cat([edge_attr, self_loop_attr], dim=0)
+        return edge_index, edge_attr, num_nodes_total, H, W
+
+
 class AdaptiveDensityGraphBuilder:
     """Density-guided adaptive graph builder.
 
@@ -1048,6 +1127,139 @@ class DensityGCNProcessor(nn.Module):
         else:
             out = self.gcn(node_features, edge_index)
         return out.view(B, H, W, in_channels).permute(0, 3, 1, 2).contiguous()
+
+
+class DepthGCNProcessor(nn.Module):
+    """Depth-only GCN processor for the scale-decoupled depth stream.
+
+    Builds a spatial-prior depth k-NN graph (DepthGraphBuilder) from a
+    depth map, then runs graph convolution message passing on the fused
+    features.
+
+    This complements the DensityGCN (count-level similarity) and
+    FeatureGCN (appearance similarity) by encoding scale-level similarity:
+    pixels at similar depths are likely heads of similar scales.
+
+    Uses the same ``conv_type``-driven GNN selection as
+    ``DensityGCNProcessor`` so that all streams share consistent
+    architectures and output statistics.
+
+    Args:
+        k: Number of graph neighbours.
+        in_channels: Input feature channels.
+        hidden_channels: GNN hidden channels.
+        out_channels: Output feature channels.
+        conv_type: GNN backbone — ``"gcn"`` (GCNModel), ``"gatv2"``
+                   (GATv2Model), or falls back to GCNModel for anything
+                   else (matches ``DensityGCNProcessor`` behaviour).
+        anisotropic: If True and ``conv_type != "gatv2"``, use ECAGCNModel.
+        spatial_alpha: Weight of depth-distance term in joint cost.
+        spatial_beta: Weight of spatial-distance term in joint cost.
+        dropout: GNN dropout rate (null → per-model default).
+    """
+
+    def __init__(
+        self,
+        k: int = 4,
+        in_channels: int = 256,
+        hidden_channels: int = 512,
+        out_channels: int = 256,
+        conv_type: str = "gcn",
+        anisotropic: bool = False,
+        spatial_alpha: float = 1.0,
+        spatial_beta: float = 1.0,
+        dropout: float | None = None,
+    ) -> None:
+        super().__init__()
+        self._conv_type = conv_type
+        self._anisotropic = anisotropic
+        self.graph_builder = DepthGraphBuilder(
+            k=k, alpha=spatial_alpha, beta=spatial_beta,
+        )
+        # Lightweight depth stem: learnable multi-scale downsampling.
+        # Three stride-2 convs (8× reduction) extract depth cues at
+        # increasing receptive fields before pooling to the feature
+        # resolution.  Compared to bilinear-resize-then-conv, this
+        # preserves fine depth edges and discontinuities that are
+        # critical for correct scale-level grouping.  ~1000 params.
+        stem_ch = 8
+        self.depth_stem = nn.Sequential(
+            nn.Conv2d(1, stem_ch, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(stem_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(stem_ch, stem_ch, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(stem_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(stem_ch, stem_ch, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(stem_ch),
+            nn.ReLU(inplace=True),
+        )
+        if conv_type == "gatv2":
+            self.gcn = GATv2Model(
+                in_channels=in_channels,
+                hidden_channels=hidden_channels,
+                out_channels=out_channels,
+                dropout=_resolve_dropout(dropout, 0.1),
+            )
+        elif anisotropic:
+            self.gcn = ECAGCNModel(
+                in_channels=in_channels,
+                hidden_channels=hidden_channels,
+                out_channels=out_channels,
+                dropout=_resolve_dropout(dropout, 0.1),
+            )
+        else:
+            self.gcn = GCNModel(
+                in_channels=in_channels,
+                hidden_channels=hidden_channels,
+                out_channels=out_channels,
+                dropout=_resolve_dropout(dropout, 0.5),
+            )
+
+    def forward(
+        self,
+        depth_maps: torch.Tensor,
+        feature_maps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Transform features via depth-graph message passing.
+
+        Args:
+            depth_maps: [B, 1, H_d, W_d] raw monocular depth map at
+                        input resolution (e.g. 128×128 for training
+                        patches).  Downsampled to feature resolution
+                        by the learnable stem (stride-2 convs).
+            feature_maps: [B, C, H, W] features to transform.
+
+        Returns:
+            [B, C, H, W] GCN-transformed features (no outer residual).
+        """
+        B, C, H, W = feature_maps.shape
+
+        # Per-image min-max normalisation → [0, 1] (consistent input range
+        # regardless of the monocular estimator's output scale).
+        flat = depth_maps.view(B, -1)
+        d_min = flat.min(dim=1, keepdim=True).values.view(B, 1, 1, 1)
+        d_max = flat.max(dim=1, keepdim=True).values.view(B, 1, 1, 1)
+        depth_maps = (depth_maps - d_min) / (d_max - d_min + 1e-6)
+
+        # Learnable multi-scale downsampling (8× reduction via stride-2 convs)
+        depth_feats = self.depth_stem(depth_maps)
+
+        # Match exact feature resolution (e.g. adaptive pool when input is
+        # not an exact multiple of 8, or for multi-scale patch training)
+        if depth_feats.shape[-2:] != (H, W):
+            depth_feats = F.adaptive_avg_pool2d(depth_feats, (H, W))
+
+        edge_index, edge_attr, _, _, _ = self.graph_builder.build_batch_graph(depth_feats)
+
+        node_features = (
+            feature_maps.permute(0, 2, 3, 1).contiguous().view(-1, C)
+        )
+        if self._anisotropic and self._conv_type != "gatv2":
+            out = self.gcn(node_features, edge_index, edge_attr)
+        else:
+            out = self.gcn(node_features, edge_index)
+        return out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
 
 class FeatureGCNProcessor(nn.Module):

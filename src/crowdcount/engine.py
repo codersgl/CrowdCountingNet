@@ -533,6 +533,11 @@ def train_one_epoch(
         if depth_graph_prior is not None
         else False
     )
+    use_depth_gcn = bool(
+        getattr(getattr(cfg, "model", None), "use_depth_gcn", False)
+        if cfg is not None
+        else False
+    )
     use_depth_input = (
         use_depth
         or use_depth_geo
@@ -541,6 +546,7 @@ def train_one_epoch(
         or use_depth_attn
         or use_depth_cross_attn
         or use_depth_graph_prior
+        or use_depth_gcn
     )
     needs_depth_batch = use_depth_input or use_depth_aux
     point_feedback_cfg = (

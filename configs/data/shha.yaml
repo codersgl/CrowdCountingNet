@@ -67,8 +67,8 @@ augmentation:
 
 # === Depth Map Processing ===
 depth_blur:
-  kernel_size: 15 # Gaussian blur kernel size (must be odd)
-  sigma: 5.0 # Gaussian blur sigma for smoothing depth edges
+  kernel_size: 1 # disabled — stride-2 depth stem handles filtering learnably
+  sigma: 0.0
 
 # === Density Map Generation ===
 density_generation:

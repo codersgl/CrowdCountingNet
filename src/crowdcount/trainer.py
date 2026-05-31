@@ -245,6 +245,7 @@ class Trainer:
         self.use_depth_graph_prior = bool(
             getattr(getattr(cfg.model, "depth_graph_prior", None), "enabled", False)
         )
+        self.use_depth_gcn = bool(getattr(cfg.model, "use_depth_gcn", False))
         self._needs_depth_eval = (
             self.use_depth
             or self.use_depth_geo
@@ -253,6 +254,7 @@ class Trainer:
             or self.use_depth_attn
             or self.use_depth_cross_attn
             or self.use_depth_graph_prior
+            or self.use_depth_gcn
         )
         self._needs_depth_train = self._needs_depth_eval or self.use_depth_aux
 

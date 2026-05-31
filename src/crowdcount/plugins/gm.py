@@ -4,14 +4,24 @@ import torch.nn.functional as F
 
 
 class GateMechanism(nn.Module):
-    """Gate Mechanism (global, legacy)"""
+    """Gate Mechanism (global, legacy).
 
-    def __init__(self, input_dim: int = 256, hidden_dim: int = 128) -> None:
+    Produces per-image fusion weights ``[B, num_streams]`` via global
+    average pooling + MLP.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 256,
+        hidden_dim: int = 128,
+        num_streams: int = 3,
+    ) -> None:
         super().__init__()
+        self.num_streams = num_streams
         self.aap = nn.AdaptiveAvgPool2d(1)
         self.activation = nn.ReLU()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 3)
+        self.fc2 = nn.Linear(hidden_dim, num_streams)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -19,7 +29,7 @@ class GateMechanism(nn.Module):
         """
         x = self.aap(x).flatten(1)  # [batch_size, input_dim]
         x = self.activation(self.fc1(x))  # [batch_size, hidden_dim]
-        x = self.fc2(x)  # [batch_size, 3]
+        x = self.fc2(x)  # [batch_size, num_streams]
         x = F.softmax(x, dim=-1)
         return x
 

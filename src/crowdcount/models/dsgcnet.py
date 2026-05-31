@@ -10,6 +10,7 @@ from crowdcount.models.gcn import (
     CrossStreamGCNProcessor,
     DensityAdaptiveFusion,
     DensityGCNProcessor,
+    DepthGCNProcessor,
     FeatureGCNProcessor,
     FeatureTransformerProcessor,
     SuperNodeGCNProcessor,
@@ -233,6 +234,7 @@ class DSGCnet(nn.Module):
         uncertainty_scale: float = 6.0,
         gcn_aniso: bool = False,
         gcn_conv_type: str = "gcn",
+        use_depth_gcn: bool = False,
         feature_stream_type: str = "gcn",
         feature_transformer_cfg: DictConfig | None = None,
         use_fg_branch: bool = False,
@@ -332,6 +334,7 @@ class DSGCnet(nn.Module):
         self._gcn_mode = gcn_mode
         self.feature_stream_type = str(feature_stream_type).lower()
         self.use_uncertainty = use_uncertainty
+        self.depth_gcn = None  # overridden in GCN paths when use_depth_gcn=True
         self.use_msca_decoder = use_msca_decoder
         self.use_decoupled_head = use_decoupled_head
         self.use_msca_neck = use_msca_neck
@@ -1468,6 +1471,7 @@ class DSGCnet(nn.Module):
                     )
             else:
                 self.gm = None
+            self.depth_gcn = None
             self.graph_attn_moe = None
             self.mamba_moe = None
             self.supernode_gcn = None
@@ -1585,6 +1589,42 @@ class DSGCnet(nn.Module):
                     )
             else:
                 self.gm = None
+
+            # Depth-only GCN stream: depth-similarity graph for scale-level
+            # grouping (complements DensityGCN count-level + FeatureGCN
+            # appearance-level).  Requires gt_depth_maps to be present.
+            if use_depth_gcn and gcn_mode == "fixed":
+                if use_density_adaptive_fusion:
+                    raise ValueError(
+                        "use_depth_gcn is incompatible with "
+                        "use_density_adaptive_fusion"
+                    )
+                self.depth_gcn = DepthGCNProcessor(
+                    k=gcn_k,
+                    in_channels=256,
+                    hidden_channels=512,
+                    out_channels=256,
+                    conv_type=str(gcn_conv_type),
+                    anisotropic=gcn_aniso,
+                    spatial_alpha=gcn_spatial_alpha,
+                    spatial_beta=gcn_spatial_beta,
+                    dropout=gcn_dropout,
+                )
+                # Extend gate from 3-way to 4-way
+                if self.alpha is not None:
+                    self.alpha = nn.Parameter(torch.ones(4, dtype=torch.float32))
+                if self.gm is not None:
+                    if gm_spatial:
+                        self.gm = SpatialGateMechanism(
+                            input_dim=gm_input_dim, num_streams=4,
+                        )
+                    else:
+                        self.gm = GateMechanism(
+                            input_dim=gm_input_dim, hidden_dim=gm_hidden_dim,
+                            num_streams=4,
+                        )
+            else:
+                self.depth_gcn = None
 
             # Density-Adaptive Fusion: replaces alpha / gm when enabled
             if use_density_adaptive_fusion and gcn_mode == "fixed":
@@ -2578,13 +2618,36 @@ class DSGCnet(nn.Module):
                     depth_map=depth_map,
                 )
                 feature_gcn_feature = self.feature_gcn(features_pa)
+
+                # DepthGCN: depth-similarity graph for scale-level grouping.
+                # Falls back to zeros when depth data is unavailable; the gate
+                # learns to suppress this stream in that case.
+                _use_depth = self.depth_gcn is not None
+                depth_gcn_feature: torch.Tensor | None = None
+                if _use_depth:
+                    if depth_map is not None:
+                        depth_gcn_feature = self.depth_gcn(
+                            depth_map, features_pa,
+                        )
+                    else:
+                        depth_gcn_feature = torch.zeros_like(features_pa)
+
                 if self.msaa_gate is not None:
                     # Phase 3: MSAAGate multi-scale attention fusion
+                    if _use_depth:
+                        raise RuntimeError(
+                            "use_depth_gcn is not supported with msaa_gate"
+                        )
                     feature_fl = self.msaa_gate(
                         features_pa, density_gcn_feature, feature_gcn_feature
                     )
                 elif self.density_adaptive_fusion is not None:
                     # Density-Adaptive Fusion: density-conditioned per-pixel weights
+                    if _use_depth:
+                        raise RuntimeError(
+                            "use_depth_gcn is not supported with "
+                            "density_adaptive_fusion"
+                        )
                     feature_fl = self.density_adaptive_fusion(
                         features_pa,
                         density_gcn_feature,
@@ -2593,12 +2656,32 @@ class DSGCnet(nn.Module):
                     )
                 elif self.gm is not None:
                     gate_weight = self.gm(features_pa)
-                    if gate_weight.dim() == 4:
+                    if gate_weight.dim() == 4 and gate_weight.shape[1] == 4:
+                        # SpatialGateMechanism: [B, 4, H, W]
+                        feature_fl = (
+                            features_pa * gate_weight[:, 0:1]
+                            + density_gcn_feature * gate_weight[:, 1:2]
+                            + feature_gcn_feature * gate_weight[:, 2:3]
+                            + depth_gcn_feature * gate_weight[:, 3:4]
+                        )
+                    elif gate_weight.dim() == 4 and gate_weight.shape[1] == 3:
                         # SpatialGateMechanism: [B, 3, H, W]
                         feature_fl = (
                             features_pa * gate_weight[:, 0:1]
                             + density_gcn_feature * gate_weight[:, 1:2]
                             + feature_gcn_feature * gate_weight[:, 2:3]
+                        )
+                    elif gate_weight.shape[1] == 4:
+                        # Legacy GateMechanism: [B, 4]
+                        w_1 = gate_weight[:, 0].view(-1, 1, 1, 1)
+                        w_2 = gate_weight[:, 1].view(-1, 1, 1, 1)
+                        w_3 = gate_weight[:, 2].view(-1, 1, 1, 1)
+                        w_4 = gate_weight[:, 3].view(-1, 1, 1, 1)
+                        feature_fl = (
+                            features_pa * w_1
+                            + density_gcn_feature * w_2
+                            + feature_gcn_feature * w_3
+                            + depth_gcn_feature * w_4
                         )
                     else:
                         # Legacy GateMechanism: [B, 3]
@@ -2613,11 +2696,19 @@ class DSGCnet(nn.Module):
                 else:
                     assert self.alpha is not None
                     w = F.softmax(self.alpha, dim=0)
-                    feature_fl = (
-                        w[0] * features_pa
-                        + w[1] * density_gcn_feature
-                        + w[2] * feature_gcn_feature
-                    )
+                    if _use_depth:
+                        feature_fl = (
+                            w[0] * features_pa
+                            + w[1] * density_gcn_feature
+                            + w[2] * feature_gcn_feature
+                            + w[3] * depth_gcn_feature
+                        )
+                    else:
+                        feature_fl = (
+                            w[0] * features_pa
+                            + w[1] * density_gcn_feature
+                            + w[2] * feature_gcn_feature
+                        )
 
         # LightMoE post-GCN conditional refinement (gcn_moe mode)
         if self.light_moe is not None and not self.use_moecount_moe:

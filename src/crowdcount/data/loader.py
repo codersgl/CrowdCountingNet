@@ -74,6 +74,7 @@ def build_dataset(cfg: DictConfig):
     depth_graph_prior = getattr(getattr(cfg, "model", None), "depth_graph_prior", None)
     use_depth_graph_prior = bool(getattr(depth_graph_prior, "enabled", False))
     use_depth_aux = bool(getattr(getattr(cfg, "model", None), "use_depth_aux", False))
+    use_depth_gcn = bool(getattr(getattr(cfg, "model", None), "use_depth_gcn", False))
     needs_depth_input = (
         use_depth
         or use_depth_geo
@@ -82,6 +83,7 @@ def build_dataset(cfg: DictConfig):
         or use_depth_attn
         or use_depth_cross_attn
         or use_depth_graph_prior
+        or use_depth_gcn
     )
     needs_depth_train = needs_depth_input or use_depth_aux
     needs_depth_eval = needs_depth_input

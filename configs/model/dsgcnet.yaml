@@ -164,6 +164,11 @@ gcn_aniso: false
 # When gcn_conv_type is set, it takes priority over gcn_aniso.
 gcn_conv_type: gcn
 
+# When true, adds a fourth GCN stream that builds a depth-similarity
+# k-NN graph (DepthGCN).  Requires gt_depth_maps to be present in the
+# dataset directory.  Gate fusion is extended from 3-way to 4-way.
+use_depth_gcn: false
+
 # Feature stream architecture inside the default dual-stream fusion path.
 # gcn keeps the original FeatureGCN/GAT branch; transformer replaces only the
 # feature-similarity branch while leaving the density-guided GCN/GAT branch intact.

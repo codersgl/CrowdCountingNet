@@ -122,6 +122,7 @@ def build_model(cfg: DictConfig, training: bool = False):
         uncertainty_scale=float(getattr(cfg.model, "uncertainty_scale", 6.0)),
         gcn_aniso=getattr(cfg.model, "gcn_aniso", False),
         gcn_conv_type=getattr(cfg.model, "gcn_conv_type", "gcn"),
+        use_depth_gcn=getattr(cfg.model, "use_depth_gcn", False),
         feature_stream_type=getattr(cfg.model, "feature_stream_type", "gcn"),
         feature_transformer_cfg=getattr(cfg.model, "feature_transformer", None),
         use_fg_branch=getattr(cfg.model, "use_fg_branch", False),
